@@ -1,0 +1,9 @@
+dependencies:
+  idf: ">=5.5.3,<6.0"
+  espressif/usb_host_uvc:
+    version: "2.2.0"
+  espressif/esp_lvgl_port:
+    version: "2.9.0"
+  lvgl/lvgl:
+    version: "8.4.*"
+    public: true

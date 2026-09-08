@@ -1,0 +1,28 @@
+# ===== ESP-IDF build output =====
+build/
+build_camera_verified/
+build_screen_verified/
+
+# ===== ESP-IDF generated config (keep sdkconfig.defaults / sdkconfig.ci.*) =====
+sdkconfig
+sdkconfig.old
+
+# ===== ESP component manager (downloaded dependencies, regenerable) =====
+managed_components/
+**/components/*__*/
+
+# ===== Editor / IDE =====
+.vscode/
+.idea/
+.clangd
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== Local tooling =====
+.claude/
+
+# ===== Backups =====
+*.bak
