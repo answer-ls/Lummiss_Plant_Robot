@@ -7,6 +7,9 @@ build_screen_verified/
 sdkconfig
 sdkconfig.old
 
+# ===== Vendor dev-board examples (not to be uploaded) =====
+开发板示例/
+
 # ===== ESP component manager (downloaded dependencies, regenerable) =====
 managed_components/
 **/components/*__*/
