@@ -1,46 +1,119 @@
-# Lummiss 硬件可行性测试工程
+# Lummiss ESP32-P4 基础工程
 
-本工程基于 ESP-IDF 5.5.5，面向 ESP32-P4。开发板原始示例保留在 `../esp_draw_bit`，本工程只保留当前硬件测试需要的依赖。
+本工程基于 ESP-IDF 5.5.5 和 FreeRTOS，是后续盆栽陪伴机器人功能的开发基础。厂商示例保留在 `../esp_draw_bit`，不在其中继续编写产品功能。
 
-项目整体进度、已知问题和后续任务见根目录 `../../PROJECT_HANDOFF.md`。
+## 当前功能
 
-## 当前默认测试：ST7789 屏幕
+- UI Task 初始化 GMT020-02-8P/ST7789 和 LVGL 8.4。
+- 屏幕横屏分辨率为 320×240，循环播放现有 8 组动画表情。
+- Camera Task 初始化 ESP32-P4 高速 USB Host 和 UVC 驱动。
+- LRCPG720p 接入后优先使用 640×480 MJPEG 30 FPS，并每 10 秒输出收帧统计。
+- 屏幕动画缓冲和摄像头帧缓冲使用 PSRAM。
+- Network Manager 通过 ESP-Hosted/SDIO 控制板载 ESP32-C6，以 STA 模式连接固定 WiFi，并通过 DHCP 获取 IPv4 地址。
+- WiFi 断开后每 2 秒自动发起重连；连接状态和 IP 信息只由 Network Manager 对外提供。
+- Video Streamer 抽取 10 FPS 的 MJPEG 帧，经 P4 硬件 JPEG 直出 YUV422、轻量色度抽样/重排和 H.264 硬件编码，再通过 HTTP/1.1 长连接实时发送到局域网 PC。
 
-GMT020-02-8P 按 240×320、RGB565、4 线 SPI 驱动，接线如下：
+## 主组件结构
+
+```text
+components/network/
+├── network_manager.c/.h     网络总入口、NVS、netif、连接状态和 DHCP 结果
+├── wifi_manager.c/.h        esp_wifi_remote 事件、连接和自动重连
+├── CMakeLists.txt           Network Manager 组件依赖
+└── idf_component.yml        ESP-Hosted/esp_wifi_remote 版本要求
+
+components/video_streamer/
+├── video_streamer.c/.h      JPEG 解码、YUV 重排、H.264 硬件编码和 HTTP 实时发送
+├── CMakeLists.txt           编码器、HTTP 与 Network Manager 依赖
+└── idf_component.yml        esp_h264 1.4.0 版本要求
+
+main/
+├── main.c                    唯一 app_main()，创建 FreeRTOS 任务
+├── display_driver.c/.h       ST7789、LVGL 和表情播放器
+├── camera_driver.c/.h        USB Host 和 UVC 摄像头管理
+├── gif_assets.c/.h           8 组表情动画资源
+└── idf_component.yml         管理组件版本
+```
+
+`main.c` 当前创建：
+
+| 任务 | 优先级 | 栈大小 | 职责 |
+| --- | ---: | ---: | --- |
+| `ui_task` | 6 | 8192 字节 | 初始化屏幕和 LVGL；后续接收 UI 事件 |
+| `camera_task` | 7 | 8192 字节 | 运行 USB Host/UVC 摄像头驱动 |
+
+UVC 组件还会创建 USB 事件任务和驱动后台任务。所有显式 LVGL 初始化都由 UI Task 发起，摄像头任务不直接操作 LVGL。
+
+`app_main()` 对网络只调用 `network_manager_init()` 和 `network_manager_start()`；WiFi 系统事件、DHCP 状态及重连逻辑均封装在 `components/network` 中。当前固定 SSID 和密码位于 `network_manager.c`，以后 BLE 配网阶段再改为读取 NVS。
+
+## ESP32-P4 与 ESP32-C6
+
+当前参数按本开发板厂商示例配置：
+
+| ESP-Hosted SDIO 信号 | ESP32-P4 GPIO |
+| --- | ---: |
+| CLK | 18 |
+| CMD | 19 |
+| D0 | 14 |
+| D1 | 15 |
+| D2 | 16 |
+| D3 | 17 |
+| C6 RESET | 54，高电平有效 |
+
+SDIO 使用 Slot 1、4-bit、40 MHz。依赖锁定结果为 `esp_hosted 2.7.4` 和 `esp_wifi_remote 1.3.0`。
+
+## 屏幕接线
 
 | 屏幕引脚 | ESP32-P4 |
 | --- | --- |
 | GND | GND |
 | VCC | 3V3 |
-| SCL / SCLK | GPIO20 |
-| SDA / MOSI | GPIO32 |
-| RST / RES | GPIO3 |
+| SCL/SCLK | GPIO20 |
+| SDA/MOSI | GPIO32 |
+| RST/RES | GPIO3 |
 | DC | GPIO2 |
 | CS | GPIO1 |
-| BL / BLK | 3V3 |
+| BL/BLK | 3V3 |
 
-屏幕程序使用 LVGL 8.4 循环显示 EXP-01 中性待机、EXP-02 微笑和 EXP-03 开心三个表情。中性表情带随机眨眼和轻微呼吸，微笑表情使用弧线眼睛，开心表情带脸颊、张嘴和上下弹动。BL 直接接 3V3，因此程序不能控制背光。
+BL 直接接 3V3，当前程序不能控制背光亮度。
 
-当前 `.vscode/settings.json` 已默认选择屏幕模式，用户可直接在 VS Code 中构建和烧录。屏幕程序已在 ESP-IDF 5.5.5 下编译通过，实机显示参数仍需烧录确认。
+## 构建与烧录
 
-开发板上的 ESP32-P4 实测为 v1.3，工程已选择 v1.x 芯片分支。若烧录日志仍显示镜像要求 `v3.1 - v3.99`，说明使用了修改前的旧镜像，应先重新构建；不要添加 `--force`。
-
-配置中必须保留 `-G Ninja`。如果日志显示 `Building for: NMake Makefiles`，说明 VS Code 没有重新加载本工程的设置；重新加载窗口后再构建。
+在普通终端中：
 
 ```powershell
 Set-Location E:\Lummiss_Plant_Robot\src\demo
-idf.py -B build_screen_verified -DLUMMISS_TEST=screen build
-idf.py -B build_screen_verified -p COM17 flash monitor
+cmd /c _build_main.bat
 ```
 
-## 切换到 USB 摄像头测试
-
-摄像头程序验证 ESP32-P4 高速 USB 口连接的 LRCPG720p UVC 摄像头。该摄像头此前已实测 640×480 MJPEG 30 FPS 稳定收帧。
+在已经激活 ESP-IDF 5.5.5 的终端中：
 
 ```powershell
-Set-Location E:\Lummiss_Plant_Robot\src\demo
-idf.py -B build_camera_verified -DLUMMISS_TEST=camera build
-idf.py -B build_camera_verified -p COM17 flash monitor
+idf.py -B build_main_verified build
+idf.py -B build_main_verified -p COM17 flash monitor
 ```
 
-摄像头正常时，串口会出现 `Supported[...]`、`Stream started`，且每 5 秒输出的 `RX frames` 和 `bytes` 持续增长，`fps` 约为 30，`last` 大于 0，`empty=0`。
+VS Code 工作区也已默认使用 `build_main_verified` 和 Ninja。
+
+2026-09-09 加入 YUV422 快速路径后的联合构建结果：
+
+```text
+lummiss_main.bin：0x196680
+8 MB 应用分区剩余：80%
+bootloader.bin：0x5310
+构建结果：通过
+```
+
+## 烧录后的正常现象
+
+1. 串口出现 `APP_MAIN`，随后可看到 ESP-Hosted 初始化和 SDIO 与 C6 建链日志。
+2. 出现 `WiFi STA 已启动，开始连接路由器` 和 `正在通过 ESP32-C6 连接 WiFi`。
+3. 成功连接后出现 `WiFi 联网成功`，并输出非 `0.0.0.0` 的 IPv4、网关和掩码。这才表示 P4→C6→路由器→DHCP 链路完整成功。
+4. 屏幕黑底横屏显示，中央区域依次播放眨眼、喜、怒、哀、乐、思考、惊讶、疑惑。
+5. 摄像头未插入时，UI 动画和 WiFi 仍应正常运行。
+6. 摄像头插入高速 USB 口后，串口显示使用 `640x480 MJPEG 30 FPS` 和 `Stream started`；每 10 秒的“可编码640x480MJPEG”持续增加，帧率接近 30，`empty=0`。
+7. PC 服务器运行时，`VIDEO_STREAM` 每 10 秒汇总一次，编码和发送接近 10 FPS、码率接近 800 kbps、发送失败为 0，并显示 JPEG、YUV 重排和 H.264 三段平均耗时；PC 的 `tools/camera_captures` 中生成持续增大的 `.h264` 文件。
+
+密码错误或路由器不可达时，串口会反复出现 `WiFi 已断开`、原因码和 2 秒后重连。若在这些日志之前就出现 Hosted/SDIO 初始化失败，应先检查板载 C6 固件；厂商提供的参考固件位于 `开发板示例/JC1060P470C_I_W_Y/8-Burn operation/Burn files/JC-C6-slave_v2.3.2.bin`。
+
+PC 服务器的启动、热复位恢复实验、颜色验收和实时速率判断见 `CAMERA_UPLOAD_TEST.md`。当前采用 HTTP/1.1 长连接传输 H.264 实时帧；H.265 不受当前 ESP32-P4 编码器支持，WebSocket 可在云端协议确定后替换传输层。

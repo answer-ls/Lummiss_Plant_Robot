@@ -1,3 +1,5 @@
 build*/
 sdkconfig.old
-
+tools/__pycache__/
+tools/camera_captures/
+tools/camera_server_test_output/

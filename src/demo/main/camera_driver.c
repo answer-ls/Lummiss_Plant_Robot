@@ -11,12 +11,17 @@
 #include "usb/usb_host.h"
 #include "usb/uvc_host.h"
 
-static const char *TAG = "CAM_TEST";
+#include "camera_driver.h"
+#include "video_streamer.h"
+
+static const char *TAG = "CAMERA";
 
 #define CAMERA_DISCONNECTED BIT0
 #define CAMERA_ERROR        BIT1
 #define CAMERA_FORMATS_READY BIT2
 #define MAX_CAMERA_FORMATS  32
+#define CAMERA_STALL_LIMIT  1
+#define CAMERA_SAME_FORMAT_RETRY_LIMIT 1
 
 static EventGroupHandle_t s_camera_events;
 static portMUX_TYPE s_stats_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -24,9 +29,14 @@ static uvc_host_frame_info_t s_camera_formats[MAX_CAMERA_FORMATS];
 static size_t s_camera_format_count;
 static uint8_t s_camera_device_address;
 static uint8_t s_camera_stream_index;
+/* 是否从真实摄像头连接回调里读到过格式列表。
+ * 只有从未读到过时才允许用“已知格式”兜底；一旦确认过真实设备，
+ * 之后的断开只能靠真实的重新接入事件恢复，避免对空总线反复探测。 */
+static bool s_saw_real_formats;
 
 typedef struct {
     uint32_t frames;
+    uint32_t matching_frames;   /* 其中属于“可编码 640×480 MJPEG”的帧数，驱动轮转判定用它 */
     uint32_t empty_frames;
     uint64_t bytes;
     size_t last_size;
@@ -59,26 +69,27 @@ static float camera_interval_to_fps(uint32_t interval)
     return interval ? 10000000.0f / interval : 30.0f;
 }
 
-/* LRCPG720p 已实测支持这些 MJPEG 模式。
+/* LRCPG720p 已实测支持以下 MJPEG 模式（当前 H.264 链路只吃 640×480）。
  * 若设备连接回调暂时没有给出格式列表，使用该列表避免再次传入 0 FPS。 */
 static void camera_load_known_formats(void)
 {
     static const struct {
+        enum uvc_host_stream_format format;
         unsigned width;
         unsigned height;
     } known_sizes[] = {
-        {640, 480},
-        {1280, 720},
-        {640, 360},
-        {800, 600},
-        {1280, 960},
-        {720, 960},
+        {UVC_VS_FORMAT_MJPEG, 640, 480},
+        {UVC_VS_FORMAT_MJPEG, 1280, 720},
+        {UVC_VS_FORMAT_MJPEG, 640, 360},
+        {UVC_VS_FORMAT_MJPEG, 800, 600},
+        {UVC_VS_FORMAT_MJPEG, 1280, 960},
+        {UVC_VS_FORMAT_MJPEG, 720, 960},
     };
 
     s_camera_format_count = sizeof(known_sizes) / sizeof(known_sizes[0]);
     for (size_t i = 0; i < s_camera_format_count; ++i) {
         s_camera_formats[i] = (uvc_host_frame_info_t) {
-            .format = UVC_VS_FORMAT_MJPEG,
+            .format = known_sizes[i].format,
             .h_res = known_sizes[i].width,
             .v_res = known_sizes[i].height,
             .default_interval = 333333,
@@ -118,8 +129,10 @@ static void camera_driver_event_cb(const uvc_host_driver_event_data_t *event, vo
     s_camera_device_address = event->device_connected.dev_addr;
     s_camera_stream_index = event->device_connected.uvc_stream_index;
     s_camera_format_count = count;
+    s_saw_real_formats = true;
 
-    /* 基础连通性测试优先使用 640×480 MJPEG，降低 USB 和内存压力。 */
+    /* 优先 640×480 MJPEG：冷启动时该模式已实机跑通完整视频链路。
+     * 热复位后可能出现 0 帧，主循环会先原地重开一次再决定是否轮转。 */
     for (size_t i = 0; i < count; ++i) {
         if (s_camera_formats[i].format == UVC_VS_FORMAT_MJPEG &&
             s_camera_formats[i].h_res == 640 && s_camera_formats[i].v_res == 480) {
@@ -130,31 +143,56 @@ static void camera_driver_event_cb(const uvc_host_driver_event_data_t *event, vo
         }
     }
 
+    unsigned mjpeg_count = 0;
+    unsigned yuy2_count = 0;
+    unsigned h26x_count = 0;
     for (size_t i = 0; i < count; ++i) {
-        ESP_LOGI(TAG, "Supported[%u]: %ux%u %s, default %.2f FPS",
-                 (unsigned)i, s_camera_formats[i].h_res, s_camera_formats[i].v_res,
-                 camera_format_name(s_camera_formats[i].format),
-                 camera_interval_to_fps(s_camera_formats[i].default_interval));
+        if (s_camera_formats[i].format == UVC_VS_FORMAT_MJPEG) {
+            mjpeg_count++;
+        } else if (s_camera_formats[i].format == UVC_VS_FORMAT_YUY2) {
+            yuy2_count++;
+        } else if (s_camera_formats[i].format == UVC_VS_FORMAT_H264 ||
+                   s_camera_formats[i].format == UVC_VS_FORMAT_H265) {
+            h26x_count++;
+        }
     }
+    ESP_LOGI(TAG,
+             "摄像头格式：共 %u 个（MJPEG=%u，YUY2=%u，H26x=%u）；使用 640x480 MJPEG 30 FPS",
+             (unsigned)count, mjpeg_count, yuy2_count, h26x_count);
     xEventGroupSetBits(s_camera_events, CAMERA_FORMATS_READY);
 }
 
-/* 帧回调只做统计并立即归还缓冲区，避免解码或日志阻塞 USB 收帧。 */
+/* 帧回调只做统计，并按限速策略将完整的 640×480 MJPEG 帧复制到解码队列。
+ * JPEG 解码、H.264 编码和 HTTP 请求由独立任务执行，本回调不会阻塞 USB 收帧。 */
 static bool camera_frame_cb(const uvc_host_frame_t *frame, void *ctx)
 {
     (void)ctx;
+    const bool valid_frame = frame->data != NULL && frame->data_len > 0;
+    const bool encodable_frame = valid_frame &&
+                                 frame->vs_format.format == UVC_VS_FORMAT_MJPEG &&
+                                 frame->vs_format.h_res == 640 &&
+                                 frame->vs_format.v_res == 480;
+
     portENTER_CRITICAL(&s_stats_lock);
-    if (frame->data != NULL && frame->data_len > 0) {
+    if (valid_frame) {
         s_stats.frames++;
         s_stats.bytes += frame->data_len;
         s_stats.last_size = frame->data_len;
         s_stats.width = frame->vs_format.h_res;
         s_stats.height = frame->vs_format.v_res;
         s_stats.format = frame->vs_format.format;
+        if (encodable_frame) {
+            s_stats.matching_frames++;
+        }
     } else {
         s_stats.empty_frames++;
     }
     portEXIT_CRITICAL(&s_stats_lock);
+
+    /* MJPEG 帧复制必须在统计临界区之外执行。 */
+    if (encodable_frame) {
+        video_streamer_submit_jpeg(frame->data, frame->data_len);
+    }
     return true;
 }
 
@@ -208,11 +246,18 @@ static esp_err_t camera_stop(uvc_host_stream_hdl_t stream)
     return uvc_host_stream_stop(stream);
 }
 
-void app_main(void)
+void camera_driver_run(void)
 {
-    ESP_LOGI(TAG, "Lummiss USB 摄像头测试：LRCPG720p，屏幕未初始化");
+    ESP_LOGI(TAG, "初始化 LRCPG720p USB 摄像头驱动");
     ESP_LOGI(TAG, "使用 ESP32-P4 高速 USB Host，当前 PSRAM 可用：%u 字节",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
+    /* 实时流初始化失败不影响本地 UVC 采集，错误会保留在串口日志中。 */
+    esp_err_t streamer_error = video_streamer_init();
+    if (streamer_error != ESP_OK) {
+        ESP_LOGE(TAG, "初始化 H.264 实时流失败：%s",
+                 esp_err_to_name(streamer_error));
+    }
 
     s_camera_events = xEventGroupCreate();
     assert(s_camera_events != NULL);
@@ -240,11 +285,12 @@ void app_main(void)
     ESP_ERROR_CHECK(uvc_host_install(&driver_config));
 
     unsigned candidate = 0;
+    unsigned same_format_retries = 0;
     while (true) {
         ESP_LOGI(TAG, "等待 UVC 摄像头及格式列表");
         EventBits_t ready = xEventGroupWaitBits(s_camera_events, CAMERA_FORMATS_READY,
                                                 pdFALSE, pdTRUE, pdMS_TO_TICKS(3000));
-        if (!(ready & CAMERA_FORMATS_READY)) {
+        if (!(ready & CAMERA_FORMATS_READY) && !s_saw_real_formats) {
             camera_load_known_formats();
         }
         if (s_camera_format_count == 0) {
@@ -279,7 +325,7 @@ void app_main(void)
             },
         };
 
-        ESP_LOGI(TAG, "Probe supported format %u/%u: %ux%u %s @ %.2f FPS",
+        ESP_LOGI(TAG, "尝试摄像头格式 %u/%u：%ux%u %s @ %.2f FPS",
                  candidate + 1, (unsigned)s_camera_format_count,
                  stream_config.vs_format.h_res, stream_config.vs_format.v_res,
                  camera_format_name(stream_config.vs_format.format),
@@ -289,6 +335,7 @@ void app_main(void)
         esp_err_t err = uvc_host_stream_open(&stream_config, pdMS_TO_TICKS(5000), &stream);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "打开视频流失败：%s，尝试设备声明的下一个格式", esp_err_to_name(err));
+            same_format_retries = 0;
             candidate = (candidate + 1) % s_camera_format_count;
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
@@ -308,7 +355,7 @@ void app_main(void)
             while (true) {
                 EventBits_t bits = xEventGroupWaitBits(
                     s_camera_events, CAMERA_DISCONNECTED | CAMERA_ERROR,
-                    pdFALSE, pdFALSE, pdMS_TO_TICKS(5000));
+                    pdFALSE, pdFALSE, pdMS_TO_TICKS(10000));
                 if (bits & (CAMERA_DISCONNECTED | CAMERA_ERROR)) {
                     break;
                 }
@@ -321,34 +368,68 @@ void app_main(void)
                 int64_t now = esp_timer_get_time();
                 double seconds = (now - last_report) / 1000000.0;
                 uint32_t received = current.frames - previous.frames;
-                ESP_LOGI(TAG, "RX frames=%" PRIu32 " (+%" PRIu32 "), fps=%.2f, bytes=%" PRIu64
+                uint32_t matching = current.matching_frames - previous.matching_frames;
+                ESP_LOGI(TAG, "RX frames=%" PRIu32 " (+%" PRIu32 ", 可编码640x480MJPEG +%" PRIu32
+                         "), fps=%.2f, bytes=%" PRIu64
                          ", last=%u, size=%ux%u, format=%d, empty=%" PRIu32,
-                         current.frames, received, received / seconds, current.bytes,
+                         current.frames, received, matching, received / seconds, current.bytes,
                          (unsigned)current.last_size, current.width, current.height,
                          current.format, current.empty_frames);
 
-                stalls = received ? 0 : stalls + 1;
+                /* 以“可编码帧”判定停顿：非 640×480 MJPEG（如 1280×960）即便一直在收帧，
+                 * 也不能喂 H.264，继续驻留只会无声无息没有视频，故同样计入停顿轮转。 */
+                if (matching) {
+                    stalls = 0;
+                    /* 当前格式已经真正收到可编码帧，下次停顿允许重新做一次原地恢复。 */
+                    same_format_retries = 0;
+                } else {
+                    stalls++;
+                }
                 previous = current;
                 last_report = now;
-                if (stalls >= 3) {
-                    ESP_LOGW(TAG, "连续 15 秒没有有效帧，改试下一个格式");
-                    candidate = (candidate + 1) % s_camera_format_count;
+                if (stalls >= CAMERA_STALL_LIMIT) {
+                    const bool preferred_640_mjpeg =
+                        selected.format == UVC_VS_FORMAT_MJPEG &&
+                        selected.h_res == 640 && selected.v_res == 480;
+                    if (preferred_640_mjpeg &&
+                        same_format_retries < CAMERA_SAME_FORMAT_RETRY_LIMIT) {
+                        same_format_retries++;
+                        ESP_LOGW(TAG,
+                                 "连续 10 秒没有可编码帧：关闭并原地重试 640x480 MJPEG（%u/%u）",
+                                 same_format_retries, CAMERA_SAME_FORMAT_RETRY_LIMIT);
+                        /* candidate 保持不变；下方完成 stop/close 后重新 open/start 同一格式。 */
+                    } else if (preferred_640_mjpeg) {
+                        ESP_LOGW(TAG,
+                                 "640x480 MJPEG 原地重试仍未恢复，改试设备声明的下一个格式");
+                        same_format_retries = 0;
+                        candidate = (candidate + 1) % s_camera_format_count;
+                    } else {
+                        ESP_LOGW(TAG,
+                                 "当前格式连续 10 秒没有可编码帧，继续轮转下一个格式");
+                        same_format_retries = 0;
+                        candidate = (candidate + 1) % s_camera_format_count;
+                    }
                     break;
                 }
             }
         } else {
             ESP_LOGE(TAG, "启动视频流失败：%s", esp_err_to_name(err));
+            same_format_retries = 0;
             candidate = (candidate + 1) % s_camera_format_count;
         }
 
         /* 摄像头已拔出时驱动会处理停止；其他情况下由主任务主动停止。 */
-        if (!(xEventGroupGetBits(s_camera_events) & CAMERA_DISCONNECTED)) {
+        const bool camera_disconnected =
+            (xEventGroupGetBits(s_camera_events) & CAMERA_DISCONNECTED) != 0;
+        if (!camera_disconnected) {
             esp_err_t stop_error = camera_stop(stream);
             if (stop_error != ESP_OK) {
                 ESP_LOGW(TAG, "停止视频流失败：%s", esp_err_to_name(stop_error));
             }
         }
 
+        /* 摄像头拔出时设备句柄已失效，close 可能失败：失败即终止摄像头任务，
+         * 需重新上电恢复。热拔插支持不在本需求范围内。 */
         esp_err_t close_error = uvc_host_stream_close(stream);
         if (close_error != ESP_OK) {
             ESP_LOGE(TAG, "关闭视频流失败：%s，请复位开发板恢复", esp_err_to_name(close_error));
