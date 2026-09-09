@@ -32,7 +32,7 @@ idf.py -B build_main_verified build
 idf.py -B build_main_verified -p COM17 flash monitor
 ```
 
-服务器状态和预览地址为 `http://127.0.0.1:8000/`。`GET /h264` 现在也返回状态，不会再产生 404。电脑 WLAN IPv4 变化后，需要修改 `components/video_streamer/video_streamer.c` 中的 `VIDEO_STREAM_URL`。
+服务器状态和预览地址为 `http://127.0.0.1:8000/`。首次运行启动脚本会自动安装 PyAV/OpenCV。`GET /h264` 返回状态，`GET /preview.mjpg` 是浏览器持续预览流。电脑 WLAN IPv4 变化后，需要修改 `components/video_streamer/video_streamer.c` 中的 `VIDEO_STREAM_URL`。
 
 ## 热复位恢复结论
 
@@ -76,7 +76,7 @@ PC 页面现在显示“最近 10 秒”的帧率和码率，不再只显示受�
 E:\Lummiss_Plant_Robot\src\demo\tools\camera_captures\camera_*.h264
 ```
 
-浏览器预览图保存在内存中。即使 Windows 看图程序锁住 `latest_h264.jpg`，网页仍能更新；关闭看图程序后，磁盘预览文件会继续更新。
+PC 接收线程把每个H.264访问单元放入有界队列，持久PyAV解码器保留参考帧并只解码新帧。浏览器通过一个长期MJPEG连接接收内存中的最新JPEG，不再每500毫秒复制并重新解码整个GOP。磁盘 `latest_h264.jpg` 仅作为每秒一次的调试快照；即使被Windows看图程序锁定，网页仍能更新。若预览队列积压，服务器会等待下一个IDR重新同步，避免丢失P帧后持续花屏。
 
 ## 画面验收
 
@@ -87,6 +87,7 @@ E:\Lummiss_Plant_Robot\src\demo\tools\camera_captures\camera_*.h264
 - 热复位后 10 秒内触发同格式重开，随后恢复约 30 FPS 摄像头输入。
 - 恢复后 UVC 可编码帧约 30 FPS，H.264 编码和发送约 10 FPS。
 - PC 最近速率与固件最近速率相符，`发送失败=0`。
+- PC 页面“网页预览”接近接收帧率，通常约 9～10 FPS，预览丢帧不持续增加。
 - 浏览器或播放器画面颜色正确、连续，无明显破帧。
 - 连续运行 10 分钟无崩溃、USB 溢出、JPEG 解码错误或 H.264 编码错误。
 

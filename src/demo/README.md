@@ -12,6 +12,7 @@
 - Network Manager 通过 ESP-Hosted/SDIO 控制板载 ESP32-C6，以 STA 模式连接固定 WiFi，并通过 DHCP 获取 IPv4 地址。
 - WiFi 断开后每 2 秒自动发起重连；连接状态和 IP 信息只由 Network Manager 对外提供。
 - Video Streamer 抽取 10 FPS 的 MJPEG 帧，经 P4 硬件 JPEG 直出 YUV422、轻量色度抽样/重排和 H.264 硬件编码，再通过 HTTP/1.1 长连接实时发送到局域网 PC。
+- PC 服务器使用持久 PyAV H.264 解码器逐帧解码，通过 `/preview.mjpg` 向浏览器连续推送 MJPEG；浏览器预览不再反复打开和重解整个 GOP。
 
 ## 主组件结构
 
@@ -86,6 +87,14 @@ Set-Location E:\Lummiss_Plant_Robot\src\demo
 cmd /c _build_main.bat
 ```
 
+启动 PC 视频接收服务器：
+
+```powershell
+.\_start_camera_server.bat
+```
+
+首次运行会自动安装 `tools/camera_server_requirements.txt` 中的 PyAV 和 OpenCV。服务器启动后访问 `http://127.0.0.1:8000/`；页面显示H.264接收帧率、浏览器预览帧率和预览队列丢帧数。
+
 在已经激活 ESP-IDF 5.5.5 的终端中：
 
 ```powershell
@@ -112,7 +121,7 @@ bootloader.bin：0x5310
 4. 屏幕黑底横屏显示，中央区域依次播放眨眼、喜、怒、哀、乐、思考、惊讶、疑惑。
 5. 摄像头未插入时，UI 动画和 WiFi 仍应正常运行。
 6. 摄像头插入高速 USB 口后，串口显示使用 `640x480 MJPEG 30 FPS` 和 `Stream started`；每 10 秒的“可编码640x480MJPEG”持续增加，帧率接近 30，`empty=0`。
-7. PC 服务器运行时，`VIDEO_STREAM` 每 10 秒汇总一次，编码和发送接近 10 FPS、码率接近 800 kbps、发送失败为 0，并显示 JPEG、YUV 重排和 H.264 三段平均耗时；PC 的 `tools/camera_captures` 中生成持续增大的 `.h264` 文件。
+7. PC 服务器运行时，`VIDEO_STREAM` 每 10 秒汇总一次，编码和发送接近 10 FPS、发送失败为 0，并显示 JPEG、YUV 重排、H.264 和 HTTP 四段平均耗时；浏览器页面中的“接收”和“网页预览”均应接近 10 FPS，PC 的 `tools/camera_captures` 中生成持续增大的 `.h264` 文件。
 
 密码错误或路由器不可达时，串口会反复出现 `WiFi 已断开`、原因码和 2 秒后重连。若在这些日志之前就出现 Hosted/SDIO 初始化失败，应先检查板载 C6 固件；厂商提供的参考固件位于 `开发板示例/JC1060P470C_I_W_Y/8-Burn operation/Burn files/JC-C6-slave_v2.3.2.bin`。
 

@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import queue
 import shutil
 import threading
 import time
+from collections import deque
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,13 +20,61 @@ from urllib.parse import urlparse
 MAX_JPEG_SIZE = 2 * 1024 * 1024
 MAX_H264_FRAME_SIZE = 1024 * 1024
 SAVE_LOCK = threading.Lock()
-PREVIEW_EVENT = threading.Event()
+PREVIEW_QUEUE_SIZE = 16
+PREVIEW_JPEG_QUALITY = 85
+MJPEG_BOUNDARY = "lummiss-frame"
+
+
+class CameraHTTPServer(ThreadingHTTPServer):
+    """让浏览器的长期 MJPEG 连接不阻止服务器退出。"""
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def enqueue_preview_frame(server: CameraHTTPServer, frame: bytes, is_keyframe: bool) -> None:
+    """把编码帧送入预览队列；积压时等待下一个 IDR 重新同步。
+
+    H.264 的 P 帧依赖前面的参考帧，不能简单丢掉队首后继续解码。队列满时
+    清空积压并等待下一关键帧，使浏览器快速回到最新画面且不会持续花屏。
+    """
+    if not server.preview_enabled:  # type: ignore[attr-defined]
+        return
+
+    with server.preview_queue_lock:  # type: ignore[attr-defined]
+        if server.preview_wait_idr:  # type: ignore[attr-defined]
+            if not is_keyframe:
+                server.preview_dropped += 1  # type: ignore[attr-defined]
+                return
+            server.preview_wait_idr = False  # type: ignore[attr-defined]
+            reset_decoder = True
+        else:
+            reset_decoder = False
+
+        try:
+            server.preview_queue.put_nowait((frame, reset_decoder))  # type: ignore[attr-defined]
+            return
+        except queue.Full:
+            dropped = 0
+            while True:
+                try:
+                    server.preview_queue.get_nowait()  # type: ignore[attr-defined]
+                    dropped += 1
+                except queue.Empty:
+                    break
+            server.preview_dropped += dropped + 1  # type: ignore[attr-defined]
+
+            if is_keyframe:
+                server.preview_wait_idr = False  # type: ignore[attr-defined]
+                server.preview_queue.put_nowait((frame, True))  # type: ignore[attr-defined]
+            else:
+                server.preview_wait_idr = True  # type: ignore[attr-defined]
 
 
 class CameraRequestHandler(BaseHTTPRequestHandler):
     """接收 H.264 帧；保留旧 JPEG 接口用于兼容性检查。"""
 
-    server_version = "LummissCameraServer/2.0"
+    server_version = "LummissCameraServer/3.0"
     protocol_version = "HTTP/1.1"
 
     @property
@@ -84,11 +134,6 @@ class CameraRequestHandler(BaseHTTPRequestHandler):
             with self.server.latest_h264_path.open("ab") as stream:  # type: ignore[attr-defined]
                 stream.write(frame)
 
-            # ESP H.264 的 0/1 分别代表 IDR/I 帧；从关键帧开始重建可独立解码的 GOP。
-            gop_mode = "wb" if frame_type in {"0", "1"} else "ab"
-            with self.server.gop_path.open(gop_mode) as stream:  # type: ignore[attr-defined]
-                stream.write(frame)
-
             if self.server.stream_frames == 0:  # type: ignore[attr-defined]
                 # 统计从第一帧开始，避免服务器提前启动的等待时间拉低平均帧率。
                 self.server.stream_started = now  # type: ignore[attr-defined]
@@ -112,7 +157,7 @@ class CameraRequestHandler(BaseHTTPRequestHandler):
                 recent_fps = self.server.recent_fps  # type: ignore[attr-defined]
                 recent_kbps = self.server.recent_kbps  # type: ignore[attr-defined]
 
-        PREVIEW_EVENT.set()
+        enqueue_preview_frame(self.server, frame, frame_type in {"0", "1"})
         if report:
             print(
                 "H.264 接收："
@@ -173,6 +218,16 @@ class CameraRequestHandler(BaseHTTPRequestHandler):
             # 第一轮 10 秒汇总前也显示实时估算，避免页面有帧却仍显示 0 FPS。
             recent_fps = frames / elapsed
             recent_kbps = total_bytes * 8 / elapsed / 1000
+
+        with self.server.preview_condition:  # type: ignore[attr-defined]
+            preview_times = tuple(self.server.preview_times)  # type: ignore[attr-defined]
+            preview_frames = self.server.preview_frames  # type: ignore[attr-defined]
+            preview_dropped = self.server.preview_dropped  # type: ignore[attr-defined]
+            preview_last_frame = self.server.preview_last_frame_time  # type: ignore[attr-defined]
+        if len(preview_times) >= 2 and now - preview_last_frame <= 2.0:
+            preview_fps = (len(preview_times) - 1) / max(preview_times[-1] - preview_times[0], 0.001)
+        else:
+            preview_fps = 0.0
         return {
             "ok": True,
             "frames": frames,
@@ -183,12 +238,61 @@ class CameraRequestHandler(BaseHTTPRequestHandler):
             "recent_kbps": round(recent_kbps, 1),
             "seconds_since_last_frame": None if last_frame == 0 else round(now - last_frame, 2),
             "stream_file": stream_name,
+            "preview_frames": preview_frames,
+            "preview_fps": round(preview_fps, 2),
+            "preview_dropped": preview_dropped,
         }
+
+    def _handle_mjpeg_stream(self) -> None:
+        """用一个长期 HTTP 连接持续推送最新 JPEG 帧。"""
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", f"multipart/x-mixed-replace; boundary={MJPEG_BOUNDARY}")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+        # 页面在首帧到达前连接时，从当前序号开始等待，避免空转占满一个 CPU 核；
+        # 已有画面时则让循环立即发送当前最新帧。
+        with self.server.preview_condition:  # type: ignore[attr-defined]
+            if self.server.preview_jpeg is None:  # type: ignore[attr-defined]
+                last_sequence = self.server.preview_sequence  # type: ignore[attr-defined]
+            else:
+                last_sequence = self.server.preview_sequence - 1  # type: ignore[attr-defined]
+        try:
+            while True:
+                with self.server.preview_condition:  # type: ignore[attr-defined]
+                    self.server.preview_condition.wait_for(  # type: ignore[attr-defined]
+                        lambda: self.server.preview_sequence != last_sequence,  # type: ignore[attr-defined]
+                        timeout=5.0,
+                    )
+                    sequence = self.server.preview_sequence  # type: ignore[attr-defined]
+                    jpeg = self.server.preview_jpeg  # type: ignore[attr-defined]
+                if jpeg is None or sequence == last_sequence:
+                    continue
+                last_sequence = sequence
+                header = (
+                    f"--{MJPEG_BOUNDARY}\r\n"
+                    "Content-Type: image/jpeg\r\n"
+                    f"Content-Length: {len(jpeg)}\r\n"
+                    f"X-Frame-Sequence: {sequence}\r\n\r\n"
+                ).encode("ascii")
+                self.wfile.write(header)
+                self.wfile.write(jpeg)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
+        except OSError:
+            # 浏览器刷新或关闭页面会断开长期连接，属于正常行为。
+            return
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         path = urlparse(self.path).path
+        if path == "/preview.mjpg":
+            self._handle_mjpeg_stream()
+            return
         if path == "/latest.jpg":
-            with SAVE_LOCK:
+            with self.server.preview_condition:  # type: ignore[attr-defined]
                 preview_jpeg = self.server.preview_jpeg  # type: ignore[attr-defined]
             if preview_jpeg is not None:
                 self._send_bytes(HTTPStatus.OK, "image/jpeg", preview_jpeg)
@@ -219,18 +323,16 @@ class CameraRequestHandler(BaseHTTPRequestHandler):
 <body style="background:#111;color:#eee;text-align:center;font-family:sans-serif">
   <h1>ESP32-P4 H.264 实时回传</h1>
   <p id="status">等待视频帧</p>
-  <img id="camera" alt="等待 ESP32-P4 上传" style="max-width:95vw;border:1px solid #555">
+  <img id="camera" src="/preview.mjpg" alt="等待 ESP32-P4 上传" style="max-width:95vw;border:1px solid #555">
   <script>
-    const image = document.getElementById('camera');
     const status = document.getElementById('status');
-    async function refresh() {
-      image.src = '/latest.jpg?t=' + Date.now();
+    async function refreshStatus() {
       try {
         const data = await (await fetch('/status?t=' + Date.now())).json();
-        status.textContent = `已收 ${data.frames} 帧，最近 ${data.recent_fps} fps，${data.recent_kbps} kbps`;
+        status.textContent = `接收 ${data.recent_fps} fps / ${data.recent_kbps} kbps，网页预览 ${data.preview_fps} fps，预览丢帧 ${data.preview_dropped}`;
       } catch (_) { status.textContent = '服务器状态读取失败'; }
     }
-    refresh(); setInterval(refresh, 500);
+    refreshStatus(); setInterval(refreshStatus, 1000);
   </script>
 </body></html>""".encode("utf-8")
         self._send_bytes(HTTPStatus.OK, "text/html; charset=utf-8", html)
@@ -242,57 +344,71 @@ class CameraRequestHandler(BaseHTTPRequestHandler):
             print(f"HTTP {self.client_address[0]} - {fmt % args}", flush=True)
 
 
-def preview_worker(server: ThreadingHTTPServer) -> None:
-    """低频解码当前 GOP，生成浏览器预览；失败不影响 H.264 原始流保存。"""
+def preview_worker(server: CameraHTTPServer) -> None:
+    """持续解码新收到的 H.264 访问单元，并发布 MJPEG 预览帧。"""
     try:
+        import av  # type: ignore[import-not-found]
         import cv2  # type: ignore[import-not-found]
     except ImportError:
-        print("未安装 OpenCV：仍会保存 H.264，浏览器暂不显示画面", flush=True)
+        server.preview_enabled = False  # type: ignore[attr-defined]
+        print(
+            "缺少 PyAV 或 OpenCV：请运行 python -m pip install -r "
+            "tools/camera_server_requirements.txt",
+            flush=True,
+        )
         return
     if hasattr(cv2, "setLogLevel"):
         cv2.setLogLevel(0)
 
     output_dir = server.output_dir  # type: ignore[attr-defined]
-    gop_path = output_dir / "current_gop.h264"
-    decode_path = output_dir / "preview_decode.h264"
     output_path = output_dir / "latest_h264.jpg"
     output_tmp = output_dir / "latest_h264.tmp.jpg"
-    last_decode = 0.0
-    while True:
-        PREVIEW_EVENT.wait()
-        PREVIEW_EVENT.clear()
-        delay = 0.5 - (time.monotonic() - last_decode)
-        if delay > 0:
-            time.sleep(delay)
-        with SAVE_LOCK:
-            if not gop_path.exists() or gop_path.stat().st_size < 64:
-                continue
-            shutil.copyfile(gop_path, decode_path)
+    decoder = av.CodecContext.create("h264", "r")
+    last_disk_save = 0.0
 
-        capture = cv2.VideoCapture(str(decode_path))
-        latest_frame = None
-        while True:
-            ok, frame = capture.read()
-            if not ok:
-                break
-            latest_frame = frame
-        capture.release()
-        if latest_frame is not None:
-            encoded_ok, encoded = cv2.imencode(".jpg", latest_frame)
+    while True:
+        encoded_frame, reset_decoder = server.preview_queue.get()  # type: ignore[attr-defined]
+        if reset_decoder:
+            decoder = av.CodecContext.create("h264", "r")
+
+        try:
+            decoded_frames = decoder.decode(av.Packet(encoded_frame))
+        except Exception as error:  # PyAV 各版本的 FFmpeg 异常基类名称不同
+            with server.preview_queue_lock:  # type: ignore[attr-defined]
+                server.preview_wait_idr = True  # type: ignore[attr-defined]
+            print(f"预览解码失败，等待下一个 IDR：{error}", flush=True)
+            continue
+
+        for decoded_frame in decoded_frames:
+            bgr_frame = decoded_frame.to_ndarray(format="bgr24")
+            encoded_ok, encoded = cv2.imencode(
+                ".jpg",
+                bgr_frame,
+                [cv2.IMWRITE_JPEG_QUALITY, PREVIEW_JPEG_QUALITY],
+            )
             if encoded_ok:
                 preview_jpeg = encoded.tobytes()
-                # 浏览器从内存取最新图，即使 Windows 看图程序锁住磁盘文件也能继续更新。
-                with SAVE_LOCK:
+                now = time.monotonic()
+                # 条件变量唤醒所有网页客户端；慢客户端只会跳到最新帧。
+                with server.preview_condition:  # type: ignore[attr-defined]
                     server.preview_jpeg = preview_jpeg  # type: ignore[attr-defined]
-                try:
-                    output_tmp.write_bytes(preview_jpeg)
-                    output_tmp.replace(output_path)
-                except PermissionError:
+                    server.preview_sequence += 1  # type: ignore[attr-defined]
+                    server.preview_frames += 1  # type: ignore[attr-defined]
+                    server.preview_last_frame_time = now  # type: ignore[attr-defined]
+                    server.preview_times.append(now)  # type: ignore[attr-defined]
+                    server.preview_condition.notify_all()  # type: ignore[attr-defined]
+
+                # 磁盘快照只作调试，每秒最多写一次；网页直接读取内存。
+                if now - last_disk_save >= 1.0:
                     try:
-                        output_tmp.unlink(missing_ok=True)
+                        output_tmp.write_bytes(preview_jpeg)
+                        output_tmp.replace(output_path)
                     except PermissionError:
-                        pass
-        last_decode = time.monotonic()
+                        try:
+                            output_tmp.unlink(missing_ok=True)
+                        except PermissionError:
+                            pass
+                    last_disk_save = now
 
 
 def main() -> None:
@@ -308,18 +424,17 @@ def main() -> None:
     parser.add_argument(
         "--no-preview",
         action="store_true",
-        help="不启动 cv2 预览解码线程（用于确认该线程的 GIL/IO 是否拖慢 HTTP 上传）",
+        help="不启动持久 H.264 解码和 MJPEG 预览（用于只测试接收与保存）",
     )
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    server = ThreadingHTTPServer((args.host, args.port), CameraRequestHandler)
+    server = CameraHTTPServer((args.host, args.port), CameraRequestHandler)
     server.output_dir = args.output  # type: ignore[attr-defined]
     server.h264_path = args.output / f"camera_{timestamp}.h264"  # type: ignore[attr-defined]
     server.latest_h264_path = args.output / "latest_stream.h264"  # type: ignore[attr-defined]
     server.latest_h264_path.write_bytes(b"")  # type: ignore[attr-defined]
-    server.gop_path = args.output / "current_gop.h264"  # type: ignore[attr-defined]
     server.stream_frames = 0  # type: ignore[attr-defined]
     server.stream_bytes = 0  # type: ignore[attr-defined]
     server.stream_started = time.monotonic()  # type: ignore[attr-defined]
@@ -330,6 +445,16 @@ def main() -> None:
     server.recent_fps = 0.0  # type: ignore[attr-defined]
     server.recent_kbps = 0.0  # type: ignore[attr-defined]
     server.preview_jpeg = None  # type: ignore[attr-defined]
+    server.preview_enabled = not args.no_preview  # type: ignore[attr-defined]
+    server.preview_queue = queue.Queue(maxsize=PREVIEW_QUEUE_SIZE)  # type: ignore[attr-defined]
+    server.preview_queue_lock = threading.Lock()  # type: ignore[attr-defined]
+    server.preview_wait_idr = True  # type: ignore[attr-defined]
+    server.preview_condition = threading.Condition()  # type: ignore[attr-defined]
+    server.preview_sequence = 0  # type: ignore[attr-defined]
+    server.preview_frames = 0  # type: ignore[attr-defined]
+    server.preview_dropped = 0  # type: ignore[attr-defined]
+    server.preview_last_frame_time = 0.0  # type: ignore[attr-defined]
+    server.preview_times = deque(maxlen=60)  # type: ignore[attr-defined]
 
     if args.no_preview:
         print("预览解码线程已禁用（--no-preview）", flush=True)

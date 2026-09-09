@@ -61,7 +61,7 @@ src/esp_draw_bit     厂商示例副本，只作参考
 | `components/network/network_manager.c/.h` | 网络总入口、状态、NVS/netif 和 DHCP 结果 |
 | `components/network/wifi_manager.c/.h` | WiFi 事件、固定凭据连接和自动重连 |
 | `components/video_streamer/video_streamer.c/.h` | MJPEG 队列、硬件 JPEG 解码、YUV422 抽样重排、H.264 编码和 HTTP 传输 |
-| `tools/pc_camera_server.py` | PC 端 H.264 接收、保存、状态接口和预览 |
+| `tools/pc_camera_server.py` | PC 端 H.264 接收、保存、持久PyAV解码和MJPEG网页预览 |
 
 当前统一构建目录为 `build_main_verified`。旧的 `build_screen_verified` 和 `build_camera_verified` 只是历史验证产物，不再对应当前入口。
 
@@ -156,7 +156,7 @@ bootloader.bin：0x5310，Bootloader 分区剩余 13%
 
 冷启动重新插电时上述视频链路已实机打通。只复位 P4、摄像头不断电时，首个 640×480 MJPEG 曾持续 0 帧；实机日志已经证明完整 `stop/close` 后保持 640×480 MJPEG 重新 `open/start`，立即恢复 29.3–30.0 FPS。该轻量恢复方案已经固化，等待从 30 秒缩短为 10 秒；第二次仍失败才轮转格式，1280×960 解码缩放方案不再作为主线。
 
-优化前恢复后的实测值为摄像头约 30 FPS、H.264 编码与发送 8.7–8.8 FPS、685–705 kbps、发送失败 0。除 RGB 软件换算外，旧限速器对 100000 us 做严格比较也会因 30 FPS 的整数时间戳取整误跳到第 4 帧；现已改为带 5 ms 容差的固定时间轴。新固件每 10 秒输出 JPEG 解码、YUV 重排、H.264 编码和 HTTP 发送的平均毫秒数，并把主动限速与真正的队列过载丢帧分开。由于视频路径不再经过 RGB565，原字节序偏绿问题及其两个校准宏已一并移除。
+优化后的实测值为摄像头 29.3～30.0 FPS、H.264 编码与发送 9.9～10.2 FPS、发送失败 0；平均耗时约为 JPEG 4.4 ms、YUV重排11.3 ms、H.264 5.1～5.2 ms、逐帧HTTP 32.9～42.2 ms。10 FPS目标已经达到。PC预览原先每500 ms复制当前GOP并从头解码，网页也每500 ms重载单张JPEG，所以被硬限制为约2 FPS。现已改成有界H.264队列、持久PyAV解码器和 `/preview.mjpg` 长连接，现有真实码流的PC离线解码加JPEG测试速度约944 FPS，接口集成测试通过，等待用户实时画面验收。
 
 注意：开发板是 ESP32-P4 revision v1.3，`CONFIG_ESP_REV_MIN_FULL=100`。`esp_h264` 1.4.0 的通用格式表虽然列有 `RGB565_LE`，该修订的实际参数检查只接受 `O_UYY_E_VYY`，所以不能直接把 RGB565 传给编码器。当前 YUV422 快速路径是在这一硬件约束下删除主要软件换算开销的安全实现。
 
@@ -206,8 +206,8 @@ VS Code 当前默认使用 `build_main_verified`，生成器必须为 Ninja。�
 
 ## 10. 现在最需要解决的问题
 
-1. **YUV422 快速路径待真机复验。** 构建已经通过；需确认画面无成对像素/隔行错位，并查看 JPEG/YUV/H264 分段耗时、编码发送是否达到约 10 FPS。
-2. **热复位恢复等待已缩短。** 同格式重开已证明有效；需确认新固件在约 10 秒时自动恢复，且不会引入重复开关流问题。
+1. **持久解码/MJPEG网页预览待实时验收。** PC端离线性能和HTTP接口测试已通过；需重启服务器并确认页面预览约9～10 FPS、画面连续、预览丢帧不持续增加。
+2. **固件10 FPS和热复位恢复已通过。** 实机日志证明约10秒同格式重开后恢复30 FPS输入，H.264稳定约10 FPS；后续提升到20～30 FPS需要拆分编码与网络任务并改为低开销持久传输。
 3. **屏幕真机结论缺失。** 构建通过不能证明 ST7789 的颜色、方向、偏移和 40 MHz 刷新稳定，需要烧录后的照片/视频及串口日志。
 4. **阶段 0 尚未冻结。** 除屏幕、USB 和 P4-C6 SDIO 外，关键器件型号与 GPIO 未定，会阻塞阶段 4、5、9、11。
 5. **当前只完成第一层模块化。** 屏幕和摄像头已提取为驱动文件，但仍位于主组件，尚未拆成独立 ESP-IDF 组件、服务层和业务层。
@@ -216,9 +216,9 @@ VS Code 当前默认使用 `build_main_verified`，生成器必须为 Ninja。�
 
 ## 11. 按流程继续的顺序
 
-1. 烧录当前固件，保持摄像头供电后只复位 P4；确认约 10 秒触发一次 640×480 同格式重开，随后恢复约 30 FPS。
-2. 检查 PC 预览颜色和像素排列，并保存至少两行新的 `VIDEO_STREAM: H.264` 统计；目标是编码/发送接近 10 FPS、失败为 0，重点记录 JPEG/YUV/H264 三段耗时。
-3. 连续运行 10 分钟，观察 USB 溢出、JPEG/H.264 错误、WiFi 发送失败和 ESP-Hosted 崩溃。
+1. 关闭旧PC服务器后重新运行 `src/demo/_start_camera_server.bat`，打开 `http://127.0.0.1:8000/`；确认接收和网页预览均约9～10 FPS。
+2. 连续运行10分钟，观察页面预览丢帧、固件队列过载丢帧、USB/JPEG/H.264错误、WiFi发送失败和ESP-Hosted崩溃。
+3. 网页预览通过后，将固件的视频编解码和网络发送拆为两个FreeRTOS任务，再把逐帧HTTP POST替换为持久WebSocket，逐步验证20 FPS和30 FPS。
 4. 补齐阶段 0 的 BOM、完整 GPIO 表和音频、传感器、电机接口定义；P4-C6 SDIO 引脚已经按厂商示例确定。
 5. 完成阶段 2：建立 HOME、LISTEN、THINK、REPLY、SLEEP、FAULT 六个页面骨架，并增加文字显示。
 6. 继续把 display、ui、expression 拆分为独立组件，提供 `expression_play()` 等统一接口。
