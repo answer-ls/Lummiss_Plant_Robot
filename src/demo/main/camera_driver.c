@@ -36,7 +36,11 @@ static bool s_saw_real_formats;
 
 typedef struct {
     uint32_t frames;
-    uint32_t matching_frames;   /* 其中属于“可编码 640×480 MJPEG”的帧数，驱动轮转判定用它 */
+    uint32_t target_frames;      /* 分辨率和格式符合目标的 MJPEG 帧，包括损坏帧 */
+    uint32_t complete_frames;    /* SOI/EOI 完整且未超过缓冲上限，可送入解码器 */
+    uint32_t missing_soi_frames;
+    uint32_t missing_eoi_frames;
+    uint32_t oversized_frames;
     uint32_t empty_frames;
     uint64_t bytes;
     size_t last_size;
@@ -69,8 +73,9 @@ static float camera_interval_to_fps(uint32_t interval)
     return interval ? 10000000.0f / interval : 30.0f;
 }
 
-/* LRCPG720p 已实测支持以下 MJPEG 模式（当前 H.264 链路只吃 640×480）。
- * 若设备连接回调暂时没有给出格式列表，使用该列表避免再次传入 0 FPS。 */
+/* LRCPG720p 已实测支持以下 MJPEG 模式（当前 H.264 链路只吃
+ * VIDEO_STREAM_WIDTH×VIDEO_STREAM_HEIGHT）。顺序即轮转时的偏好顺序，
+ * 目标分辨率放最前，若设备连接回调暂时没有给出格式列表，使用该列表避免再次传入 0 FPS。 */
 static void camera_load_known_formats(void)
 {
     static const struct {
@@ -78,12 +83,12 @@ static void camera_load_known_formats(void)
         unsigned width;
         unsigned height;
     } known_sizes[] = {
+        {UVC_VS_FORMAT_MJPEG, VIDEO_STREAM_WIDTH, VIDEO_STREAM_HEIGHT},
         {UVC_VS_FORMAT_MJPEG, 640, 480},
-        {UVC_VS_FORMAT_MJPEG, 1280, 720},
-        {UVC_VS_FORMAT_MJPEG, 640, 360},
-        {UVC_VS_FORMAT_MJPEG, 800, 600},
         {UVC_VS_FORMAT_MJPEG, 1280, 960},
+        {UVC_VS_FORMAT_MJPEG, 800, 600},
         {UVC_VS_FORMAT_MJPEG, 720, 960},
+        {UVC_VS_FORMAT_MJPEG, 640, 360},
     };
 
     s_camera_format_count = sizeof(known_sizes) / sizeof(known_sizes[0]);
@@ -97,7 +102,8 @@ static void camera_load_known_formats(void)
     }
     s_camera_device_address = UVC_HOST_ANY_DEV_ADDR;
     s_camera_stream_index = 0;
-    ESP_LOGW(TAG, "暂未收到格式回调，使用 LRCPG720p 已知格式，优先 640x480 MJPEG 30 FPS");
+    ESP_LOGW(TAG, "暂未收到格式回调，使用 LRCPG720p 已知格式，优先 %ux%u MJPEG 30 FPS",
+             VIDEO_STREAM_WIDTH, VIDEO_STREAM_HEIGHT);
     xEventGroupSetBits(s_camera_events, CAMERA_FORMATS_READY);
 }
 
@@ -131,11 +137,13 @@ static void camera_driver_event_cb(const uvc_host_driver_event_data_t *event, vo
     s_camera_format_count = count;
     s_saw_real_formats = true;
 
-    /* 优先 640×480 MJPEG：冷启动时该模式已实机跑通完整视频链路。
-     * 热复位后可能出现 0 帧，主循环会先原地重开一次再决定是否轮转。 */
+    /* 优先 VIDEO_STREAM_WIDTH×VIDEO_STREAM_HEIGHT MJPEG：冷启动时该模式
+     * 已实机跑通完整视频链路。热复位后可能出现 0 帧，主循环会先原地重开
+     * 一次再决定是否轮转。 */
     for (size_t i = 0; i < count; ++i) {
         if (s_camera_formats[i].format == UVC_VS_FORMAT_MJPEG &&
-            s_camera_formats[i].h_res == 640 && s_camera_formats[i].v_res == 480) {
+            s_camera_formats[i].h_res == VIDEO_STREAM_WIDTH &&
+            s_camera_formats[i].v_res == VIDEO_STREAM_HEIGHT) {
             uvc_host_frame_info_t preferred = s_camera_formats[i];
             s_camera_formats[i] = s_camera_formats[0];
             s_camera_formats[0] = preferred;
@@ -157,21 +165,40 @@ static void camera_driver_event_cb(const uvc_host_driver_event_data_t *event, vo
         }
     }
     ESP_LOGI(TAG,
-             "摄像头格式：共 %u 个（MJPEG=%u，YUY2=%u，H26x=%u）；使用 640x480 MJPEG 30 FPS",
-             (unsigned)count, mjpeg_count, yuy2_count, h26x_count);
+             "摄像头格式：共 %u 个（MJPEG=%u，YUY2=%u，H26x=%u）；使用 %ux%u MJPEG 30 FPS",
+             (unsigned)count, mjpeg_count, yuy2_count, h26x_count,
+             VIDEO_STREAM_WIDTH, VIDEO_STREAM_HEIGHT);
     xEventGroupSetBits(s_camera_events, CAMERA_FORMATS_READY);
 }
 
-/* 帧回调只做统计，并按限速策略将完整的 640×480 MJPEG 帧复制到解码队列。
- * JPEG 解码、H.264 编码和 HTTP 请求由独立任务执行，本回调不会阻塞 USB 收帧。 */
+/* 帧回调只做统计，并按限速策略将完整的 VIDEO_STREAM_WIDTH×VIDEO_STREAM_HEIGHT
+ * MJPEG 帧复制到解码队列。JPEG 解码、H.264 编码和 HTTP 请求由独立任务执行，
+ * 本回调不会阻塞 USB 收帧。 */
 static bool camera_frame_cb(const uvc_host_frame_t *frame, void *ctx)
 {
     (void)ctx;
     const bool valid_frame = frame->data != NULL && frame->data_len > 0;
-    const bool encodable_frame = valid_frame &&
-                                 frame->vs_format.format == UVC_VS_FORMAT_MJPEG &&
-                                 frame->vs_format.h_res == 640 &&
-                                 frame->vs_format.v_res == 480;
+    const bool target_frame = valid_frame &&
+                              frame->vs_format.format == UVC_VS_FORMAT_MJPEG &&
+                              frame->vs_format.h_res == VIDEO_STREAM_WIDTH &&
+                              frame->vs_format.v_res == VIDEO_STREAM_HEIGHT;
+    const bool oversized_frame = target_frame &&
+                                 frame->data_len > VIDEO_STREAM_JPEG_MAX_SIZE;
+    const bool has_soi = target_frame && frame->data_len >= 2 &&
+                         frame->data[0] == 0xff && frame->data[1] == 0xd8;
+    /* 从末尾反查 EOI：兼容某些 UVC 摄像头在 JPEG 后附带少量填充字节，
+     * 提交时只复制到 FF D9，避免把填充内容交给硬件解码器。 */
+    size_t jpeg_size = 0;
+    if (target_frame && frame->data_len >= 2) {
+        for (size_t end = frame->data_len; end >= 2; --end) {
+            if (frame->data[end - 2] == 0xff && frame->data[end - 1] == 0xd9) {
+                jpeg_size = end;
+                break;
+            }
+        }
+    }
+    const bool has_eoi = jpeg_size != 0;
+    const bool complete_frame = target_frame && !oversized_frame && has_soi && has_eoi;
 
     portENTER_CRITICAL(&s_stats_lock);
     if (valid_frame) {
@@ -181,8 +208,20 @@ static bool camera_frame_cb(const uvc_host_frame_t *frame, void *ctx)
         s_stats.width = frame->vs_format.h_res;
         s_stats.height = frame->vs_format.v_res;
         s_stats.format = frame->vs_format.format;
-        if (encodable_frame) {
-            s_stats.matching_frames++;
+        if (target_frame) {
+            s_stats.target_frames++;
+            if (complete_frame) {
+                s_stats.complete_frames++;
+            }
+            if (!has_soi) {
+                s_stats.missing_soi_frames++;
+            }
+            if (!has_eoi) {
+                s_stats.missing_eoi_frames++;
+            }
+            if (oversized_frame) {
+                s_stats.oversized_frames++;
+            }
         }
     } else {
         s_stats.empty_frames++;
@@ -190,8 +229,8 @@ static bool camera_frame_cb(const uvc_host_frame_t *frame, void *ctx)
     portEXIT_CRITICAL(&s_stats_lock);
 
     /* MJPEG 帧复制必须在统计临界区之外执行。 */
-    if (encodable_frame) {
-        video_streamer_submit_jpeg(frame->data, frame->data_len);
+    if (complete_frame) {
+        video_streamer_submit_jpeg(frame->data, jpeg_size);
     }
     return true;
 }
@@ -317,10 +356,13 @@ void camera_driver_run(void)
                 .format = selected.format,
             },
             .advanced = {
-                .frame_size = 0,
+                /* 摄像头协商的 dwMaxVideoFrameSize 偏小会截断复杂画面。
+                 * 显式预留 512KB，并将大块 DMA 缓冲放入 PSRAM。 */
+                .frame_size = VIDEO_STREAM_JPEG_MAX_SIZE,
                 .number_of_frame_buffers = 3,
-                .number_of_urbs = 3,
-                .urb_size = 10 * 1024,
+                /* 较大的 URB 减少等时传输的提交和中断频率。 */
+                .number_of_urbs = 4,
+                .urb_size = 32 * 1024,
                 .frame_heap_caps = MALLOC_CAP_SPIRAM,
             },
         };
@@ -368,17 +410,22 @@ void camera_driver_run(void)
                 int64_t now = esp_timer_get_time();
                 double seconds = (now - last_report) / 1000000.0;
                 uint32_t received = current.frames - previous.frames;
-                uint32_t matching = current.matching_frames - previous.matching_frames;
-                ESP_LOGI(TAG, "RX frames=%" PRIu32 " (+%" PRIu32 ", 可编码640x480MJPEG +%" PRIu32
+                uint32_t complete = current.complete_frames - previous.complete_frames;
+                ESP_LOGI(TAG, "RX frames=%" PRIu32 " (+%" PRIu32 ", 完整%ux%uMJPEG +%" PRIu32
                          "), fps=%.2f, bytes=%" PRIu64
-                         ", last=%u, size=%ux%u, format=%d, empty=%" PRIu32,
-                         current.frames, received, matching, received / seconds, current.bytes,
+                         ", last=%u, size=%ux%u, format=%d, empty=%" PRIu32
+                         ", JPEG目标=%" PRIu32 ", 缺SOI=%" PRIu32
+                         ", 缺EOI=%" PRIu32 ", 过大=%" PRIu32,
+                         current.frames, received, VIDEO_STREAM_WIDTH, VIDEO_STREAM_HEIGHT,
+                         complete, received / seconds, current.bytes,
                          (unsigned)current.last_size, current.width, current.height,
-                         current.format, current.empty_frames);
+                         current.format, current.empty_frames, current.target_frames,
+                         current.missing_soi_frames, current.missing_eoi_frames,
+                         current.oversized_frames);
 
-                /* 以“可编码帧”判定停顿：非 640×480 MJPEG（如 1280×960）即便一直在收帧，
-                 * 也不能喂 H.264，继续驻留只会无声无息没有视频，故同样计入停顿轮转。 */
-                if (matching) {
+                /* 以“可编码帧”判定停顿：非目标分辨率 MJPEG（如 1280×960）即便一直在
+                 * 收帧，也不能喂 H.264，继续驻留只会无声无息没有视频，故同样计入停顿轮转。 */
+                if (complete) {
                     stalls = 0;
                     /* 当前格式已经真正收到可编码帧，下次停顿允许重新做一次原地恢复。 */
                     same_format_retries = 0;
@@ -388,19 +435,22 @@ void camera_driver_run(void)
                 previous = current;
                 last_report = now;
                 if (stalls >= CAMERA_STALL_LIMIT) {
-                    const bool preferred_640_mjpeg =
+                    const bool preferred_mjpeg =
                         selected.format == UVC_VS_FORMAT_MJPEG &&
-                        selected.h_res == 640 && selected.v_res == 480;
-                    if (preferred_640_mjpeg &&
+                        selected.h_res == VIDEO_STREAM_WIDTH &&
+                        selected.v_res == VIDEO_STREAM_HEIGHT;
+                    if (preferred_mjpeg &&
                         same_format_retries < CAMERA_SAME_FORMAT_RETRY_LIMIT) {
                         same_format_retries++;
                         ESP_LOGW(TAG,
-                                 "连续 10 秒没有可编码帧：关闭并原地重试 640x480 MJPEG（%u/%u）",
+                                 "连续 10 秒没有可编码帧：关闭并原地重试 %ux%u MJPEG（%u/%u）",
+                                 VIDEO_STREAM_WIDTH, VIDEO_STREAM_HEIGHT,
                                  same_format_retries, CAMERA_SAME_FORMAT_RETRY_LIMIT);
                         /* candidate 保持不变；下方完成 stop/close 后重新 open/start 同一格式。 */
-                    } else if (preferred_640_mjpeg) {
+                    } else if (preferred_mjpeg) {
                         ESP_LOGW(TAG,
-                                 "640x480 MJPEG 原地重试仍未恢复，改试设备声明的下一个格式");
+                                 "%ux%u MJPEG 原地重试仍未恢复，改试设备声明的下一个格式",
+                                 VIDEO_STREAM_WIDTH, VIDEO_STREAM_HEIGHT);
                         same_format_retries = 0;
                         candidate = (candidate + 1) % s_camera_format_count;
                     } else {

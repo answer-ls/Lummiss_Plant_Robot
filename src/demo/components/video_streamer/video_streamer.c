@@ -23,13 +23,15 @@ static const char *TAG = "VIDEO_STREAM";
 
 /* 当前电脑 WLAN IPv4 为 192.168.1.66。地址变化后修改此项并重新构建。 */
 #define VIDEO_STREAM_URL              "http://192.168.1.66:8000/h264"
-#define VIDEO_WIDTH                   640
-#define VIDEO_HEIGHT                  480
-/* 双任务流水线目标帧率：编码/HTTP 拆开后按实测估算可稳定 20 FPS。
+/* 分辨率统一取 video_streamer.h 的公共常量，与摄像头侧"可编码帧"门控一致。 */
+#define VIDEO_WIDTH                   VIDEO_STREAM_WIDTH
+#define VIDEO_HEIGHT                  VIDEO_STREAM_HEIGHT
+/* 800×600 的像素量高于 640×480，先使用 15fps 保留编解码余量。
  * GOP 与 PTS 除数跟随该宏，避免改帧率时漏改。 */
-#define VIDEO_ENCODE_FPS              20
+#define VIDEO_ENCODE_FPS              15
 #define VIDEO_GOP                     VIDEO_ENCODE_FPS
-#define VIDEO_BITRATE                 1200000
+/* 800×600 使用 1.5Mbps，在清晰度和 WiFi 发送压力之间取平衡。 */
+#define VIDEO_BITRATE                 1500000
 #define VIDEO_QP_MIN                  20
 #define VIDEO_QP_MAX                  40
 /* 摄像头侧 MJPEG 输入环槽数（提交时 memcpy 进槽）。 */
@@ -37,8 +39,6 @@ static const char *TAG = "VIDEO_STREAM";
 /* H.264 编码输出（码流）槽数：编码任务写满一个槽就交给发送任务，
  * 发送完成归还。槽数 4 可在 HTTP 短暂变慢时吸收抖动。 */
 #define VIDEO_OUT_SLOT_COUNT          4
-/* 640×480 MJPEG 单帧压缩数据上限；PSRAM 充足，尺寸取大留余量。 */
-#define VIDEO_JPEG_MAX_SIZE           (128 * 1024)
 /* 摄像头 MJPEG 实测为 YUV422 采样；JPEG 硬件直接输出 U Y0 V Y1，16bpp。 */
 #define VIDEO_YUV422_SIZE             (VIDEO_WIDTH * VIDEO_HEIGHT * 2)
 /* H.264 硬件输入固定为 O_UYY_E_VYY 交错 YUV420，1.5 字节/像素。 */
@@ -161,12 +161,15 @@ static esp_http_client_handle_t video_http_client_create(void)
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client != NULL) {
-        /* 帧率头必须与 VIDEO_ENCODE_FPS 一致，PC 端按它推算时间轴。 */
+        /* 分辨率/帧率头必须与编码配置一致，PC 端按它推算时间轴。 */
+        char size_text[16];
         char fps_text[8];
+        snprintf(size_text, sizeof(size_text), "%u", VIDEO_WIDTH);
+        esp_http_client_set_header(client, "X-Video-Width", size_text);
+        snprintf(size_text, sizeof(size_text), "%u", VIDEO_HEIGHT);
+        esp_http_client_set_header(client, "X-Video-Height", size_text);
         snprintf(fps_text, sizeof(fps_text), "%d", VIDEO_ENCODE_FPS);
         esp_http_client_set_header(client, "Content-Type", "video/h264");
-        esp_http_client_set_header(client, "X-Video-Width", "640");
-        esp_http_client_set_header(client, "X-Video-Height", "480");
         esp_http_client_set_header(client, "X-Video-FPS", fps_text);
         esp_http_client_set_header(client, "Connection", "keep-alive");
     }
@@ -334,7 +337,7 @@ static void video_upload_task(void *arg)
 
 /* 编解码任务（钉核 1，优先 8）：
  * JPEG 解码 → YUV 重排 → H.264 编码，完成后把输出槽索引交给上传任务，
- * 自身不等待网络，保证 20 FPS 门控下编码侧稳定供帧。 */
+ * 自身不等待网络，保证目标帧率下编码侧稳定供帧。 */
 static void video_codec_task(void *arg)
 {
     (void)arg;
@@ -412,8 +415,9 @@ static void video_codec_task(void *arg)
 
     ESP_LOGI(TAG,
              "编解码/上传双任务已就绪：MJPEG(YUV422直出)→硬编 H.264 "
-             "640x480@%dfps，%dkbps，GOP=%d，输出槽=%d，HTTP=%s",
-             VIDEO_ENCODE_FPS, VIDEO_BITRATE / 1000, VIDEO_GOP,
+             "%ux%u@%dfps，%dkbps，GOP=%d，输出槽=%d，HTTP=%s",
+             VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_ENCODE_FPS,
+             VIDEO_BITRATE / 1000, VIDEO_GOP,
              VIDEO_OUT_SLOT_COUNT, VIDEO_STREAM_URL);
 
     unsigned slot_index;
@@ -568,7 +572,7 @@ esp_err_t video_streamer_init(void)
     };
     size_t slot_size = 0;
     for (unsigned i = 0; i < VIDEO_SLOT_COUNT; ++i) {
-        s_slots[i].data = jpeg_alloc_decoder_mem(VIDEO_JPEG_MAX_SIZE,
+        s_slots[i].data = jpeg_alloc_decoder_mem(VIDEO_STREAM_JPEG_MAX_SIZE,
                                                  &slot_alloc_cfg, &slot_size);
         if (s_slots[i].data == NULL) {
             ESP_LOGE(TAG, "分配第 %u 个 MJPEG PSRAM 缓冲失败", i);
@@ -607,7 +611,7 @@ bool video_streamer_submit_jpeg(const uint8_t *data,
                                 size_t data_len)
 {
     if (!s_initialized || !network_manager_is_connected() || data == NULL ||
-        data_len == 0 || data_len > VIDEO_JPEG_MAX_SIZE) {
+        data_len == 0 || data_len > VIDEO_STREAM_JPEG_MAX_SIZE) {
         return false;
     }
 
