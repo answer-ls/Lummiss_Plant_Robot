@@ -9,6 +9,7 @@
 #include "display_driver.h"
 #include "home_info.h"
 #include "network_manager.h"
+#include "screen_carousel.h"
 
 static const char *TAG = "APP_MAIN";
 
@@ -20,6 +21,11 @@ static void ui_task(void *arg)
     (void)arg;
     ESP_LOGI(TAG, "UI Task 启动");
     display_driver_start();
+
+    /* 屏幕轮播：天气首页 5 秒 → TF 卡上每个 GIF 各 5 秒 → 回到首页，循环。
+     * 必须放在 display_driver_start() 之后：轮播把已建好的天气首页当作
+     * 循环的第一环，也依赖这里初始化好的 LVGL。 */
+    screen_carousel_start();
 
     while (true) {
         /* 页面刷新由 LVGL 定时器完成，本任务保留给后续 UI 事件队列。 */

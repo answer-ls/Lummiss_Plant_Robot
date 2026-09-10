@@ -10,6 +10,14 @@ sdkconfig.old
 # ===== Vendor dev-board examples (not to be uploaded) =====
 开发板示例/
 
+# ===== 项目文档：GIF 素材体积大且可本地留存，入库的只有转换脚本 =====
+项目文档/GIF/
+# Word 打开文档时生成的锁文件
+~$*
+
+# ===== 第三方组件源码副本，本身是独立 git 仓库，只作参考 =====
+esp-h264-component-source/
+
 # ===== ESP component manager (downloaded dependencies, regenerable) =====
 managed_components/
 **/components/*__*/

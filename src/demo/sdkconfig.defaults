@@ -39,6 +39,22 @@ CONFIG_LV_FONT_SIMSUN_16_CJK=y
 CONFIG_LWIP_SNTP_MAX_SERVERS=2
 CONFIG_LV_BUILD_EXAMPLES=n
 
+# SD 卡 GIF 运行时解码：lv_gif/gifdec 解 320x180 需要约 230KB 画布，
+# 超过 LVGL 内置堆的 128KB 上限，必须改走 malloc()（大块会落 PSRAM）。
+CONFIG_LV_MEM_CUSTOM=y
+CONFIG_LV_USE_GIF=y
+# lv_gif 通过 LVGL 文件系统读卡：用 POSIX 驱动（底层 fopen），
+# 盘符 'S'，路径直接写 VFS 挂载点 /sdcard。
+CONFIG_LV_USE_FS_POSIX=y
+CONFIG_LV_FS_POSIX_LETTER=83
+CONFIG_LV_FS_POSIX_PATH=""
+
+# 卡上的素材目录是 expressions/，11 个字符超过 8.3；文件名 exp_01.gif 才是 8.3。
+# 默认只认短名，按 "expressions" 打不开（FATFS 看到的是 EXPRESS~1）。
+CONFIG_FATFS_LONG_FILENAMES=y
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_MAX_LFN=255
+
 # 板载 ESP32-C6 网络协处理器：ESP-Hosted 通过 SDIO Slot 1 通信。
 # 引脚和时钟来自同型号 JC1060P470C 厂商的小智示例。
 CONFIG_ESP_HOSTED_ENABLED=y
