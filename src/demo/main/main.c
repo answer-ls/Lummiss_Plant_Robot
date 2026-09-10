@@ -7,11 +7,12 @@
 
 #include "camera_driver.h"
 #include "display_driver.h"
+#include "home_info.h"
 #include "network_manager.h"
 
 static const char *TAG = "APP_MAIN";
 
-/* UI 初始化包含 LCD、LVGL 和表情播放器。
+/* UI 初始化包含 LCD、LVGL 和动态时间天气首页。
  * 初始化完成后，LVGL Port 的内部任务负责定时器和屏幕刷新；本任务保持存活，
  * 后续可以在这里接收 UI 队列事件，统一执行页面和表情切换。 */
 static void ui_task(void *arg)
@@ -21,7 +22,7 @@ static void ui_task(void *arg)
     display_driver_start();
 
     while (true) {
-        /* 当前基础工程还没有业务事件，先低频休眠避免空转占用 CPU。 */
+        /* 页面刷新由 LVGL 定时器完成，本任务保留给后续 UI 事件队列。 */
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
@@ -53,6 +54,12 @@ void app_main(void)
         /* 网络故障不能阻止屏幕和摄像头启动，后续由故障管理器统一处理。 */
         ESP_LOGE(TAG, "Network Manager 启动失败：%s",
                  esp_err_to_name(network_error));
+    }
+
+    /* 首页信息服务独立等待网络并访问定位、网络时间和天气接口。 */
+    esp_err_t home_error = home_info_start();
+    if (home_error != ESP_OK) {
+        ESP_LOGE(TAG, "首页信息服务启动失败：%s", esp_err_to_name(home_error));
     }
 
     BaseType_t result = xTaskCreate(ui_task, "ui_task", 8192, NULL, 6, NULL);

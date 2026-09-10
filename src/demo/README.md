@@ -5,10 +5,11 @@
 ## 当前功能
 
 - UI Task 初始化 GMT020-02-8P/ST7789 和 LVGL 8.4。
-- 屏幕横屏分辨率为 320×240，循环播放现有 8 组动画表情。
+- 屏幕横屏分辨率为 320×240，显示动态时间首页：日期、星期、天气、温度和大号时间；电量等电池管理完成后再接入。
+- 首页服务联网后通过公网 IP 自动取得坐标和时区，使用网络校时并从 Open-Meteo 获取当前天气；时间每秒刷新，天气每 30 分钟刷新。
 - Camera Task 初始化 ESP32-P4 高速 USB Host 和 UVC 驱动。
 - LRCPG720p 接入后优先使用 800×600 MJPEG 30 FPS，并每 10 秒输出 JPEG 完整性和收帧统计。
-- 屏幕动画缓冲和摄像头帧缓冲使用 PSRAM。
+- 摄像头帧缓冲使用 PSRAM；首页图像作为 RGB565 资源嵌入固件。
 - Network Manager 通过 ESP-Hosted/SDIO 控制板载 ESP32-C6，以 STA 模式连接固定 WiFi，并通过 DHCP 获取 IPv4 地址。
 - WiFi 断开后每 2 秒自动发起重连；连接状态和 IP 信息只由 Network Manager 对外提供。
 - Video Streamer 从完整 MJPEG 帧中抽取 15 FPS，经 P4 硬件 JPEG 直出 YUV422、轻量色度抽样/重排和 H.264 硬件编码，再由独立上传任务通过 HTTP/1.1 长连接实时发送到局域网 PC。当前编码参数为 800×600、1.5 Mbps、GOP 15。
@@ -28,11 +29,15 @@ components/video_streamer/
 ├── CMakeLists.txt           编码器、HTTP 与 Network Manager 依赖
 └── idf_component.yml        esp_h264 1.4.0 版本要求
 
+components/home_info/
+├── home_info.c/.h           自动定位、网络校时、天气 API 和线程安全快照
+└── CMakeLists.txt           HTTPS、JSON 与 Network Manager 依赖
+
 main/
 ├── main.c                    唯一 app_main()，创建 FreeRTOS 任务
-├── display_driver.c/.h       ST7789、LVGL 和表情播放器
+├── display_driver.c/.h       ST7789、LVGL 和动态时间天气首页
 ├── camera_driver.c/.h        USB Host 和 UVC 摄像头管理
-├── gif_assets.c/.h           8 组表情动画资源
+├── gif_assets.c/.h           保留的 8 组表情动画资源，当前首页不编译
 └── idf_component.yml         管理组件版本
 ```
 
@@ -104,10 +109,10 @@ idf.py -B build_main_verified -p COM17 flash monitor
 
 VS Code 工作区也已默认使用 `build_main_verified` 和 Ninja。
 
-2026-09-09 切换到 800×600 并加入 JPEG 完整性检查后的联合构建结果：
+2026-09-10 接入动态时间、天气 API 和镜像修正后的联合构建结果：
 
 ```text
-lummiss_main.bin：0x196cc0
+lummiss_main.bin：0x19afb0
 8 MB 应用分区剩余：80%
 bootloader.bin：0x5310
 构建结果：通过
@@ -118,8 +123,8 @@ bootloader.bin：0x5310
 1. 串口出现 `APP_MAIN`，随后可看到 ESP-Hosted 初始化和 SDIO 与 C6 建链日志。
 2. 出现 `WiFi STA 已启动，开始连接路由器` 和 `正在通过 ESP32-C6 连接 WiFi`。
 3. 成功连接后出现 `WiFi 联网成功`，并输出非 `0.0.0.0` 的 IPv4、网关和掩码。这才表示 P4→C6→路由器→DHCP 链路完整成功。
-4. 屏幕黑底横屏显示，中央区域依次播放眨眼、喜、怒、哀、乐、思考、惊讶、疑惑。
-5. 摄像头未插入时，UI 动画和 WiFi 仍应正常运行。
+4. 屏幕黑底横屏显示时间首页，文字方向正常且不再左右镜像；当前不会显示电量。
+5. 联网前页面显示占位符；联网后串口依次出现“网络时间同步成功”“自动定位成功”和“天气更新”，随后页面显示当前日期、星期、时间、天气和温度。
 6. 摄像头插入高速 USB 口后，串口显示使用 `800x600 MJPEG 30 FPS` 和 `Stream started`。热复位后首流可能为 0 帧，10 秒后原地重开可恢复；实测恢复后输入约 22 FPS、完整 JPEG 约 20～21 FPS。
 7. PC 服务器运行时，`VIDEO_STREAM` 每 10 秒汇总一次，编码和发送应接近 15 FPS、码率约 1.5 Mbps、发送失败为 0，并显示 JPEG、YUV 重排、H.264 和 HTTP 四段平均耗时；浏览器页面中的“接收”和“网页预览”应接近 15 FPS，PC 的 `tools/camera_captures` 中生成持续增大的 `.h264` 文件。
 
