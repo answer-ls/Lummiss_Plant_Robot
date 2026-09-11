@@ -29,7 +29,9 @@ static const char *TAG = "CAMERA";
 #define CAMERA_USB_EVENTS_EXITED   BIT4
 #define CAMERA_USB_EVENTS_PRIORITY 19
 #define CAMERA_UVC_DRIVER_PRIORITY 20
-#define CAMERA_USB_URB_COUNT        64
+/* URB 对照测试当前档位：64 为已完成基线，下一轮使用 96，再切换到 128。
+ * 只改变这个数量，其他摄像头、编码和网络参数保持不变。 */
+#define CAMERA_USB_URB_COUNT        96
 #define CAMERA_USB_URB_SIZE         (32U * 1024U)
 #define CAMERA_FRAME_BUFFER_COUNT   3
 #define CAMERA_REPORT_INTERVAL_MS   5000
@@ -627,8 +629,8 @@ void camera_driver_run(void)
                  * 丢整帧 10.3/s（≈ 全部帧的 34%）。这个放大约 160 倍，所以
                  * 这条路不是"差不多就行"，得把窗口开宽。
                  *
-                 * 当前测试使用 64 个、32 KiB/个 → 约 704 微帧 ≈ 88 ms，
-                 * 约 2.16 MB PSRAM。这个窗口用于覆盖 100 ms 级别回调停顿的
+                 * 当前 96 个、32 KiB/个 → 约 1056 微帧 ≈ 132 ms，
+                 * 约 3.24 MB PSRAM。这个窗口用于覆盖 100 ms 级别回调停顿的
                  * 大部分场景；如果最大回调间隔仍超过 88 ms，说明问题已经超出
                  * URB 环能吸收的范围，应继续查 HCD 调度或 USB 物理链路。 */
                 .number_of_urbs = CAMERA_USB_URB_COUNT,
