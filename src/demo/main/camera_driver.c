@@ -328,6 +328,13 @@ static bool camera_frame_cb(const uvc_host_frame_t *frame, void *ctx)
 
     /* 成功时保留 UVC 帧，待编解码任务完成后异步归还；失败时不取得所有权，
      * 下面返回 true 让 UVC 驱动立即回收该帧。 */
+#if CAMERA_UVC_ONLY_TEST
+    /* 第一阶段只测 UVC 组帧，不启动 JPEG/H.264/WebSocket，也不借用 UVC
+     * 帧缓冲给下游，保证 USB 驱动可以立即回收每一帧。 */
+    if (candidate_frame) {
+        CAMERA_FRAME_CB_RETURN(true);
+    }
+#endif
     if (candidate_frame) {
         camera_frame_loan_t *loan = camera_acquire_frame_loan((uvc_host_frame_t *)frame);
         if (loan == NULL) {
@@ -559,12 +566,17 @@ void camera_driver_run(void)
     ESP_LOGI(TAG, "使用 ESP32-P4 高速 USB Host，当前 PSRAM 可用：%u 字节",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
+    /* UVC-only 隔离阶段不初始化视频流水线，避免 H.264/WebSocket 影响 USB。 */
+#if CAMERA_UVC_ONLY_TEST
+    ESP_LOGI(TAG, "UVC-only 隔离测试：跳过 H.264/JPEG/WebSocket 视频流水线");
+#else
     /* 实时流初始化失败不影响本地 UVC 采集，错误会保留在串口日志中。 */
     esp_err_t streamer_error = video_streamer_init();
     if (streamer_error != ESP_OK) {
         ESP_LOGE(TAG, "初始化 H.264 实时流失败：%s",
                  esp_err_to_name(streamer_error));
     }
+#endif
 
     s_camera_events = xEventGroupCreate();
     assert(s_camera_events != NULL);

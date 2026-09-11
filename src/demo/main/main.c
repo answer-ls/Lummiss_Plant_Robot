@@ -20,11 +20,12 @@ static const char *TAG = "APP_MAIN";
  * 和 GIF/SD 卡轮播，便于判断 USB 回调间隔是否仍会出现 100 ms 级停顿。
  * 测试完成后改为 0 即可恢复原来的天气与 GIF 任务。
  */
-#define CAMERA_ISOLATION_TEST 0
+#define CAMERA_ISOLATION_TEST CAMERA_UVC_ONLY_TEST
 
 /* UI 初始化包含 LCD、LVGL 和动态时间天气首页。
  * 初始化完成后，LVGL Port 的内部任务负责定时器和屏幕刷新；本任务保持存活，
  * 后续可以在这里接收 UI 队列事件，统一执行页面和表情切换。 */
+#if !CAMERA_ISOLATION_TEST
 static void ui_task(void *arg)
 {
     (void)arg;
@@ -45,6 +46,7 @@ static void ui_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
+#endif
 
 /* 摄像头驱动在独立任务内运行，USB 收帧不会阻塞 UI 初始化和刷新。 */
 static void camera_task(void *arg)
@@ -64,7 +66,10 @@ void app_main(void)
              "Lummiss 基础工程启动：FreeRTOS + 屏幕 + USB 摄像头 + WiFi + H.264 实时流");
 
     /* Network Manager 内部负责 ESP-Hosted、C6、WiFi 事件和 DHCP。
-     * 主入口只调用统一接口，不保存凭据，也不处理 WiFi 系统事件。 */
+     * UVC-only 测试必须完全跳过它，避免 WiFi/SDIO 负载干扰 USB 统计。 */
+#if CAMERA_ISOLATION_TEST
+    ESP_LOGI(TAG, "UVC-only 隔离测试：跳过 Network Manager/WiFi/ESP-Hosted");
+#else
     esp_err_t network_error = network_manager_init();
     if (network_error == ESP_OK) {
         network_error = network_manager_start();
@@ -74,6 +79,7 @@ void app_main(void)
         ESP_LOGE(TAG, "Network Manager 启动失败：%s",
                  esp_err_to_name(network_error));
     }
+#endif
 
 #if CAMERA_ISOLATION_TEST
     ESP_LOGI(TAG, "隔离测试模式：已暂停天气 HTTPS/首页信息任务");
@@ -85,8 +91,13 @@ void app_main(void)
     }
 #endif
 
-    BaseType_t result = xTaskCreate(ui_task, "ui_task", 8192, NULL, 6, NULL);
+    BaseType_t result;
+#if CAMERA_ISOLATION_TEST
+    ESP_LOGI(TAG, "UVC-only 隔离测试：跳过 UI/LVGL、天气 HTTPS 和 GIF/SD 轮播");
+#else
+    result = xTaskCreate(ui_task, "ui_task", 8192, NULL, 6, NULL);
     assert(result == pdPASS);
+#endif
 
     result = xTaskCreate(camera_task, "camera_task", 8192, NULL, 7, NULL);
     assert(result == pdPASS);
