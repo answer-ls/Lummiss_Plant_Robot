@@ -1,14 +1,20 @@
 #include "screen_carousel.h"
 
 #include <dirent.h>
+#include <errno.h>
 #include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "lvgl.h"
 /* lvgl 组件同时导出了 src/，按相对路径包含即可拿到 lv_gif 的公开结构。 */
@@ -20,6 +26,11 @@ static const char *TAG = "CAROUSEL";
 
 #define CAROUSEL_TASK_STACK     6144
 #define CAROUSEL_TASK_PRIORITY  5
+#define CAROUSEL_PREFETCH_STACK  8192
+#define CAROUSEL_PREFETCH_PRIORITY 2
+#define CAROUSEL_PREFETCH_CORE  1
+#define CAROUSEL_PREFETCH_DEPTH 2
+#define CAROUSEL_PREFETCH_CHUNK  (32U * 1024U)
 
 /* 每个画面停留时长，天气首页和每个 GIF 都用这个值。 */
 #define CAROUSEL_SLOT_MS        5000
@@ -47,6 +58,28 @@ static uint32_t s_gif_count;
 static lv_obj_t *s_home_screen;   /* display_driver 建的默认屏幕 */
 static lv_obj_t *s_gif_screen;    /* 本模块自建的 GIF 屏，全程复用 */
 static lv_obj_t *s_gif_obj;       /* 屏里唯一的 lv_gif 对象，切素材只换 src */
+
+/*
+ * lv_gif 的文件源会在 LVGL 定时器回调里调用 lv_fs_read/lv_fs_seek，
+ * 这会把 FAT/SDMMC 的长尾延迟带进 taskLVGL。预读队列传递的是完整的
+ * GIF 内存块，所有权从预读任务转移给 LVGL；当前 GIF 切换完成后才释放
+ * 上一个内存块，保证 gd_GIF.data 在整个播放期间有效。
+ */
+typedef struct {
+    uint32_t index;
+    uint8_t *data;
+    size_t size;
+    bool ready;
+} gif_prefetch_item_t;
+
+typedef enum {
+    GIF_SHOW_NOT_READY = 0,
+    GIF_SHOW_FAILED,
+    GIF_SHOW_OK,
+} gif_show_result_t;
+
+static QueueHandle_t s_prefetch_queue;
+static uint8_t *s_active_gif_data;
 
 /* 大小写无关的字典序比较，用于让轮播顺序可预期（exp_01 排在 exp_02 前）。
  * 不用 strcasecmp 是因为它在 IDF 的 newlib 头里归属不定，
@@ -134,26 +167,156 @@ static void collect_gifs(void)
     sort_gif_paths();
 }
 
-/* 把第 index 个 GIF 装进 s_gif_obj。返回是否成功。 */
-static bool show_gif(uint32_t index)
+/*
+ * 在 LVGL 任务之外把一个 GIF 顺序读入 PSRAM。
+ * 这里故意不使用 fseek：预读阶段只做小块 fread，LVGL 侧完全不碰 FAT。
+ */
+static uint8_t *read_gif_to_psram(const char *path, size_t *size_out)
 {
-    /* LVGL 的盘符是 'S'（CONFIG_LV_FS_POSIX_LETTER=83），路径直接接 VFS 挂载点。 */
-    char lvgl_path[CAROUSEL_PATH_MAX + 4];
-    snprintf(lvgl_path, sizeof(lvgl_path), "S:%s", s_gif_paths[index]);
+    struct stat file_stat;
+    if (stat(path, &file_stat) != 0 || file_stat.st_size <= 0) {
+        ESP_LOGW(TAG, "无法获取 GIF 大小 %s：%s", path, strerror(errno));
+        return NULL;
+    }
+
+    const size_t file_size = (size_t)file_stat.st_size;
+    uint8_t *data = heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (data == NULL) {
+        ESP_LOGW(TAG, "PSRAM 不足，无法预读 %s (%u bytes)",
+                 path, (unsigned)file_size);
+        return NULL;
+    }
+
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) {
+        ESP_LOGW(TAG, "无法打开 GIF %s：%s", path, strerror(errno));
+        heap_caps_free(data);
+        return NULL;
+    }
+
+    size_t offset = 0;
+    while (offset < file_size) {
+        const size_t remaining = file_size - offset;
+        const size_t chunk = (remaining < CAROUSEL_PREFETCH_CHUNK)
+                           ? remaining : CAROUSEL_PREFETCH_CHUNK;
+        const size_t read_count = fread(data + offset, 1, chunk, file);
+        if (read_count == 0) {
+            ESP_LOGW(TAG, "读取 GIF 失败 %s：%s", path,
+                     ferror(file) ? strerror(errno) : "提前到达文件末尾");
+            fclose(file);
+            heap_caps_free(data);
+            return NULL;
+        }
+        offset += read_count;
+    }
+
+    fclose(file);
+    *size_out = offset;
+    return data;
+}
+
+static void carousel_prefetch_task(void *arg)
+{
+    (void)arg;
+
+    uint32_t next_index = 0;
+    for (;;) {
+        gif_prefetch_item_t item = {
+            .index = next_index,
+            .data = NULL,
+            .size = 0,
+            .ready = false,
+        };
+
+        item.data = read_gif_to_psram(s_gif_paths[next_index], &item.size);
+        item.ready = (item.data != NULL);
+        if (item.ready) {
+            ESP_LOGI(TAG, "GIF 预读完成 [%u/%u]：%u bytes",
+                     (unsigned)(next_index + 1), (unsigned)s_gif_count,
+                     (unsigned)item.size);
+        }
+
+        /* 队列满时只阻塞预读任务，绝不阻塞 taskLVGL。 */
+        if (xQueueSend(s_prefetch_queue, &item, portMAX_DELAY) != pdTRUE) {
+            if (item.data != NULL) {
+                heap_caps_free(item.data);
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        next_index = (next_index + 1U) % s_gif_count;
+        vTaskDelay(1);
+    }
+}
+
+static void pause_gif_timer(void)
+{
+    if (s_gif_obj == NULL) {
+        return;
+    }
+
+    lv_gif_t *gifobj = (lv_gif_t *)s_gif_obj;
+    if (gifobj->timer != NULL) {
+        lv_timer_pause(gifobj->timer);
+    }
+}
+
+/* 从预读队列取指定序号的 GIF，并在 LVGL 任务中只切换内存源。 */
+static gif_show_result_t show_prefetched_gif(uint32_t index)
+{
+    /* 无论预读是否已经完成，都先停止旧 GIF，避免切回首页或等待时
+     * 旧的 LVGL 定时器继续消耗 CPU。成功加载内存源后 lv_gif_set_src()
+     * 会重新启动这个定时器。 */
+    pause_gif_timer();
+
+    gif_prefetch_item_t item;
+    if (s_prefetch_queue == NULL ||
+        xQueueReceive(s_prefetch_queue, &item, 0) != pdTRUE) {
+        return GIF_SHOW_NOT_READY;
+    }
+
+    if (item.index != index) {
+        ESP_LOGW(TAG, "GIF 预读序号错位：期望 %u，收到 %u",
+                 (unsigned)index, (unsigned)item.index);
+        if (item.data != NULL) {
+            heap_caps_free(item.data);
+        }
+        return GIF_SHOW_NOT_READY;
+    }
+
+    if (!item.ready || item.data == NULL || item.size == 0) {
+        ESP_LOGW(TAG, "GIF %s 预读失败，本轮跳过", s_gif_paths[index]);
+        return GIF_SHOW_FAILED;
+    }
 
     lv_gif_t *gifobj = (lv_gif_t *)s_gif_obj;
 
     /* lv_gif_set_src() 打开失败时直接 return，既不清空对象也不停定时器。
-     * 上一个 GIF 的定时器要是还在跑，next_frame_task_cb() 会解引用
-     * gifobj->gif（此时是 NULL）当场崩。所以先手动停掉：失败时它停在
-     * 停着的状态，成功时 lv_gif_set_src() 自己会 resume，不用我们管。 */
+     * 这里已经先暂停旧定时器；成功时 lv_gif_set_src() 自己会 resume。 */
     lv_timer_pause(gifobj->timer);
 
-    lv_gif_set_src(s_gif_obj, lvgl_path);
+    /* lv_gif_set_src() 对 LV_IMG_SRC_VARIABLE 会调用 gd_open_gif_data()，
+     * 后续 GIF 帧解析只访问这块内存，不会再调用 lv_fs。 */
+    lv_img_dsc_t gif_source = {0};
+    gif_source.header.cf = LV_IMG_CF_RAW;
+    gif_source.data_size = item.size;
+    gif_source.data = item.data;
+    lv_gif_set_src(s_gif_obj, &gif_source);
     if (gifobj->gif == NULL) {
-        ESP_LOGW(TAG, "打不开 %s，本轮跳过", lvgl_path);
-        return false;
+        ESP_LOGW(TAG, "无法解析预读 GIF %s，本轮跳过", s_gif_paths[index]);
+        if (s_active_gif_data != NULL) {
+            heap_caps_free(s_active_gif_data);
+            s_active_gif_data = NULL;
+        }
+        heap_caps_free(item.data);
+        return GIF_SHOW_FAILED;
     }
+
+    if (s_active_gif_data != NULL) {
+        heap_caps_free(s_active_gif_data);
+    }
+    s_active_gif_data = item.data;
 
     const uint32_t gif_w = gifobj->gif->width;
     const uint32_t gif_h = gifobj->gif->height;
@@ -177,7 +340,7 @@ static bool show_gif(uint32_t index)
 
         ESP_LOGW(TAG, "%s 是 %ux%u，超出屏幕 %dx%d：按 %u%% 缩小显示。"
                       "请用 tools/gif_resize_for_sd.py 预处理素材，否则会掉帧",
-                 lvgl_path, gif_w, gif_h, scr_w, scr_h,
+                 s_gif_paths[index], gif_w, gif_h, scr_w, scr_h,
                  (unsigned)(zoom * 100U / 256U));
 
         lv_img_set_zoom(s_gif_obj, (uint16_t)zoom);
@@ -189,7 +352,7 @@ static bool show_gif(uint32_t index)
     }
     lv_obj_center(s_gif_obj);
 
-    return true;
+    return GIF_SHOW_OK;
 }
 
 static void carousel_timer_cb(lv_timer_t *timer)
@@ -197,19 +360,25 @@ static void carousel_timer_cb(lv_timer_t *timer)
     (void)timer;
 
     if (s_slot == 0) {
+        /* 隐藏 GIF 时也要暂停它的 LVGL 定时器，避免后台继续解码。 */
+        pause_gif_timer();
         lv_scr_load(s_home_screen);
         s_slot = (s_gif_count > 0) ? 1 : 0;
         return;
     }
 
-    if (show_gif(s_slot - 1)) {
+    const gif_show_result_t result = show_prefetched_gif(s_slot - 1);
+    if (result == GIF_SHOW_OK) {
         lv_scr_load(s_gif_screen);
+        s_slot = (s_slot >= s_gif_count) ? 0 : s_slot + 1;
+    } else if (result == GIF_SHOW_FAILED) {
+        /* 文件确实读失败时跳过它，避免每 5 秒反复重试同一个坏文件。 */
+        lv_scr_load(s_home_screen);
+        s_slot = (s_slot >= s_gif_count) ? 0 : s_slot + 1;
     } else {
-        /* 打不开就退回首页，免得停在一个空白的 GIF 屏上。 */
+        /* 预读还没完成时不阻塞 LVGL，保留当前序号，下次定时器再试。 */
         lv_scr_load(s_home_screen);
     }
-
-    s_slot = (s_slot >= s_gif_count) ? 0 : s_slot + 1;
 }
 
 /* 建 GIF 屏。天气首页由 display_driver 建在默认屏幕上，这里先把它的句柄
@@ -248,6 +417,26 @@ static void carousel_task(void *arg)
 
     ESP_LOGI(TAG, "找到 %u 个 GIF：天气首页 %d ms → 每个 GIF %d ms → 回到首页，循环",
              (unsigned)s_gif_count, CAROUSEL_SLOT_MS, CAROUSEL_SLOT_MS);
+
+    s_prefetch_queue = xQueueCreate(CAROUSEL_PREFETCH_DEPTH,
+                                    sizeof(gif_prefetch_item_t));
+    if (s_prefetch_queue == NULL) {
+        ESP_LOGE(TAG, "GIF 预读队列创建失败，屏幕停在天气首页");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    const BaseType_t prefetch_created = xTaskCreatePinnedToCore(
+        carousel_prefetch_task, "gif_prefetch", CAROUSEL_PREFETCH_STACK, NULL,
+        CAROUSEL_PREFETCH_PRIORITY, NULL, CAROUSEL_PREFETCH_CORE);
+    if (prefetch_created != pdPASS) {
+        ESP_LOGE(TAG, "GIF 预读任务创建失败，屏幕停在天气首页");
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG, "GIF 预读任务已启动：CPU%d，队列深度=%d，读取块=%u bytes",
+             CAROUSEL_PREFETCH_CORE, CAROUSEL_PREFETCH_DEPTH,
+             CAROUSEL_PREFETCH_CHUNK);
 
     lvgl_port_lock(0);
     build_gif_screen();

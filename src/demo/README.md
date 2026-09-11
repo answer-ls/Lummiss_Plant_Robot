@@ -12,7 +12,7 @@
 - 摄像头帧缓冲使用 PSRAM；首页图像作为 RGB565 资源嵌入固件。
 - Network Manager 通过 ESP-Hosted/SDIO 控制板载 ESP32-C6，以 STA 模式连接固定 WiFi，并通过 DHCP 获取 IPv4 地址。
 - WiFi 断开后每 2 秒自动发起重连；连接状态和 IP 信息只由 Network Manager 对外提供。
-- Video Streamer 从完整 MJPEG 帧中抽取 15 FPS，经 P4 硬件 JPEG 直出 YUV422、轻量色度抽样/重排和 H.264 硬件编码，再由独立上传任务通过 HTTP/1.1 长连接实时发送到局域网 PC。当前编码参数为 800×600、1.5 Mbps、GOP 15。
+- Video Streamer 从完整 MJPEG 帧中抽取 15 FPS，经 P4 硬件 JPEG 直出 YUV422、轻量色度抽样/重排和 H.264 硬件编码，再由独立上传任务通过 WebSocket 实时发送到局域网 PC（每帧前置 16 字节自描述头携带分辨率与帧率）。当前编码参数为 800×600、1.5 Mbps、GOP 15。
 - PC 服务器使用持久 PyAV H.264 解码器逐帧解码，通过 `/preview.mjpg` 向浏览器连续推送 MJPEG；浏览器预览不再反复打开和重解整个 GOP。
 
 ## 主组件结构
@@ -98,7 +98,7 @@ cmd /c _build_main.bat
 .\_start_camera_server.bat
 ```
 
-首次运行会自动安装 `tools/camera_server_requirements.txt` 中的 PyAV 和 OpenCV。服务器启动后访问 `http://127.0.0.1:8000/`；页面显示H.264接收帧率、浏览器预览帧率和预览队列丢帧数。
+首次运行会自动安装 `tools/camera_server_requirements.txt` 中的 PyAV、OpenCV 和 websockets。服务器启动后访问 `http://127.0.0.1:8000/`；页面显示H.264接收帧率、浏览器预览帧率和预览队列丢帧数，并提供下发命令按钮。视频帧走 WebSocket `ws://<PC>:8001/ws`，HTTP（8000）负责预览页与下行命令 `/cmd?cmd=ping|status`。
 
 在已经激活 ESP-IDF 5.5.5 的终端中：
 
@@ -130,4 +130,4 @@ bootloader.bin：0x5310
 
 密码错误或路由器不可达时，串口会反复出现 `WiFi 已断开`、原因码和 2 秒后重连。若在这些日志之前就出现 Hosted/SDIO 初始化失败，应先检查板载 C6 固件；厂商提供的参考固件位于 `开发板示例/JC1060P470C_I_W_Y/8-Burn operation/Burn files/JC-C6-slave_v2.3.2.bin`。
 
-PC 服务器的启动、热复位恢复实验、JPEG 完整性统计、颜色验收和实时速率判断见 `CAMERA_UPLOAD_TEST.md`。当前采用 HTTP/1.1 长连接传输 H.264 实时帧；H.265 不受当前 ESP32-P4 编码器支持，WebSocket 可在云端协议确定后替换传输层。ESP-Hosted Host 2.7.x 与板载 C6 2.3.x 存在版本警告，当前联网和视频传输正常，后续应升级 C6 固件并做回归测试。
+PC 服务器的启动、热复位恢复实验、JPEG 完整性统计、颜色验收和实时速率判断见 `CAMERA_UPLOAD_TEST.md`。H.264 实时帧已从 HTTP/1.1 长连接改为 WebSocket 二进制帧传输（8001），每帧前置 16 字节自描述头携带分辨率与帧率，PC 端据此自适应；HTTP 侧保留 `/h264` 回退入口与下行命令通道。H.265 不受当前 ESP32-P4 编码器支持。ESP-Hosted Host 2.7.x 与板载 C6 2.3.x 存在版本警告，当前联网和视频传输正常，后续应升级 C6 固件并做回归测试。

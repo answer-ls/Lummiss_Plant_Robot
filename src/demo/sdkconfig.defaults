@@ -39,6 +39,16 @@ CONFIG_LV_FONT_SIMSUN_16_CJK=y
 CONFIG_LWIP_SNTP_MAX_SERVERS=2
 CONFIG_LV_BUILD_EXAMPLES=n
 
+# 默认发送缓冲只有 5760 字节（= 4×MSS），一帧 H.264 约 17KB 装不下，一次
+# esp_websocket_client_send_bin() 要分三个 RTT 才能推完（实测 WS=46.9ms ≈
+# 3×15.6ms，正好对上）。改成 65535 后整帧一次进队列，耗时收敛到 1 个 RTT。
+# 上限只能是 65535：LWIP_WND_SCALE 依赖 SPIRAM_TRY_ALLOCATE_WIFI_LWIP（未开），
+# Kconfig 走 `range 2440 65535` 分支，写 65536 会被判非法。
+# 段池 MEMP_NUM_TCP_SEG 默认 16 不构成限制——lwipopts.h 开了 MEMP_MEM_MALLOC，
+# 池是堆分配、无数量上限，真正的闸门是 TCP_SND_BUF 和由它推出的 TCP_SND_QUEUELEN。
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=65535
+CONFIG_LWIP_TCP_WND_DEFAULT=65535
+
 # SD 卡 GIF 运行时解码：lv_gif/gifdec 解 320x180 需要约 230KB 画布，
 # 超过 LVGL 内置堆的 128KB 上限，必须改走 malloc()（大块会落 PSRAM）。
 CONFIG_LV_MEM_CUSTOM=y

@@ -1,4 +1,5 @@
 #include "video_streamer.h"
+#include "dma2d_yuv.h"
 
 #include <inttypes.h>
 #include <stdbool.h>
@@ -9,35 +10,62 @@
 #include "esp_h264_alloc.h"
 #include "esp_h264_enc_single.h"
 #include "esp_h264_enc_single_hw.h"
+#include "esp_attr.h"
 #include "esp_heap_caps.h"
-#include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "esp_websocket_client.h"
 
 #include "network_manager.h"
 
 static const char *TAG = "VIDEO_STREAM";
 
-/* 当前电脑 WLAN IPv4 为 192.168.1.66。地址变化后修改此项并重新构建。 */
-#define VIDEO_STREAM_URL              "http://192.168.1.66:8000/h264"
+/* 当前电脑 WLAN IPv4 为 192.168.1.66。地址变化后修改此项并重新构建。
+ * 实时视频走 WebSocket：PC 端 HTTP 预览页仍在 8000，视频帧与控制命令在 8001。 */
+#define VIDEO_STREAM_WS_URL           "ws://192.168.1.66:8001/ws"
 /* 分辨率统一取 video_streamer.h 的公共常量，与摄像头侧"可编码帧"门控一致。 */
 #define VIDEO_WIDTH                   VIDEO_STREAM_WIDTH
 #define VIDEO_HEIGHT                  VIDEO_STREAM_HEIGHT
-/* 800×600 的像素量高于 640×480，先使用 15fps 保留编解码余量。
- * GOP 与 PTS 除数跟随该宏，避免改帧率时漏改。 */
-#define VIDEO_ENCODE_FPS              15
+/* 帧率**上限**，不是目标值：GOP 与 PTS 除数跟随该宏，避免改帧率时漏改。
+ * 实际帧率由编解码链耗时决定——800×600 实测 31.3ms/帧（J 6.7 + Y 16.4 + H 8.2），
+ * 约 25 fps；1280×720 实测 60.8ms/帧，仅 15.3～16.3 fps。
+ * 
+ *
+ * 这个宏还有第二个作用，而且更隐蔽：它同时是编码器速率控制的分母
+ * （每帧预算 = VIDEO_BITRATE / 本值，详见 VIDEO_BITRATE 处的说明）。
+ * 所以它不能随便写大——写成 30 而实际只跑 16，每帧比特预算就被摊薄近一半，
+ * 画质直接变糊。**改这里前先确认它与实测帧率接近。** */
+#define VIDEO_ENCODE_FPS              30
 #define VIDEO_GOP                     VIDEO_ENCODE_FPS
-/* 800×600 使用 1.5Mbps，在清晰度和 WiFi 发送压力之间取平衡。 */
-#define VIDEO_BITRATE                 1500000
+/* 目标码率。真正决定画质和线上流量的不是这个值本身，而是**每帧比特预算**：
+ *
+ *     每帧预算 = VIDEO_BITRATE / VIDEO_ENCODE_FPS        ← 编码器速率控制用的口径
+ *     线上实际 kbps = 每帧预算 × 实际帧率                  ← 实际帧率通常低于宏值
+ *     每像素比特 bpp = 每帧预算 / (宽 × 高)                ← 主观清晰度的直接来源
+ *
+ * 实测每帧比特都贴在预算附近，但**没有精确打满**：720p@15.8fps 是 134.4 kbit
+ * （预算 133.3 kbit，已饱和，说明 QP 压到了 qp_min）；800×600@23～26fps 在
+ * 83～140 kbit 之间浮动、均值约 118 kbit（略低于预算，因为 QP 还没探到下限）。
+ * 两种情况都**不是**被 qp_min 卡住——那是我一度写错的说法。
+ *
+ * 所以：VIDEO_ENCODE_FPS 一旦与实际帧率不符，线上码率和 bpp 都会跟着跑偏。
+ * 800×600 的实际帧率约 25 fps，与宏值 30 接近，133.3 kbit/帧 → 0.28 bpp，可用。
+ * 调这个宏前先想清楚要动的是"每帧多少比特"，不是"每秒多少比特"。 */
+#define VIDEO_BITRATE                 4000000
 #define VIDEO_QP_MIN                  20
 #define VIDEO_QP_MAX                  40
 /* 摄像头侧 MJPEG 输入环槽数（提交时 memcpy 进槽）。 */
-#define VIDEO_SLOT_COUNT              2
-/* H.264 编码输出（码流）槽数：编码任务写满一个槽就交给发送任务，
- * 发送完成归还。槽数 4 可在 HTTP 短暂变慢时吸收抖动。 */
+#define VIDEO_SLOT_COUNT              3
+/* H.264 编码输出（码流）槽数：编码任务写满一个槽就交给发送任务，发送完成归还。
+ * 深度要够 WS **单帧耗时峰值**除以帧间隔，否则一次停顿就丢帧：
+ * 800×600@25fps（帧间隔 40ms）下 WS 均值 18～28ms 尚可，峰值却到 269.8ms，
+ * 4 槽只吸收得了约 160ms —— 于是"输出槽满"从 0 涨到 25（约 1.2%）。
+ * 当前收紧到 4 槽，最多吸收约 160ms 的发送抖动；超过这个窗口时，编码任务
+ * 会在编码前丢弃输入帧，避免产生无法连续解码的孤立 H.264 P 帧。
+ * 注意这只吸收抖动，不消除峰值本身 —— 峰值若持续存在要查码率占用和链路。 */
 #define VIDEO_OUT_SLOT_COUNT          4
 /* 摄像头 MJPEG 实测为 YUV422 采样；JPEG 硬件直接输出 U Y0 V Y1，16bpp。 */
 #define VIDEO_YUV422_SIZE             (VIDEO_WIDTH * VIDEO_HEIGHT * 2)
@@ -46,24 +74,84 @@ static const char *TAG = "VIDEO_STREAM";
 /* 码流输出缓冲：沿用原尺寸（远大于实际 NAL），每槽独立一份。 */
 #define VIDEO_H264_OUTPUT_SIZE        VIDEO_H264_INPUT_SIZE
 
+/* 每帧 H.264 码流前置的 16 字节自描述头（小端）：
+ *   [0..3]  magic 'L','M','V','1'    [4..5]  width       [6..7]  height
+ *   [8..9]  fps                      [10]    frame_type  [11]    reserved
+ *   [12..15] sequence
+ * frame_type 即 esp_h264_frame_type_t 原值：0=IDR、1=I、2=P。
+ * PC 端把 0/1 当作可随机接入的帧（用于预览重同步），不要改动这个映射。
+ * 分辨率随每一帧携带，而不是在连接建立时一次性协商，PC 端据此自适应几何参数 ——
+ * 将来改分辨率只需要改一处常量，协议和 PC 端都不用动。
+ * 编码器直接写进槽内偏移 +16 处，发送时在同一块缓冲头部原地填头，全程零拷贝。 */
+#define VIDEO_WS_FRAME_HEADER_SIZE    16
+#define VIDEO_WS_FRAME_MAGIC          0x31564D4CU  /* 'L','M','V','1' 小端 */
+
+/* H.264 硬件编码器每编完一帧都要对输出缓冲做一次 cache 失效
+ * （esp_h264_enc_dual_hw.c:168 → esp_h264_cache.c:17）。该调用用的是
+ * DIR_M2C 且**不带** UNALIGNED 标志，要求起始地址与长度都按 cache line
+ * （128 字节）对齐：不满足时每帧刷一条 esp_cache_msync 报错，更要命的是
+ * 失效根本没生效——CPU 读硬件 DMA 刚写好的码流时读到的是旧缓存内容。
+ * 所以编码输出放在槽内 +128 处（地址与 720000 长度都保持对齐），
+ * 16 字节帧头紧贴其前放在 +112，PC 端收到的仍是「帧头 + 紧邻码流」。
+ * 切勿把编码缓冲改回 +16 之类的非 128 对齐偏移。 */
+#define VIDEO_WS_ALIGN                128U
+#define VIDEO_WS_FRAME_HEADER_OFFSET  (VIDEO_WS_ALIGN - VIDEO_WS_FRAME_HEADER_SIZE)  /* 112 */
+#define VIDEO_H264_SLOT_SIZE          (VIDEO_WS_ALIGN + VIDEO_H264_OUTPUT_SIZE)
+
 #define VIDEO_TASK_STACK              8192
 /* 编解码任务：JPEG 解码 + YUV 重排 + H.264 编码，全程不等待网络。 */
 #define VIDEO_CODEC_PRIORITY          8
 #define VIDEO_CODEC_CORE              1
-/* 网络发送任务：只做 HTTP 上传与失败处理，与编解码任务并行。 */
+/* 网络发送任务：只做 WebSocket 上传与失败处理，与编解码任务并行。 */
 #define VIDEO_UPLOAD_PRIORITY         9
 #define VIDEO_UPLOAD_CORE             0
-#define VIDEO_HTTP_TIMEOUT_MS         3000
-#define VIDEO_REPORT_INTERVAL_US      (10 * 1000 * 1000LL)
+#define VIDEO_REPORT_PRIORITY         4
+#define VIDEO_REPORT_CORE             0
+
+/* WebSocket 客户端会自建一个任务：钉核 0、优先级低于上传任务（9），
+ * 免得收命令和自动重连去抢上传任务的 CPU。 */
+#define VIDEO_WS_TASK_STACK           6144
+#define VIDEO_WS_TASK_PRIORITY        5
+#define VIDEO_WS_TASK_CORE            0
+/* WebSocket 收发缓冲大小。这个值直接决定上行一帧被切成几个 WebSocket 分片，
+ * 而分片数决定每帧要付多少次运输层操作——这是上行耗时的真正来源。
+ *
+ * 每发一片，_ws_write()（IDF tcp_transport/transport_ws.c）都要做：
+ *   1 次 esp_transport_poll_write + 2 次 esp_transport_write（帧头 + 载荷）
+ *   + 2 遍逐字节 XOR（RFC6455 客户端掩码：发前异或、发后异或回来）
+ * 每一次 write 都要经 ESP-Hosted 走 SDIO RPC 到 C6。
+ *
+ * 按 4096 算，实测单帧约 10.8KB 要切 3 片 = 3 poll + 6 write = 9 次 socket 操作；
+ * 32KB 只需 1 片 = 1 poll + 2 write = 3 次。实测 WS 单帧 20～35ms、峰值 150ms
+ * 主要就是这个开销（10.8KB 走 WiFi 本身用不了这么久）。
+ * 注意：memcpy 与 XOR 的总字节数不随分片数变化，唯一变量是操作次数。
+ *
+ * 选值公式：单帧字节数 = 码率 ÷ 8 ÷ 帧率，与分辨率无关。
+ * 32KB 覆盖到约 7.8 Mbps@30fps（4Mbps 时单帧 16.7KB，1 片发完）。
+ * 开了 CONFIG_ESP_WS_CLIENT_ENABLE_DYNAMIC_BUFFER 才会每帧重分配，
+ * 当前没开，所以这是启动时一次性 malloc(buffer_size) 的 tx + rx 共 2 份常驻。 */
+#define VIDEO_WS_BUFFER_SIZE          32768
+/* 断线后 2 秒重试，比组件默认的 10 秒恢复更快。 */
+#define VIDEO_WS_RECONNECT_MS         8000
+/* 单帧发送超时。实时预览允许丢弃过期帧，不能让一次网络阻塞占住输出槽数秒。 */
+#define VIDEO_WS_TIMEOUT_MS           100
+#define VIDEO_WS_SEND_INTERVAL_US     (1000000LL / 25)
+/* 下行命令的累积缓冲：服务器下发的 JSON 命令很短。 */
+#define VIDEO_WS_COMMAND_MAX          192
+#define VIDEO_REPORT_INTERVAL_US      (5 * 1000 * 1000LL)
 /* 门控按 VIDEO_ENCODE_FPS 的帧周期推进；允许提前 5 ms 接帧，
  * 避免整数取整导致的周期漂移。 */
 #define VIDEO_SUBMIT_EARLY_US         5000
 
 typedef struct {
     uint8_t *data;
+    const uint8_t *input;
     size_t data_len;   /* 本帧 JPEG 压缩数据长度（可变），解码按它喂位流 */
     uint32_t sequence;
+    int64_t submitted_us;
     bool busy;
+    video_streamer_input_release_cb_t release_cb;
+    void *release_ctx;
 } video_input_slot_t;
 
 /* H.264 输出槽：编码任务写入码流后连同元数据交给发送任务。
@@ -74,22 +162,31 @@ typedef struct {
     uint32_t sequence;
     uint32_t pts;
     int frame_type;
+    int64_t ready_us;
 } video_out_slot_t;
 
 typedef struct {
     uint32_t submitted;
     uint32_t rate_limited;
-    uint32_t dropped;        /* 提交侧：MJPEG 环槽全忙时丢弃 */
-    uint32_t slot_dropped;   /* 编码侧：无空闲输出槽时在编码前丢弃 MJPEG 帧 */
+    uint32_t dropped;        /* 输入槽满：提交时 MJPEG 环槽全忙，编解码任务跟不上 */
+    uint32_t slot_dropped;   /* 输出槽满：编码前拿不到空闲输出槽，上传任务跟不上 */
+    /* 结构校验不通过的输入帧：有 SOI/EOI，但 Marker 结构或尺寸损坏，未送进
+     * JPEG 解码器。由编解码任务统计（见 video_jpeg_structurally_valid）。 */
+    uint32_t input_invalid;
     uint32_t encoded;
     uint32_t sent;
     uint32_t send_failed;
     uint64_t encoded_bytes;
     uint64_t jpeg_decode_us;
+    uint64_t input_queue_us;
+    uint64_t validation_us;
     uint64_t yuv_repack_us;
     uint64_t h264_encode_us;
-    uint64_t http_send_us;
-    uint64_t http_max_us;    /* 报告周期内 HTTP 单帧最长耗时（重置式） */
+    uint64_t output_queue_us;
+    uint64_t ws_send_us;
+    uint32_t send_attempts;
+    uint32_t upload_received;
+    uint64_t ws_max_us;      /* 报告周期内 WebSocket 单帧最长耗时（重置式） */
 } video_stream_stats_t;
 
 static video_input_slot_t s_slots[VIDEO_SLOT_COUNT];
@@ -103,6 +200,69 @@ static video_stream_stats_t s_stats;
 static int64_t s_next_submit_us;
 static uint32_t s_next_sequence;
 static bool s_initialized;
+static bool s_stream_enabled = true;
+/* 发送任务和 UVC 回调都读取该状态；断线时在入口丢帧，避免 JPEG 解码、
+ * H.264 编码和输出槽继续为一个已经不可写的 socket 消耗资源。 */
+static volatile bool s_ws_connected;
+static volatile bool s_yuv_busy;
+static int64_t s_next_ws_send_us;
+
+/* 下行命令的累积缓冲。WebSocket 事件回调运行在客户端自己的任务里，
+ * 与上传任务并发，但这两个变量只有该回调会写，因此不需要加锁。 */
+static char s_ws_command[VIDEO_WS_COMMAND_MAX];
+static size_t s_ws_command_len;
+
+static void video_drop_pending_output(void)
+{
+    unsigned index;
+    uint32_t dropped = 0;
+    while (xQueueReceive(s_out_ready, &index, 0) == pdTRUE) {
+        if (xQueueSend(s_out_free, &index, 0) == pdTRUE) {
+            dropped++;
+        }
+    }
+    if (dropped != 0) {
+        ESP_LOGW(TAG, "WebSocket 不可用，丢弃已编码旧帧=%" PRIu32, dropped);
+    }
+}
+
+/* 限制发送调用的启动频率。它不改变当前低于 25fps 的编码速率，只防止网络
+ * 短暂恢复后多个待发槽连续冲击 ESP-Hosted 的 SDIO/WiFi TX 缓冲池。 */
+static void video_upload_pace(void)
+{
+    const int64_t now_us = esp_timer_get_time();
+    int64_t next_us = s_next_ws_send_us;
+    if (next_us > now_us) {
+        const int64_t wait_us = next_us - now_us;
+        const TickType_t wait_ticks = pdMS_TO_TICKS((wait_us + 999) / 1000);
+        if (wait_ticks > 0) {
+            vTaskDelay(wait_ticks);
+        }
+    }
+
+    const int64_t after_wait_us = esp_timer_get_time();
+    s_next_ws_send_us = after_wait_us + VIDEO_WS_SEND_INTERVAL_US;
+}
+
+/* 归还由外部持有的输入帧。调用方在进入编解码任务后独占该槽，
+ * 因此回调前先摘下 owner，再把槽标记为空闲，避免 UVC 缓冲过早复用。 */
+static void video_input_slot_release(video_input_slot_t *slot)
+{
+    video_streamer_input_release_cb_t release_cb = slot->release_cb;
+    void *release_ctx = slot->release_ctx;
+    slot->release_cb = NULL;
+    slot->release_ctx = NULL;
+    slot->input = NULL;
+    slot->data_len = 0;
+
+    if (release_cb != NULL) {
+        release_cb(release_ctx);
+    }
+
+    portENTER_CRITICAL(&s_lock);
+    slot->busy = false;
+    portEXIT_CRITICAL(&s_lock);
+}
 
 /* 网络或服务器异常时最多每 5 秒输出一次详情，避免 20 FPS 的失败日志刷屏。 */
 static void video_stream_log_error_limited(const char *message, int error)
@@ -115,11 +275,132 @@ static void video_stream_log_error_limited(const char *message, int error)
     }
 }
 
-/* ESP32-P4 v1.x 的 H.264 硬件输入格式为交错 YUV420（O_UYY_E_VYY）：
- * JPEG 硬件直出的 YUV422 每两个像素为 U Y0 V Y1。对相邻两行的
- * U/V 分别求平均完成垂直 2:1 色度抽样，再重排为编码器所需布局。
- * 这里只做字节复制和两个均值，避免 RGB565 路径每像素的颜色换算。 */
-static void yuv422_to_h264_yuv420(const uint8_t *src, uint8_t *dst)
+/*
+ * JPEG 硬件解码器对输入格式比普通软件解码器严格：只确认 SOI/EOI 齐全仍可能把
+ * 丢包后的半截 JPEG 送进去，随后就是 "data units 数量与软件配置的分辨率不符"、
+ * unsupported marker，以及连带的 dma2d_force_end 报错。
+ *
+ * 这段校验原先写在 UVC 帧回调里，现在搬到本任务：扫描整帧是 O(帧长) 的工作，
+ * 而帧回调运行在 USB 等时传输的上下文里，每多占一毫秒，transfer 就晚一毫秒
+ * 重新入队——等时传输没有重传，那段时间的包就是白丢的。搬过来之后 USB 回调
+ * 只剩常数时间的工作，硬件解码器受到的防护强度不变。
+ *
+ * 只走一遍 Marker 结构，不解码像素数据；帧尾允许存在填充字节。
+ */
+static bool video_jpeg_structurally_valid(const uint8_t *data, size_t data_len)
+{
+    if (data == NULL || data_len < 4 || data[0] != 0xff || data[1] != 0xd8) {
+        return false;
+    }
+
+    size_t pos = 2;
+    bool saw_sof = false;
+    bool saw_sos = false;
+
+    /* Parse headers until Start Of Scan. */
+    while (pos < data_len) {
+        if (data[pos++] != 0xff) {
+            return false;
+        }
+        while (pos < data_len && data[pos] == 0xff) {
+            ++pos;
+        }
+        if (pos >= data_len) {
+            return false;
+        }
+
+        const uint8_t marker = data[pos++];
+        if (marker == 0x00 || marker == 0xd8 || marker == 0xd9 ||
+            (marker >= 0xd0 && marker <= 0xd7)) {
+            return false;
+        }
+
+        if (pos + 2 > data_len) {
+            return false;
+        }
+        const size_t segment_length = ((size_t)data[pos] << 8) | data[pos + 1];
+        if (segment_length < 2 || pos + segment_length > data_len) {
+            return false;
+        }
+
+        /* ESP32-P4 JPEG hardware accepts sequential SOF, not progressive SOF. */
+        const bool is_sof = (marker >= 0xc0 && marker <= 0xcf &&
+                             marker != 0xc4 && marker != 0xc8 && marker != 0xcc);
+        if (is_sof) {
+            if ((marker != 0xc0 && marker != 0xc1) || segment_length < 8) {
+                return false;
+            }
+            const unsigned height = ((unsigned)data[pos + 3] << 8) | data[pos + 4];
+            const unsigned width = ((unsigned)data[pos + 5] << 8) | data[pos + 6];
+            if (width != VIDEO_WIDTH || height != VIDEO_HEIGHT) {
+                return false;
+            }
+            saw_sof = true;
+        }
+
+        if (marker == 0xda) { /* SOS */
+            if (!saw_sof || segment_length < 6) {
+                return false;
+            }
+            pos += segment_length;
+            saw_sos = true;
+            break;
+        }
+
+        pos += segment_length;
+    }
+
+    if (!saw_sos) {
+        return false;
+    }
+
+    /* Parse entropy-coded data. Inside the scan only stuffed bytes, restart
+     * markers and EOI are legal. Any other marker means the frame is corrupt
+     * or uses a JPEG feature unsupported by the P4 hardware decoder. */
+    while (pos < data_len) {
+        if (data[pos++] != 0xff) {
+            continue;
+        }
+        while (pos < data_len && data[pos] == 0xff) {
+            ++pos;
+        }
+        if (pos >= data_len) {
+            return false;
+        }
+
+        const uint8_t marker = data[pos++];
+        if (marker == 0x00 || (marker >= 0xd0 && marker <= 0xd7)) {
+            continue;
+        }
+        if (marker == 0xd9) { /* EOI */
+            return true;
+        }
+        return false;
+    }
+
+    return false;
+}
+
+/* 只在编解码任务中截断 UVC 帧尾的填充字节。这个扫描不能放回 USB 回调，
+ * 否则一张损坏帧缺少 EOI 时会把回调长时间占住。 */
+static size_t video_jpeg_find_eoi(const uint8_t *data, size_t data_len)
+{
+    if (data == NULL || data_len < 2) {
+        return 0;
+    }
+    for (size_t end = data_len; end >= 2; --end) {
+        if (data[end - 2] == 0xff && data[end - 1] == 0xd9) {
+            return end;
+        }
+    }
+    return 0;
+}
+
+/* ESP32-P4 v1.x 的 H.264 硬件输入格式为交错 YUV420（O_UYY_E_VYY）。
+ * 如果相机 JPEG 本身就是 YUV420，JPEG 解码器可以直接输出同一布局，
+ * 走零拷贝；YUV422 首选 DMA2D CSC，下面的 CPU 函数只作故障回退。 */
+static void IRAM_ATTR yuv422_to_h264_yuv420(const uint8_t *restrict src,
+                                            uint8_t *restrict dst)
 {
     const size_t src_line_bytes = VIDEO_WIDTH * 2;
     const size_t dst_line_bytes = VIDEO_WIDTH * 3 / 2;
@@ -130,7 +411,11 @@ static void yuv422_to_h264_yuv420(const uint8_t *src, uint8_t *dst)
         uint8_t *dst_even = dst + (by * 2) * dst_line_bytes;
         uint8_t *dst_odd = dst_even + dst_line_bytes;
 
-        for (unsigned bx = 0; bx < VIDEO_WIDTH / 2; ++bx) {
+        /* 每次展开 4 个 2x2 块（8 个像素）。restrict 让编译器知道输入
+         * 和输出不别名；IRAM_ATTR 避免这段高频循环依赖 PSRAM 指令取数。
+         * 仍保留上下两行色度平均，画质和原实现一致。 */
+        unsigned bx = 0;
+        for (; bx + 4 <= VIDEO_WIDTH / 2; bx += 4) {
             /* 输入：U0 Y00 V0 Y01 / U1 Y10 V1 Y11。 */
             dst_even[0] = (uint8_t)(((unsigned)src_even[0] + src_odd[0] + 1) >> 1);
             dst_even[1] = src_even[1];
@@ -138,7 +423,37 @@ static void yuv422_to_h264_yuv420(const uint8_t *src, uint8_t *dst)
             dst_odd[0] = (uint8_t)(((unsigned)src_even[2] + src_odd[2] + 1) >> 1);
             dst_odd[1] = src_odd[1];
             dst_odd[2] = src_odd[3];
+            dst_even[3] = (uint8_t)(((unsigned)src_even[4] + src_odd[4] + 1) >> 1);
+            dst_even[4] = src_even[5];
+            dst_even[5] = src_even[7];
+            dst_odd[3] = (uint8_t)(((unsigned)src_even[6] + src_odd[6] + 1) >> 1);
+            dst_odd[4] = src_odd[5];
+            dst_odd[5] = src_odd[7];
+            dst_even[6] = (uint8_t)(((unsigned)src_even[8] + src_odd[8] + 1) >> 1);
+            dst_even[7] = src_even[9];
+            dst_even[8] = src_even[11];
+            dst_odd[6] = (uint8_t)(((unsigned)src_even[10] + src_odd[10] + 1) >> 1);
+            dst_odd[7] = src_odd[9];
+            dst_odd[8] = src_odd[11];
+            dst_even[9] = (uint8_t)(((unsigned)src_even[12] + src_odd[12] + 1) >> 1);
+            dst_even[10] = src_even[13];
+            dst_even[11] = src_even[15];
+            dst_odd[9] = (uint8_t)(((unsigned)src_even[14] + src_odd[14] + 1) >> 1);
+            dst_odd[10] = src_odd[13];
+            dst_odd[11] = src_odd[15];
 
+            src_even += 16;
+            src_odd += 16;
+            dst_even += 12;
+            dst_odd += 12;
+        }
+        for (; bx < VIDEO_WIDTH / 2; ++bx) {
+            dst_even[0] = (uint8_t)(((unsigned)src_even[0] + src_odd[0] + 1) >> 1);
+            dst_even[1] = src_even[1];
+            dst_even[2] = src_even[3];
+            dst_odd[0] = (uint8_t)(((unsigned)src_even[2] + src_odd[2] + 1) >> 1);
+            dst_odd[1] = src_odd[1];
+            dst_odd[2] = src_odd[3];
             src_even += 4;
             src_odd += 4;
             dst_even += 3;
@@ -147,64 +462,177 @@ static void yuv422_to_h264_yuv420(const uint8_t *src, uint8_t *dst)
     }
 }
 
-static esp_http_client_handle_t video_http_client_create(void)
+/* 就地把 16 字节帧头写进输出槽开头（小端）。用 memcpy 而非指针强转，
+ * 不依赖对齐假设；RISC-V 本身是小端，布局与 PC 端解析一致。 */
+static void video_ws_frame_header_fill(uint8_t *header,
+                                       uint32_t sequence,
+                                       int frame_type)
 {
-    const esp_http_client_config_t config = {
-        .url = VIDEO_STREAM_URL,
-        .method = HTTP_METHOD_POST,
-        .timeout_ms = VIDEO_HTTP_TIMEOUT_MS,
-        .buffer_size = 512,
-        .buffer_size_tx = 2048,
-        .keep_alive_enable = true,
-        .disable_auto_redirect = true,
-    };
+    const uint32_t magic = VIDEO_WS_FRAME_MAGIC;
+    const uint16_t width = VIDEO_WIDTH;
+    const uint16_t height = VIDEO_HEIGHT;
+    const uint16_t fps = VIDEO_ENCODE_FPS;
 
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (client != NULL) {
-        /* 分辨率/帧率头必须与编码配置一致，PC 端按它推算时间轴。 */
-        char size_text[16];
-        char fps_text[8];
-        snprintf(size_text, sizeof(size_text), "%u", VIDEO_WIDTH);
-        esp_http_client_set_header(client, "X-Video-Width", size_text);
-        snprintf(size_text, sizeof(size_text), "%u", VIDEO_HEIGHT);
-        esp_http_client_set_header(client, "X-Video-Height", size_text);
-        snprintf(fps_text, sizeof(fps_text), "%d", VIDEO_ENCODE_FPS);
-        esp_http_client_set_header(client, "Content-Type", "video/h264");
-        esp_http_client_set_header(client, "X-Video-FPS", fps_text);
-        esp_http_client_set_header(client, "Connection", "keep-alive");
-    }
-    return client;
+    memcpy(header + 0, &magic, sizeof(magic));
+    memcpy(header + 4, &width, sizeof(width));
+    memcpy(header + 6, &height, sizeof(height));
+    memcpy(header + 8, &fps, sizeof(fps));
+    header[10] = (uint8_t)frame_type;
+    header[11] = 0;  /* 保留字段 */
+    memcpy(header + 12, &sequence, sizeof(sequence));
 }
 
-static esp_err_t video_http_send(esp_http_client_handle_t client,
-                                 const uint8_t *data,
-                                 size_t data_len,
-                                 uint32_t sequence,
-                                 uint32_t pts,
-                                 int frame_type)
+/* 从 {"cmd":"XXX"} 里取出 XXX。命令格式固定且简单，手写解析即可，
+ * 不为它引入 JSON 依赖。返回 false 表示格式不符合预期。 */
+static bool video_ws_extract_cmd(const char *json, char *out, size_t out_size)
 {
-    char sequence_text[16];
-    char pts_text[16];
-    char frame_type_text[8];
-    snprintf(sequence_text, sizeof(sequence_text), "%" PRIu32, sequence);
-    snprintf(pts_text, sizeof(pts_text), "%" PRIu32, pts);
-    snprintf(frame_type_text, sizeof(frame_type_text), "%d", frame_type);
-
-    esp_http_client_set_header(client, "X-Frame-Sequence", sequence_text);
-    esp_http_client_set_header(client, "X-Frame-PTS", pts_text);
-    esp_http_client_set_header(client, "X-Frame-Type", frame_type_text);
-    esp_http_client_set_post_field(client, (const char *)data, data_len);
-
-    esp_err_t err = esp_http_client_perform(client);
-    const int status = esp_http_client_get_status_code(client);
-    if (err == ESP_OK && status >= 200 && status < 300) {
-        return ESP_OK;
+    const char *key = strstr(json, "\"cmd\"");
+    if (key == NULL) {
+        return false;
+    }
+    const char *colon = strchr(key + 5, ':');
+    if (colon == NULL) {
+        return false;
+    }
+    const char *open = strchr(colon + 1, '"');
+    if (open == NULL) {
+        return false;
+    }
+    const char *close = strchr(open + 1, '"');
+    if (close == NULL) {
+        return false;
     }
 
-    if (err == ESP_OK) {
-        return ESP_FAIL;
+    const size_t length = (size_t)(close - open - 1);
+    if (length == 0 || length >= out_size) {
+        return false;
     }
-    return err;
+    memcpy(out, open + 1, length);
+    out[length] = '\0';
+    return true;
+}
+
+void video_streamer_set_enabled(bool enabled)
+{
+    portENTER_CRITICAL(&s_lock);
+    s_stream_enabled = enabled;
+    portEXIT_CRITICAL(&s_lock);
+    ESP_LOGI(TAG, "视频上传流已%s", enabled ? "开启" : "关闭");
+}
+
+bool video_streamer_is_enabled(void)
+{
+    bool enabled;
+    portENTER_CRITICAL(&s_lock);
+    enabled = s_stream_enabled;
+    portEXIT_CRITICAL(&s_lock);
+    return enabled;
+}
+
+/* 处理服务器下发的控制命令并回包。 */
+static void video_ws_handle_command(esp_websocket_client_handle_t client,
+                                    const char *command)
+{
+    char cmd[16];
+    char reply[192];
+
+    if (!video_ws_extract_cmd(command, cmd, sizeof(cmd))) {
+        snprintf(reply, sizeof(reply), "{\"ok\":false,\"error\":\"bad command\"}");
+    } else if (strcmp(cmd, "ping") == 0) {
+        snprintf(reply, sizeof(reply), "{\"ok\":true,\"cmd\":\"ping\"}");
+    } else if (strcmp(cmd, "status") == 0) {
+        portENTER_CRITICAL(&s_lock);
+        const uint32_t encoded = s_stats.encoded;
+        const uint32_t sent = s_stats.sent;
+        const uint32_t failed = s_stats.send_failed;
+        const uint32_t dropped = s_stats.dropped + s_stats.slot_dropped;
+        const bool enabled = s_stream_enabled;
+        portEXIT_CRITICAL(&s_lock);
+
+        snprintf(reply, sizeof(reply),
+                 "{\"ok\":true,\"cmd\":\"status\",\"width\":%d,\"height\":%d,"
+                 "\"fps\":%d,\"encoded\":%" PRIu32 ",\"sent\":%" PRIu32
+                 ",\"failed\":%" PRIu32 ",\"dropped\":%" PRIu32
+                 ",\"video_enabled\":%s}",
+                 VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_ENCODE_FPS,
+                 encoded, sent, failed, dropped, enabled ? "true" : "false");
+    } else if (strcmp(cmd, "video_on") == 0 || strcmp(cmd, "video_off") == 0) {
+        const bool enabled = strcmp(cmd, "video_on") == 0;
+        video_streamer_set_enabled(enabled);
+        snprintf(reply, sizeof(reply),
+                 "{\"ok\":true,\"cmd\":\"%s\",\"video_enabled\":%s}",
+                 cmd, enabled ? "true" : "false");
+    } else {
+        snprintf(reply, sizeof(reply),
+                 "{\"ok\":false,\"error\":\"unknown cmd\",\"cmd\":\"%s\"}", cmd);
+    }
+
+    ESP_LOGI(TAG, "下行命令 %s → %s", command, reply);
+    if (esp_websocket_client_send_text(client, reply, (int)strlen(reply),
+                                       pdMS_TO_TICKS(VIDEO_WS_TIMEOUT_MS)) < 0) {
+        ESP_LOGW(TAG, "回发命令响应失败");
+    }
+}
+
+/* WebSocket 事件回调。由客户端的任务在派发事件前主动释放 client->lock 后调用
+ * （见组件连接态分支），所以这里直接 send_text 回包不会自死锁。
+ * 只做轻量处理：收命令、打日志，不做任何等待。 */
+static void video_ws_event_handler(void *handler_args,
+                                   esp_event_base_t base,
+                                   int32_t event_id,
+                                   void *event_data)
+{
+    (void)handler_args;
+    (void)base;
+    const esp_websocket_event_data_t *data = (const esp_websocket_event_data_t *)event_data;
+
+    switch ((esp_websocket_event_id_t)event_id) {
+    case WEBSOCKET_EVENT_CONNECTED:
+        __atomic_store_n(&s_ws_connected, true, __ATOMIC_SEQ_CST);
+        ESP_LOGI(TAG, "WebSocket 已连接：%s", VIDEO_STREAM_WS_URL);
+        break;
+
+    case WEBSOCKET_EVENT_DISCONNECTED:
+    case WEBSOCKET_EVENT_CLOSED:
+        /* 重连由组件负责，这里只复位可能残留的半条命令。 */
+        __atomic_store_n(&s_ws_connected, false, __ATOMIC_SEQ_CST);
+        ESP_LOGW(TAG, "WebSocket 连接断开，等待自动重连");
+        s_ws_command_len = 0;
+        break;
+
+    case WEBSOCKET_EVENT_ERROR:
+        __atomic_store_n(&s_ws_connected, false, __ATOMIC_SEQ_CST);
+        video_stream_log_error_limited(
+            "WebSocket 出错",
+            data != NULL ? data->error_handle.esp_transport_sock_errno : 0);
+        break;
+
+    case WEBSOCKET_EVENT_DATA:
+        /* 只收文本帧（下行命令）。二进制帧是上行视频，服务器不会回传。
+         * 命令远小于缓冲，正常只有一次事件；超出缓冲时组件会按偏移分多次投递。 */
+        if (data == NULL || (data->op_code != 0x01 && data->op_code != 0x00)) {
+            break;
+        }
+        if (data->op_code == 0x01) {
+            s_ws_command_len = 0;  /* 新一条消息的第一片 */
+        }
+        if (s_ws_command_len + (size_t)data->data_len >= sizeof(s_ws_command)) {
+            s_ws_command_len = 0;
+            ESP_LOGW(TAG, "下行命令过长，已丢弃");
+            break;
+        }
+        memcpy(s_ws_command + s_ws_command_len, data->data_ptr, (size_t)data->data_len);
+        s_ws_command_len += (size_t)data->data_len;
+        if (data->fin) {
+            s_ws_command[s_ws_command_len] = '\0';
+            video_ws_handle_command(data->client, s_ws_command);
+            s_ws_command_len = 0;
+        }
+        break;
+
+    default:
+        break;
+    }
 }
 
 static void video_stream_report(int64_t now_us)
@@ -222,8 +650,8 @@ static void video_stream_report(int64_t now_us)
     video_stream_stats_t current;
     portENTER_CRITICAL(&s_lock);
     current = s_stats;
-    /* 报告周期内的 HTTP 最长单帧耗时：读出后清零，只统计当前窗口。 */
-    s_stats.http_max_us = 0;
+    /* 报告周期内的 WebSocket 最长单帧耗时：读出后清零，只统计当前窗口。 */
+    s_stats.ws_max_us = 0;
     portEXIT_CRITICAL(&s_lock);
 
     const double seconds = (now_us - last_report_us) / 1000000.0;
@@ -231,23 +659,60 @@ static void video_stream_report(int64_t now_us)
     const uint32_t sent_delta = current.sent - previous.sent;
     const uint64_t bytes_delta = current.encoded_bytes - previous.encoded_bytes;
     const uint64_t decode_us_delta = current.jpeg_decode_us - previous.jpeg_decode_us;
+    const uint64_t input_queue_us_delta = current.input_queue_us - previous.input_queue_us;
+    const uint64_t validation_us_delta = current.validation_us - previous.validation_us;
     const uint64_t repack_us_delta = current.yuv_repack_us - previous.yuv_repack_us;
     const uint64_t encode_us_delta = current.h264_encode_us - previous.h264_encode_us;
-    const uint64_t send_us_delta = current.http_send_us - previous.http_send_us;
+    const uint64_t output_queue_us_delta = current.output_queue_us - previous.output_queue_us;
+    const uint64_t send_us_delta = current.ws_send_us - previous.ws_send_us;
+    const uint32_t send_attempts_delta = current.send_attempts - previous.send_attempts;
+    const uint32_t upload_received_delta = current.upload_received - previous.upload_received;
     const double sample_count = encoded_delta > 0 ? encoded_delta : 1;
+    const UBaseType_t input_used = s_input_queue != NULL ? uxQueueMessagesWaiting(s_input_queue) : 0;
+    const UBaseType_t input_capacity = s_input_queue != NULL ?
+                                       uxQueueSpacesAvailable(s_input_queue) + input_used : 0;
+    const UBaseType_t output_used = s_out_ready != NULL ? uxQueueMessagesWaiting(s_out_ready) : 0;
+    const UBaseType_t output_capacity = s_out_ready != NULL ?
+                                        uxQueueSpacesAvailable(s_out_ready) + output_used : 0;
+
     ESP_LOGI(TAG,
-             "H.264：编码=%.1f fps，发送=%.1f fps，%.0f kbps，耗时 J=%.1f/Y=%.1f/H=%.1f/HTTP=%.1f(峰值 %.1f) ms，过载丢帧=%" PRIu32 "，失败=%" PRIu32,
+             "[VIDEO] encoded=%.1f fps sent=%.1f fps bitrate=%.0f kbps",
              encoded_delta / seconds, sent_delta / seconds,
-             bytes_delta * 8.0 / seconds / 1000.0,
+             bytes_delta * 8.0 / seconds / 1000.0);
+    ESP_LOGI(TAG,
+             "[VIDEO] avg ms input_wait=%.2f validate=%.2f JPEG_DEC=%.2f "
+             "YUV_CONV=%.2f H264_ENC=%.2f output_wait=%.2f SEND=%.2f max_SEND=%.2f",
+             input_queue_us_delta / sample_count / 1000.0,
+             validation_us_delta / sample_count / 1000.0,
              decode_us_delta / sample_count / 1000.0,
              repack_us_delta / sample_count / 1000.0,
              encode_us_delta / sample_count / 1000.0,
-             send_us_delta / sample_count / 1000.0,
-             current.http_max_us / 1000.0,
-             current.dropped + current.slot_dropped, current.send_failed);
+             upload_received_delta > 0 ? output_queue_us_delta / upload_received_delta / 1000.0 : 0.0,
+             send_attempts_delta > 0 ? send_us_delta / send_attempts_delta / 1000.0 : 0.0,
+             current.ws_max_us / 1000.0);
+    ESP_LOGI(TAG,
+             "[VIDEO] Queue MJPEG=%u/%u YUV=%u/1 H264=%u/%u "
+             "drop_input=%" PRIu32 " drop_output=%" PRIu32 " invalid=%" PRIu32
+             " send_fail=%" PRIu32 " PSRAM_free=%u KB",
+             (unsigned)input_used, (unsigned)input_capacity,
+             s_yuv_busy ? 1U : 0U, (unsigned)output_used, (unsigned)output_capacity,
+             current.dropped, current.slot_dropped, current.input_invalid,
+             current.send_failed,
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U));
 
     previous = current;
     last_report_us = now_us;
+}
+
+/* 独立统计任务负责定时汇总，避免把“是否有发送完成”当成计时源。
+ * 因此即使 WebSocket 暂停或完全断开，也会每 5 秒输出一个诊断窗口。 */
+static void video_report_task(void *arg)
+{
+    (void)arg;
+    while (true) {
+        video_stream_report(esp_timer_get_time());
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
 }
 
 static esp_err_t video_encoder_create(esp_h264_enc_handle_t *encoder)
@@ -284,14 +749,39 @@ static esp_err_t video_encoder_create(esp_h264_enc_handle_t *encoder)
 
 /* 网络发送任务（钉核 0，优先 9）：
  * 只做 H.264 码流上传与失败恢复，不参与任何编解码。
- * 编码完成前绝不丢弃 P 帧——输出槽一旦入队就必须发送，
- * 否则 PC 端解码器会因缺帧花屏直到下一个 IDR。 */
+ * 正常连接时按顺序发送；断线时快速丢弃过期输出槽，避免恢复后把旧 P 帧
+ * 排队发送。PC 端会等待下一个 IDR 重新同步。 */
 static void video_upload_task(void *arg)
 {
     (void)arg;
-    esp_http_client_handle_t http_client = video_http_client_create();
-    if (http_client == NULL) {
-        ESP_LOGE(TAG, "创建 H.264 HTTP 客户端失败");
+
+    const esp_websocket_client_config_t ws_config = {
+        .uri = VIDEO_STREAM_WS_URL,
+        .buffer_size = VIDEO_WS_BUFFER_SIZE,
+        .task_stack = VIDEO_WS_TASK_STACK,
+        .task_prio = VIDEO_WS_TASK_PRIORITY,
+        .task_core_id_set = true,
+        .task_core_id = VIDEO_WS_TASK_CORE,
+        /* 两种断开都交给组件自动重连：异常断开（默认就开）与
+         * 服务器发出的正常 CLOSE 握手（默认关，这里显式打开），
+         * 免得 PC 端优雅退出后 P4 就此停摆、必须复位。 */
+        .disable_auto_reconnect = false,
+        .enable_close_reconnect = true,
+        .reconnect_timeout_ms = VIDEO_WS_RECONNECT_MS,
+        .network_timeout_ms = VIDEO_WS_TIMEOUT_MS,
+    };
+
+    esp_websocket_client_handle_t ws_client = esp_websocket_client_init(&ws_config);
+    if (ws_client == NULL) {
+        ESP_LOGE(TAG, "创建 WebSocket 客户端失败");
+        vTaskDelete(NULL);
+        return;
+    }
+    esp_websocket_register_events(ws_client, WEBSOCKET_EVENT_ANY,
+                                  video_ws_event_handler, NULL);
+    if (esp_websocket_client_start(ws_client) != ESP_OK) {
+        ESP_LOGE(TAG, "启动 WebSocket 客户端失败");
+        esp_websocket_client_destroy(ws_client);
         vTaskDelete(NULL);
         return;
     }
@@ -303,18 +793,50 @@ static void video_upload_task(void *arg)
         }
         video_out_slot_t *slot = &s_out_slots[out_index];
 
+        /* 关闭期间清空已编码但尚未发送的旧帧，恢复后只发送新帧。 */
+        if (!video_streamer_is_enabled()) {
+            xQueueSend(s_out_free, &out_index, portMAX_DELAY);
+            continue;
+        }
+
+        /* 槽里已经是「16 字节帧头 + Annex-B 码流」一整条，一次发完。 */
+        const int frame_bytes = (int)(VIDEO_WS_FRAME_HEADER_SIZE + slot->data_len);
+
         esp_err_t send_error = ESP_ERR_INVALID_STATE;
         const int64_t send_started_us = esp_timer_get_time();
-        if (network_manager_wait_connected(VIDEO_HTTP_TIMEOUT_MS)) {
-            send_error = video_http_send(http_client, slot->data, slot->data_len,
-                                         slot->sequence, slot->pts, slot->frame_type);
+        const int64_t output_wait_us = slot->ready_us != 0 ?
+                                       send_started_us - slot->ready_us : 0;
+        /* 不等待 WiFi/WS 恢复：输出槽里的 P 帧带有旧参考时间轴，断线后继续
+         * 发送只会制造延迟，且会把输出槽全部占满。恢复后从新产生的帧继续，
+         * PC 端会等待下一个 IDR 重新同步。 */
+        if (__atomic_load_n(&s_ws_connected, __ATOMIC_SEQ_CST) &&
+            network_manager_is_connected() &&
+            esp_websocket_client_is_connected(ws_client)) {
+            video_upload_pace();
+
+            /* 发送间隔等待期间连接可能已经断开，重新检查状态，避免在
+             * 断线窗口继续申请 ESP-Hosted 传输缓冲。 */
+            if (!__atomic_load_n(&s_ws_connected, __ATOMIC_SEQ_CST) ||
+                !network_manager_is_connected() ||
+                !esp_websocket_client_is_connected(ws_client)) {
+                send_error = ESP_ERR_INVALID_STATE;
+            } else {
+            /* 返回实际写入字节数；不等于整帧长度即视为本帧失败。 */
+            const int sent = esp_websocket_client_send_bin(
+                ws_client, (const char *)(slot->data + VIDEO_WS_FRAME_HEADER_OFFSET), frame_bytes,
+                pdMS_TO_TICKS(VIDEO_WS_TIMEOUT_MS));
+            send_error = (sent == frame_bytes) ? ESP_OK : ESP_FAIL;
+            }
         }
         const int64_t send_elapsed_us = esp_timer_get_time() - send_started_us;
 
         portENTER_CRITICAL(&s_lock);
-        s_stats.http_send_us += send_elapsed_us;
-        if (send_elapsed_us > (int64_t)s_stats.http_max_us) {
-            s_stats.http_max_us = send_elapsed_us;
+        s_stats.output_queue_us += output_wait_us;
+        s_stats.upload_received++;
+        s_stats.send_attempts++;
+        s_stats.ws_send_us += send_elapsed_us;
+        if (send_elapsed_us > (int64_t)s_stats.ws_max_us) {
+            s_stats.ws_max_us = send_elapsed_us;
         }
         if (send_error == ESP_OK) {
             s_stats.sent++;
@@ -324,14 +846,16 @@ static void video_upload_task(void *arg)
         portEXIT_CRITICAL(&s_lock);
 
         if (send_error != ESP_OK) {
+            __atomic_store_n(&s_ws_connected, false, __ATOMIC_SEQ_CST);
+            /* 重连由 WebSocket 客户端负责，下一帧自然会重新尝试。 */
             video_stream_log_error_limited("H.264 发送失败", send_error);
-            /* 关闭连接，下一帧 perform 时自动重连恢复。 */
-            esp_http_client_close(http_client);
+            /* 旧 P 帧即使稍后发送成功，也只会制造延迟；实时预览从新帧
+             * 重新开始，输出槽立即回收，避免断线期间持续积压。 */
+            video_drop_pending_output();
         }
 
         /* 无论成败都归还输出槽，编码任务才可能继续推进。 */
         xQueueSend(s_out_free, &out_index, portMAX_DELAY);
-        video_stream_report(esp_timer_get_time());
     }
 }
 
@@ -343,13 +867,15 @@ static void video_codec_task(void *arg)
     (void)arg;
     uint32_t aligned_input_size = VIDEO_H264_INPUT_SIZE;
     uint8_t *h264_input = esp_h264_aligned_calloc(
-        16, 1, VIDEO_H264_INPUT_SIZE, &aligned_input_size, ESP_H264_MEM_SPIRAM);
+        VIDEO_WS_ALIGN, 1, VIDEO_H264_INPUT_SIZE, &aligned_input_size, ESP_H264_MEM_SPIRAM);
     esp_h264_enc_handle_t encoder = NULL;
     jpeg_decoder_handle_t jpeg_decoder = NULL;
     uint8_t *jpeg_yuv = NULL;
     uint8_t *out_buffers[VIDEO_OUT_SLOT_COUNT] = { 0 };
     unsigned initialized_out = 0;
     bool upload_started = false;
+    bool jpeg_sampling_known = false;
+    jpeg_down_sampling_type_t jpeg_sampling = JPEG_DOWN_SAMPLING_YUV422;
 
     if (h264_input == NULL ||
         video_encoder_create(&encoder) != ESP_OK) {
@@ -379,6 +905,15 @@ static void video_codec_task(void *arg)
         goto codec_fail;
     }
 
+    const esp_err_t dma2d_yuv_init_ret = dma2d_yuv_converter_init();
+    const bool dma2d_yuv_ready = dma2d_yuv_init_ret == ESP_OK;
+    ESP_LOGI(TAG, "YUV422→YUV420 转换：%s",
+             dma2d_yuv_ready ? "DMA2D 硬件 CSC" : "CPU 回退");
+    if (!dma2d_yuv_ready) {
+        ESP_LOGW(TAG, "DMA2D YUV CSC 当前不可用（%s），禁用硬件尝试，避免每帧超时",
+                 esp_err_to_name(dma2d_yuv_init_ret));
+    }
+
     /* H.264 输出槽池与两条所有权队列：编解码任务独占写入，上传任务独占读出。 */
     s_out_free = xQueueCreate(VIDEO_OUT_SLOT_COUNT, sizeof(unsigned));
     s_out_ready = xQueueCreate(VIDEO_OUT_SLOT_COUNT, sizeof(unsigned));
@@ -388,9 +923,10 @@ static void video_codec_task(void *arg)
     }
     for (unsigned i = 0; i < VIDEO_OUT_SLOT_COUNT; ++i) {
         uint32_t actual_size = 0;
+        /* 按 128 对齐分配：编码缓冲位于槽内 +128，基址对齐才能保证它也对齐。 */
         out_buffers[i] = esp_h264_aligned_calloc(
-            16, 1, VIDEO_H264_OUTPUT_SIZE, &actual_size, ESP_H264_MEM_SPIRAM);
-        if (out_buffers[i] == NULL || actual_size < VIDEO_H264_OUTPUT_SIZE) {
+            VIDEO_WS_ALIGN, 1, VIDEO_H264_SLOT_SIZE, &actual_size, ESP_H264_MEM_SPIRAM);
+        if (out_buffers[i] == NULL || actual_size < VIDEO_H264_SLOT_SIZE) {
             ESP_LOGE(TAG, "分配第 %u 个 H.264 输出缓冲失败", i);
             goto codec_fail;
         }
@@ -413,12 +949,17 @@ static void video_codec_task(void *arg)
     }
     upload_started = true;
 
+    if (xTaskCreatePinnedToCore(video_report_task, "video_report", 4096, NULL,
+                                VIDEO_REPORT_PRIORITY, NULL, VIDEO_REPORT_CORE) != pdPASS) {
+        ESP_LOGW(TAG, "创建视频统计任务失败，保留编解码和传输任务");
+    }
+
     ESP_LOGI(TAG,
-             "编解码/上传双任务已就绪：MJPEG(YUV422直出)→硬编 H.264 "
-             "%ux%u@%dfps，%dkbps，GOP=%d，输出槽=%d，HTTP=%s",
+             "编解码/上传双任务已就绪：MJPEG→JPEG硬解→硬编 H.264 "
+             "%ux%u@%dfps，%dkbps，GOP=%d，输出槽=%d，WS=%s",
              VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_ENCODE_FPS,
              VIDEO_BITRATE / 1000, VIDEO_GOP,
-             VIDEO_OUT_SLOT_COUNT, VIDEO_STREAM_URL);
+             VIDEO_OUT_SLOT_COUNT, VIDEO_STREAM_WS_URL);
 
     unsigned slot_index;
     while (true) {
@@ -426,12 +967,63 @@ static void video_codec_task(void *arg)
             continue;
         }
         video_input_slot_t *slot = &s_slots[slot_index];
+        const int64_t codec_started_us = esp_timer_get_time();
+        const int64_t input_queue_us = slot->submitted_us != 0 ?
+                                       codec_started_us - slot->submitted_us : 0;
+        portENTER_CRITICAL(&s_lock);
+        s_stats.input_queue_us += input_queue_us;
+        portEXIT_CRITICAL(&s_lock);
         const uint32_t sequence = slot->sequence;
+        const uint8_t *jpeg_data = slot->input;
+        const size_t frame_data_len = slot->data_len;
+        const int64_t validation_started_us = esp_timer_get_time();
+        const size_t jpeg_size = video_jpeg_find_eoi(jpeg_data, frame_data_len);
+        const bool structurally_valid = jpeg_size != 0 &&
+                                        video_jpeg_structurally_valid(jpeg_data, jpeg_size);
+        const int64_t validation_elapsed_us = esp_timer_get_time() - validation_started_us;
+        portENTER_CRITICAL(&s_lock);
+        s_stats.validation_us += validation_elapsed_us;
+        portEXIT_CRITICAL(&s_lock);
+
+        if (!video_streamer_is_enabled()) {
+            video_input_slot_release(slot);
+            continue;
+        }
+
+        /* 结构校验放在这里而不是 USB 回调里，理由见上面
+         * video_jpeg_structurally_valid 的说明。不通过就不进硬件解码器：
+         * P4 的 JPEG 单元遇到损坏 Marker 会卡在 data-units 数量不符上，
+         * 还会连带 DMA2D 报 transaction not in-flight。 */
+        if (!structurally_valid) {
+            portENTER_CRITICAL(&s_lock);
+            s_stats.input_invalid++;
+            portEXIT_CRITICAL(&s_lock);
+            video_input_slot_release(slot);
+            continue;
+        }
 
         /* JPEG 硬件解码：环槽里的 MJPEG 帧直接作为位流源，无需二次拷贝。
-         * 解码完成后即可释放 MJPEG 环槽，后续各段不再引用它。 */
+         * 首帧读取 JPEG 采样方式；相机若原生输出 YUV420，则直接把解码
+         * 缓冲交给 H.264，避免 YUV422→YUV420 软件重排。 */
+        if (!jpeg_sampling_known) {
+            jpeg_decode_picture_info_t picture_info = { 0 };
+            if (jpeg_decoder_get_info(jpeg_data,
+                                      (uint32_t)jpeg_size,
+                                      &picture_info) == ESP_OK) {
+                jpeg_sampling = picture_info.sample_method;
+                jpeg_sampling_known = true;
+                ESP_LOGI(TAG, "JPEG 采样格式：%s",
+                         jpeg_sampling == JPEG_DOWN_SAMPLING_YUV420 ? "YUV420 原生直通" :
+                         (dma2d_yuv_ready ? "YUV422 DMA2D 硬件转换" : "YUV422 CPU 回退路径"));
+            }
+        }
+        const bool native_yuv420 = jpeg_sampling_known &&
+                                   jpeg_sampling == JPEG_DOWN_SAMPLING_YUV420;
+        const uint32_t expected_decode_size = native_yuv420 ?
+                                               VIDEO_H264_INPUT_SIZE : VIDEO_YUV422_SIZE;
         const jpeg_decode_cfg_t decode_cfg = {
-            .output_format = JPEG_DECODE_OUT_FORMAT_YUV422,
+            .output_format = native_yuv420 ? JPEG_DECODE_OUT_FORMAT_YUV420 :
+                                             JPEG_DECODE_OUT_FORMAT_YUV422,
             /* YUV 输出不使用 rgb_order/conv_std，这里保留合法默认值。 */
             .rgb_order = JPEG_DEC_RGB_ELEMENT_ORDER_RGB,
             .conv_std = JPEG_YUV_RGB_CONV_STD_BT601,
@@ -440,15 +1032,18 @@ static void video_codec_task(void *arg)
         const int64_t decode_started_us = esp_timer_get_time();
         esp_err_t decode_error = jpeg_decoder_process(
             jpeg_decoder, &decode_cfg,
-            slot->data, (uint32_t)slot->data_len,
+            (uint8_t *)jpeg_data, (uint32_t)jpeg_size,
             jpeg_yuv, (uint32_t)jpeg_yuv_size, &decoded_size);
         const int64_t decode_elapsed_us = esp_timer_get_time() - decode_started_us;
 
-        portENTER_CRITICAL(&s_lock);
-        slot->busy = false;
-        portEXIT_CRITICAL(&s_lock);
+        video_input_slot_release(slot);
 
-        if (decode_error != ESP_OK || decoded_size != VIDEO_YUV422_SIZE) {
+        /* 如果命令在解码期间到达，不再继续占用编码和发送资源。 */
+        if (!video_streamer_is_enabled()) {
+            continue;
+        }
+
+        if (decode_error != ESP_OK || decoded_size != expected_decode_size) {
             video_stream_log_error_limited("JPEG 解码失败", decode_error);
             continue;
         }
@@ -465,21 +1060,46 @@ static void video_codec_task(void *arg)
         }
         video_out_slot_t *out_slot = &s_out_slots[out_index];
 
-        /* YUV422 → esp_h264 要求的 O_UYY_E_VYY 交错 YUV420。 */
+        /* 原生 YUV420 与 H.264 输入布局一致时零拷贝；YUV422 交给 DMA2D
+         * 的 RX CSC 硬件转换。P4 v1.x 的 JPEG 公共驱动虽然不能直接请求
+         * 这个转换，但底层 DMA2D M2M CSC 可以单独完成同一布局转换。 */
         const int64_t repack_started_us = esp_timer_get_time();
-        yuv422_to_h264_yuv420(jpeg_yuv, h264_input);
-        const int64_t repack_elapsed_us = esp_timer_get_time() - repack_started_us;
+        s_yuv_busy = !native_yuv420;
+        uint8_t *h264_frame = jpeg_yuv;
+        uint32_t h264_frame_len = VIDEO_H264_INPUT_SIZE;
+        if (!native_yuv420) {
+            esp_err_t dma2d_ret = ESP_ERR_NOT_SUPPORTED;
+            if (dma2d_yuv_ready) {
+                dma2d_ret = dma2d_yuv422_to_h264_yuv420(
+                    jpeg_yuv, VIDEO_YUV422_SIZE,
+                    h264_input, VIDEO_H264_INPUT_SIZE,
+                    VIDEO_WIDTH, VIDEO_HEIGHT, 100);
+            }
+            if (dma2d_ret != ESP_OK) {
+                if (dma2d_yuv_ready) {
+                    ESP_LOGW(TAG, "DMA2D YUV 转换失败（%s），本次回退 CPU",
+                             esp_err_to_name(dma2d_ret));
+                }
+                yuv422_to_h264_yuv420(jpeg_yuv, h264_input);
+            }
+            h264_frame = h264_input;
+        }
+        const int64_t repack_elapsed_us = native_yuv420 ? 0 :
+                                           esp_timer_get_time() - repack_started_us;
+        s_yuv_busy = false;
 
         esp_h264_enc_in_frame_t input_frame = {
             .raw_data = {
-                .buffer = h264_input,
-                .len = aligned_input_size,
+                .buffer = h264_frame,
+                .len = native_yuv420 ? h264_frame_len : aligned_input_size,
             },
             .pts = sequence * (90000 / VIDEO_ENCODE_FPS),
         };
+        /* 码流写进槽内偏移 +128 处（见 VIDEO_WS_ALIGN 处的对齐说明），
+         * 帧头放在其前 16 字节的 +112 处，发送时原地补齐。 */
         esp_h264_enc_out_frame_t output_frame = {
             .raw_data = {
-                .buffer = out_slot->data,
+                .buffer = out_slot->data + VIDEO_WS_ALIGN,
                 .len = VIDEO_H264_OUTPUT_SIZE,
             },
         };
@@ -496,10 +1116,14 @@ static void video_codec_task(void *arg)
         portEXIT_CRITICAL(&s_lock);
 
         if (encode_error == ESP_H264_ERR_OK && output_frame.length > 0) {
+            /* 先补齐帧头再入队：上传任务拿到槽时整条消息已经完整。 */
+            video_ws_frame_header_fill(out_slot->data + VIDEO_WS_FRAME_HEADER_OFFSET,
+                                       sequence, output_frame.frame_type);
             out_slot->data_len = output_frame.length;
             out_slot->sequence = sequence;
             out_slot->pts = input_frame.pts;
             out_slot->frame_type = output_frame.frame_type;
+            out_slot->ready_us = esp_timer_get_time();
             portENTER_CRITICAL(&s_lock);
             s_stats.encoded++;
             s_stats.encoded_bytes += output_frame.length;
@@ -573,7 +1197,7 @@ esp_err_t video_streamer_init(void)
     size_t slot_size = 0;
     for (unsigned i = 0; i < VIDEO_SLOT_COUNT; ++i) {
         s_slots[i].data = jpeg_alloc_decoder_mem(VIDEO_STREAM_JPEG_MAX_SIZE,
-                                                 &slot_alloc_cfg, &slot_size);
+                                                  &slot_alloc_cfg, &slot_size);
         if (s_slots[i].data == NULL) {
             ESP_LOGE(TAG, "分配第 %u 个 MJPEG PSRAM 缓冲失败", i);
             while (i > 0) {
@@ -584,6 +1208,9 @@ esp_err_t video_streamer_init(void)
             s_input_queue = NULL;
             return ESP_ERR_NO_MEM;
         }
+        s_slots[i].input = s_slots[i].data;
+        s_slots[i].release_cb = NULL;
+        s_slots[i].release_ctx = NULL;
     }
 
     BaseType_t created = xTaskCreatePinnedToCore(video_codec_task,
@@ -607,10 +1234,15 @@ esp_err_t video_streamer_init(void)
     return ESP_OK;
 }
 
-bool video_streamer_submit_jpeg(const uint8_t *data,
-                                size_t data_len)
+static bool video_streamer_submit_jpeg_internal(
+    const uint8_t *data,
+    size_t data_len,
+    video_streamer_input_release_cb_t release_cb,
+    void *release_ctx)
 {
-    if (!s_initialized || !network_manager_is_connected() || data == NULL ||
+    if (!s_initialized || !video_streamer_is_enabled() ||
+        !__atomic_load_n(&s_ws_connected, __ATOMIC_SEQ_CST) ||
+        !network_manager_is_connected() || data == NULL ||
         data_len == 0 || data_len > VIDEO_STREAM_JPEG_MAX_SIZE) {
         return false;
     }
@@ -644,13 +1276,21 @@ bool video_streamer_submit_jpeg(const uint8_t *data,
     }
 
     video_input_slot_t *slot = &s_slots[selected];
-    memcpy(slot->data, data, data_len);
+    if (release_cb == NULL) {
+        memcpy(slot->data, data, data_len);
+        slot->input = slot->data;
+    } else {
+        slot->input = data;
+    }
     slot->data_len = data_len;
     slot->sequence = ++s_next_sequence;
+    slot->submitted_us = now_us;
+    slot->release_cb = release_cb;
+    slot->release_ctx = release_ctx;
 
     if (xQueueSend(s_input_queue, &selected, 0) != pdTRUE) {
+        video_input_slot_release(slot);
         portENTER_CRITICAL(&s_lock);
-        slot->busy = false;
         s_stats.dropped++;
         portEXIT_CRITICAL(&s_lock);
         return false;
@@ -668,4 +1308,22 @@ bool video_streamer_submit_jpeg(const uint8_t *data,
         s_next_submit_us += frame_interval_us;
     }
     return true;
+}
+
+bool video_streamer_submit_jpeg(const uint8_t *data,
+                                size_t data_len)
+{
+    return video_streamer_submit_jpeg_internal(data, data_len, NULL, NULL);
+}
+
+bool video_streamer_submit_jpeg_owned(
+    const uint8_t *data,
+    size_t data_len,
+    video_streamer_input_release_cb_t release_cb,
+    void *release_ctx)
+{
+    if (release_cb == NULL) {
+        return false;
+    }
+    return video_streamer_submit_jpeg_internal(data, data_len, release_cb, release_ctx);
 }

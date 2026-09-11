@@ -8,11 +8,15 @@ LRCPG720p USB 摄像头
 → ESP32-P4 硬件 JPEG 直接解码为 UYVY/YUV422
 → 软件仅做垂直色度抽样和 O_UYY_E_VYY 字节重排
 → ESP32-P4 H.264 硬件编码，目标 15 FPS / 1.5 Mbps / GOP 15
-→ HTTP/1.1 长连接逐帧 POST
+→ 每帧前置 16 字节自描述头（magic/宽/高/帧率/帧类型/序号）
+→ WebSocket 二进制帧逐帧发送
 → ESP-Hosted / ESP32-C6 / WiFi
-→ Windows PC 192.168.1.66:8000
-→ 保存 Annex-B `.h264` 码流并生成浏览器预览
+→ Windows PC 192.168.1.66:8001/ws
+→ 保存 Annex-B `.h264` 码流（只落 payload）并生成浏览器预览
 ```
+
+分辨率与帧率随每帧的 16 字节头携带，PC 端据此自适应几何参数，不需要在连接建立时协商；
+因此改分辨率只影响 P4 侧的编译期常量，协议和 PC 端都不用动。
 
 摄像头本身没有 H.264/H.265 输出。YUY2 直采在本机的热复位流程中不稳定，当前主线已改为 MJPEG 加硬件 JPEG 解码。ESP32-P4 当前组件只提供 H.264 硬件编码，本阶段不实现 H.265。
 
@@ -32,7 +36,18 @@ idf.py -B build_main_verified build
 idf.py -B build_main_verified -p COM17 flash monitor
 ```
 
-服务器状态和预览地址为 `http://127.0.0.1:8000/`。首次运行启动脚本会自动安装 PyAV/OpenCV。`GET /h264` 返回状态，`GET /preview.mjpg` 是浏览器持续预览流。电脑 WLAN IPv4 变化后，需要修改 `components/video_streamer/video_streamer.c` 中的 `VIDEO_STREAM_URL`。
+服务器状态和预览地址为 `http://127.0.0.1:8000/`。首次运行启动脚本会自动安装 PyAV/OpenCV/websockets。`GET /preview.mjpg` 是浏览器持续预览流；视频帧走 **WebSocket `ws://<PC>:8001/ws`**，`GET /h264`（HTTP POST）作为回退通道保留。
+
+下行命令在 HTTP 侧下发，广播给所有 WebSocket 连接：
+
+```text
+GET http://127.0.0.1:8000/cmd?cmd=ping     # 探活，P4 回 {"ok":true,"cmd":"ping"}
+GET http://127.0.0.1:8000/cmd?cmd=status   # 取 P4 内部计数
+```
+
+P4 的回复是异步到达的，通过 `GET /status` 的 `last_command_reply` 字段读取。
+
+电脑 WLAN IPv4 变化后，需要修改 `components/video_streamer/video_streamer.c` 中的 `VIDEO_STREAM_WS_URL`。
 
 ## 热复位恢复结论
 

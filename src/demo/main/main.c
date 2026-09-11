@@ -13,6 +13,15 @@
 
 static const char *TAG = "APP_MAIN";
 
+/*
+ * USB + 视频链路隔离测试开关。
+ *
+ * 保留 Network Manager（视频 WebSocket 仍需要 Wi-Fi），但暂停天气 HTTPS
+ * 和 GIF/SD 卡轮播，便于判断 USB 回调间隔是否仍会出现 100 ms 级停顿。
+ * 测试完成后改为 0 即可恢复原来的天气与 GIF 任务。
+ */
+#define CAMERA_ISOLATION_TEST 0
+
 /* UI 初始化包含 LCD、LVGL 和动态时间天气首页。
  * 初始化完成后，LVGL Port 的内部任务负责定时器和屏幕刷新；本任务保持存活，
  * 后续可以在这里接收 UI 队列事件，统一执行页面和表情切换。 */
@@ -22,10 +31,14 @@ static void ui_task(void *arg)
     ESP_LOGI(TAG, "UI Task 启动");
     display_driver_start();
 
+#if CAMERA_ISOLATION_TEST
+    ESP_LOGI(TAG, "隔离测试模式：已暂停 GIF/SD 卡轮播，保留显示驱动");
+#else
     /* 屏幕轮播：天气首页 5 秒 → TF 卡上每个 GIF 各 5 秒 → 回到首页，循环。
      * 必须放在 display_driver_start() 之后：轮播把已建好的天气首页当作
      * 循环的第一环，也依赖这里初始化好的 LVGL。 */
     screen_carousel_start();
+#endif
 
     while (true) {
         /* 页面刷新由 LVGL 定时器完成，本任务保留给后续 UI 事件队列。 */
@@ -62,11 +75,15 @@ void app_main(void)
                  esp_err_to_name(network_error));
     }
 
+#if CAMERA_ISOLATION_TEST
+    ESP_LOGI(TAG, "隔离测试模式：已暂停天气 HTTPS/首页信息任务");
+#else
     /* 首页信息服务独立等待网络并访问定位、网络时间和天气接口。 */
     esp_err_t home_error = home_info_start();
     if (home_error != ESP_OK) {
         ESP_LOGE(TAG, "首页信息服务启动失败：%s", esp_err_to_name(home_error));
     }
+#endif
 
     BaseType_t result = xTaskCreate(ui_task, "ui_task", 8192, NULL, 6, NULL);
     assert(result == pdPASS);

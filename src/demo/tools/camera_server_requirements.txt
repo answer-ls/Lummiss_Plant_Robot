@@ -1,2 +1,5 @@
 av>=14.0,<17.0
 opencv-python>=4.8
+# P4 通过 WebSocket 上行 H.264 帧、下行接收控制命令。
+# 使用其中的线程式 API websockets.sync.server（12.0 起提供），无需 asyncio。
+websockets>=12.0

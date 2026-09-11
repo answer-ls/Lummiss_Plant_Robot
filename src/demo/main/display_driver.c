@@ -29,7 +29,11 @@ static const char *TAG = "DISPLAY";
 #define LCD_PIN_RST             3
 #define LCD_PIN_DC              2
 #define LCD_PIN_CS              1
-#define LCD_SPI_HOST            SPI2_HOST
+/* ESP-Hosted 的 SPI 全双工链路固定占用 SPI2_HOST（控制器 1）。
+ * LCD 使用另一条总线，避免网络初始化后再次初始化 SPI2 时得到
+ * ESP_ERR_INVALID_STATE。ESP32-P4 的 SPI3_HOST 可通过 GPIO Matrix 复用到
+ * 当前 LCD 接线。 */
+#define LCD_SPI_HOST            SPI3_HOST
 
 static lv_obj_t *s_date_label;
 static lv_obj_t *s_weather_label;

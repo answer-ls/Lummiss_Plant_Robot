@@ -2,3 +2,7 @@ dependencies:
   idf: ">=5.5.3,<6.0"
   espressif/esp_h264:
     version: "^1.4.0"
+  # WebSocket 客户端：IDF 5.x 起该组件已从 IDF 核心移出，改由组件管理器拉取。
+  # 首次构建会联网下载，之后落进 managed_components/。
+  espressif/esp_websocket_client:
+    version: "~1.8.0"

@@ -1,9 +1,10 @@
 idf_component_register(
-    SRCS "video_streamer.c"
+    SRCS "video_streamer.c" "dma2d_yuv.c"
     INCLUDE_DIRS "."
     REQUIRES
-        esp_http_client
+        esp_websocket_client
         esp_driver_jpeg
+        esp_hw_support
         esp_timer
         esp_h264
         network)

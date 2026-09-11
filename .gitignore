@@ -21,6 +21,12 @@ esp-h264-component-source/
 # ===== ESP component manager (downloaded dependencies, regenerable) =====
 managed_components/
 **/components/*__*/
+# 项目对 UVC 等时传输做了本地修复；保留这个文件，避免组件更新时丢失补丁。
+!src/demo/managed_components/
+src/demo/managed_components/*
+!src/demo/managed_components/espressif__usb_host_uvc/
+src/demo/managed_components/espressif__usb_host_uvc/*
+!src/demo/managed_components/espressif__usb_host_uvc/uvc_isoc.c
 
 # ===== Editor / IDE =====
 .vscode/

@@ -78,9 +78,9 @@ src/esp_draw_bit     厂商示例副本，只作参考
 | 阶段 3：UI 状态机 | 未开始 | 当前只有静态时间首页 | Event Bus、状态请求、优先级、覆盖、恢复、超时和异常 |
 | 阶段 4：传感器/触摸/LED | 未开始 | 无 | 土壤、光照、温湿度、左右触摸、呼吸灯 |
 | 阶段 5：音频 | 未开始 | 无 | 麦克风、扬声器、I2S、PCM、Opus |
-| 阶段 6：Wi-Fi | 部分完成 | P4-C6 ESP-Hosted/SDIO、独立 Network Manager、固定凭据、DHCP 实机成功、2 秒自动重连 | NVS 凭据、BLE 配网、HTTP 通用封装、WebSocket |
+| 阶段 6：Wi-Fi | 部分完成 | P4-C6 ESP-Hosted/SDIO、独立 Network Manager、固定凭据、DHCP 实机成功、2 秒自动重连 | NVS 凭据、BLE 配网、HTTP 通用封装 |
 | 阶段 7：小智 | 未开始 | 无 | 基础语音链路、UI 状态映射、MCP |
-| 阶段 8：摄像头 | 部分完成 | USB Host/UVC 枚举；800×600 MJPEG；JPEG 完整性门控；硬件 JPEG 解码；双任务 H.264 编码与 HTTP 实机打通；15 FPS 发送；PC 保存/持久解码/MJPEG 预览；热复位同格式重开恢复已通过 | 浏览器实时画面验收、10 分钟及更长稳定性、C6 固件版本对齐、正式 Camera API |
+| 阶段 8：摄像头 | 部分完成 | USB Host/UVC 枚举；800×600 MJPEG；JPEG 完整性门控；硬件 JPEG 解码；双任务 H.264 编码与 WebSocket 实机打通；16 字节帧头自描述分辨率；下行命令 ping/status 双向通道；断线自动重连（不复位）；15 FPS 发送；PC 保存/持久解码/MJPEG 预览；热复位同格式重开恢复已通过 | 浏览器实时画面验收、10 分钟及更长稳定性、C6 固件版本对齐、正式 Camera API、运行期改分辨率 |
 | 阶段 9：旋转底座 | 未开始 | 无 | 电机、编码器、回零、角度、启停和堵转保护 |
 | 阶段 10：专注模式 | 未开始 | 无 | 全部功能 |
 | 阶段 11：电源管理 | 未开始 | 无 | 电量、充电、休眠和各外设降功耗 |
@@ -155,7 +155,7 @@ bootloader.bin：0x5310，Bootloader 分区剩余 13%
 - 帧数和累计字节持续增加，800×600 约 39～42 KB/帧，空帧为 0。
 - 原先 `@0.0FPS` 打不开流的问题已通过读取设备实际帧率修复。
 
-摄像头驱动由独立 Camera Task 运行。当前 `components/video_streamer` 接收 800×600 MJPEG，按 15 FPS 放入两个 PSRAM 输入槽；实测 MJPEG 是 YUV422 采样，ESP32-P4 硬件 JPEG 解码器直接输出 `U Y0 V Y1`。软件只对相邻两行 U/V 求平均并重排为 P4 v1.x H.264 编码器要求的 `O_UYY_E_VYY`，再编码为目标 1.5 Mbps、GOP 15 的 Annex-B H.264。编解码任务把码流放入 4 个输出槽，独立上传任务通过 HTTP/1.1 长连接发送，网络等待不会阻塞编解码。原 RGB565 拆色与 BT.601 全帧换算和 YUY2 主线均已删除。
+摄像头驱动由独立 Camera Task 运行。当前 `components/video_streamer` 接收 800×600 MJPEG，按 15 FPS 放入两个 PSRAM 输入槽；实测 MJPEG 是 YUV422 采样，ESP32-P4 硬件 JPEG 解码器直接输出 `U Y0 V Y1`。软件只对相邻两行 U/V 求平均并重排为 P4 v1.x H.264 编码器要求的 `O_UYY_E_VYY`，再编码为目标 1.5 Mbps、GOP 15 的 Annex-B H.264。编解码任务把码流放入 4 个输出槽，独立上传任务通过 WebSocket 二进制帧发送（每帧前置 16 字节自描述头携带宽高/帧率/帧类型/序号），网络等待不会阻塞编解码。注意输出槽内编码缓冲必须保持 128 字节 cache line 对齐（槽按 128 对齐分配，编码数据放 +128、帧头放 +112），否则 `esp_cache_msync` 失效会让 CPU 读到旧帧数据。原 RGB565 拆色与 BT.601 全帧换算和 YUY2 主线均已删除。
 
 冷启动重新插电时视频链路已实机打通。只复位 P4、摄像头不断电时，首个目标 MJPEG 流可能持续 0 帧；640×480 和 800×600 均已证明完整 `stop/close` 后保持原格式重新 `open/start` 可以恢复。当前 800×600 在约 10 秒触发原地重试后恢复约 22 FPS；第二次仍失败才轮转格式。
 
@@ -221,11 +221,11 @@ VS Code 当前默认使用 `build_main_verified`，生成器必须为 Ninja。�
 
 1. 关闭旧 PC 服务器后重新运行 `src/demo/_start_camera_server.bat`，打开 `http://127.0.0.1:8000/`；确认 800×600 的接收和网页预览均接近 15 FPS。
 2. 连续运行 10 分钟，观察缺 SOI 比例、页面预览丢帧、固件过载丢帧、USB/JPEG/H.264 错误、WiFi 发送失败和 ESP-Hosted 崩溃。
-3. 当前双任务流水线保留 20 FPS 性能余量；在 15 FPS 稳定性验收后，可测试 800×600@20 FPS。正式云端协议确定后再评估把 HTTP 长连接替换为 WebSocket。
+3. 当前双任务流水线保留 20 FPS 性能余量；在 15 FPS 稳定性验收后，可测试 800×600@20 FPS。传输层已于 2026-09-10 由 HTTP 长连接替换为 WebSocket，并建立了下行命令通道（`/cmd?cmd=ping|status`）。
 4. 补齐阶段 0 的 BOM、完整 GPIO 表和音频、传感器、电机接口定义；P4-C6 SDIO 引脚已经按厂商示例确定。
 5. 验收 HOME 页动态时间、日期、天气与镜像方向，再建立 LISTEN、THINK、REPLY、SLEEP、FAULT 页面骨架；电量在阶段 11 完成电池管理后接入。
 6. 继续把 display、ui、expression 拆分为独立组件，提供 `expression_play()` 等统一接口。
 7. 完成阶段 3：实现 App Event Bus、UI 状态机、优先级、超时和状态恢复；只有 UI Task 调用 LVGL。
-8. H.264 HTTP 实时链路通过后，根据正式云端协议决定是否把 HTTP 传输层替换为 WebSocket；保持编码队列和 Network Manager 接口不变。
+8. ~~H.264 HTTP 实时链路通过后替换为 WebSocket~~ **已完成（2026-09-10）**：P4 侧走 `esp_websocket_client`（`ws://<PC>:8001/ws`），每帧前置 16 字节自描述头（分辨率/帧率随帧携带）；PC 侧 HTTP(8000) 保留预览页、`/h264` 回退入口与 `/cmd` 下行命令。编码队列和 Network Manager 接口未动。后续要做运行期改分辨率：需把 `VIDEO_STREAM_WIDTH/HEIGHT` 从编译期宏改为运行期变量，并同步 `camera_driver.c` 的格式耦合（兜底格式表、格式提升、帧门控、`preferred_mjpeg` 判定），帧头自描述已解除 PC 端对分辨率的感知需求。
 
 下一个会话开始时，先读取本文件、`盆栽陪伴机器人_开发文档.md` 和 `src/demo/CAMERA_UPLOAD_TEST.md`，再根据 H.264 串口统计、PC `/status`、浏览器预览及保存的 `.h264` 继续。修改 C/C++ 源码时继续使用中文注释。
