@@ -1,6 +1,7 @@
 #ifndef LUMMISS_WIFI_MANAGER_H
 #define LUMMISS_WIFI_MANAGER_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -27,7 +28,10 @@ typedef void (*wifi_manager_event_callback_t)(wifi_manager_event_t event,
  * 并创建默认事件循环。 */
 esp_err_t wifi_manager_init(wifi_manager_event_callback_t callback, void *user_ctx);
 
-/* 使用给定的固定凭据启动 STA。该函数只发起连接，DHCP 结果通过回调返回。 */
-esp_err_t wifi_manager_start(const char *ssid, const char *password);
+/* 使用 C6 Flash 中已经持久化的凭据启动 STA。 */
+esp_err_t wifi_manager_start_saved(void);
+
+/* 配网期间由官方 Network Provisioning 管理重试；成功后再打开常驻自动重连。 */
+void wifi_manager_set_auto_reconnect_enabled(bool enabled);
 
 #endif /* LUMMISS_WIFI_MANAGER_H */

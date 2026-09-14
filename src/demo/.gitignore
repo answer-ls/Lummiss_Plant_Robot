@@ -3,5 +3,8 @@ sdkconfig.old
 tools/__pycache__/
 tools/camera_captures/
 tools/camera_server_test_output/
+# 实机对照日志和固件快照保留在本机，结论另写入交接文档。
+test_results/
+logs/
 # gif_resize_for_sd.py 的输出，由 项目文档/GIF 随时可重建，不入库
 tools/sd_gif_out/

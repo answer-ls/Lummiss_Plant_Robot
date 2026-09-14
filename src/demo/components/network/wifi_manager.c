@@ -1,8 +1,6 @@
 #include "wifi_manager.h"
 
 #include <stdbool.h>
-#include <string.h>
-
 #include "esp_check.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -18,6 +16,7 @@ static void *s_event_user_ctx;
 static esp_timer_handle_t s_reconnect_timer;
 static bool s_initialized;
 static bool s_started;
+static bool s_auto_reconnect;
 
 /* 统一向 Network Manager 上报状态，业务模块不直接订阅底层 WiFi 事件。 */
 static void wifi_manager_notify(wifi_manager_event_t event,
@@ -41,7 +40,7 @@ static void reconnect_timer_callback(void *arg)
 
 static void schedule_reconnect(void)
 {
-    if (!s_started || s_reconnect_timer == NULL) {
+    if (!s_started || !s_auto_reconnect || s_reconnect_timer == NULL) {
         return;
     }
 
@@ -63,12 +62,15 @@ static void wifi_event_handler(void *arg,
     (void)event_base;
 
     if (event_id == WIFI_EVENT_STA_START) {
-        ESP_LOGI(TAG, "WiFi STA 已启动，开始连接路由器");
+        ESP_LOGI(TAG, "WiFi STA 已启动");
         wifi_manager_notify(WIFI_MANAGER_EVENT_CONNECTING, NULL);
-        esp_err_t err = esp_wifi_connect();
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "连接请求失败：%s", esp_err_to_name(err));
-            schedule_reconnect();
+        if (s_auto_reconnect) {
+            ESP_LOGI(TAG, "使用已保存凭据连接路由器");
+            esp_err_t err = esp_wifi_connect();
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "连接请求失败：%s", esp_err_to_name(err));
+                schedule_reconnect();
+            }
         }
         return;
     }
@@ -79,10 +81,13 @@ static void wifi_event_handler(void *arg,
         if (disconnected != NULL) {
             data.disconnect_reason = disconnected->reason;
         }
-        ESP_LOGW(TAG, "WiFi 已断开，reason=%u，%u ms 后重连",
-                 data.disconnect_reason, WIFI_RECONNECT_DELAY_MS);
+        ESP_LOGW(TAG, "WiFi 已断开，reason=%u%s",
+                 data.disconnect_reason,
+                 s_auto_reconnect ? "，等待自动重连" : "");
         wifi_manager_notify(WIFI_MANAGER_EVENT_DISCONNECTED, &data);
-        schedule_reconnect();
+        if (s_auto_reconnect) {
+            schedule_reconnect();
+        }
     }
 }
 
@@ -152,35 +157,22 @@ esp_err_t wifi_manager_init(wifi_manager_event_callback_t callback, void *user_c
     return ESP_OK;
 }
 
-esp_err_t wifi_manager_start(const char *ssid, const char *password)
+esp_err_t wifi_manager_start_saved(void)
 {
     if (!s_initialized) {
         return ESP_ERR_INVALID_STATE;
-    }
-    if (ssid == NULL || password == NULL || ssid[0] == '\0' ||
-        strlen(ssid) > 32 || strlen(password) > 64) {
-        return ESP_ERR_INVALID_ARG;
     }
     if (s_started) {
         return ESP_OK;
     }
 
-    wifi_config_t station_config = {0};
-    memcpy(station_config.sta.ssid, ssid, strlen(ssid));
-    memcpy(station_config.sta.password, password, strlen(password));
-    station_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
-    station_config.sta.pmf_cfg.capable = true;
-    station_config.sta.pmf_cfg.required = false;
-
-    /* 凭据由当前固件固定配置，暂不写入远端 C6 的 NVS。 */
-    ESP_RETURN_ON_ERROR(esp_wifi_set_storage(WIFI_STORAGE_RAM),
-                        TAG, "设置 WiFi RAM 存储失败");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_storage(WIFI_STORAGE_FLASH),
+                        TAG, "设置 WiFi Flash 存储失败");
     ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA),
                         TAG, "设置 WiFi STA 模式失败");
-    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &station_config),
-                        TAG, "设置固定 WiFi 凭据失败");
 
     s_started = true;
+    s_auto_reconnect = true;
     esp_err_t err = esp_wifi_start();
     if (err != ESP_OK) {
         s_started = false;
@@ -188,6 +180,17 @@ esp_err_t wifi_manager_start(const char *ssid, const char *password)
         return err;
     }
 
-    ESP_LOGI(TAG, "WiFi STA 启动请求完成，SSID=%s", ssid);
+    ESP_LOGI(TAG, "WiFi STA 已使用 C6 保存的凭据启动");
     return ESP_OK;
+}
+
+void wifi_manager_set_auto_reconnect_enabled(bool enabled)
+{
+    s_auto_reconnect = enabled;
+    if (enabled) {
+        /* 配网管理器已经启动 Wi-Fi；标记为运行态，以便后续断线重连。 */
+        s_started = true;
+    } else if (s_reconnect_timer != NULL) {
+        esp_timer_stop(s_reconnect_timer);
+    }
 }

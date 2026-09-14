@@ -1,0 +1,11 @@
+menu "Lummiss BLE provisioning"
+
+config LUMMISS_FORCE_BLE_PROVISIONING
+    bool "Force BLE provisioning even when Wi-Fi credentials exist"
+    default n
+    help
+        Development-only switch used to validate BLE provisioning without erasing
+        the Wi-Fi credentials stored by the ESP32-C6. Keep this disabled in normal
+        firmware builds.
+
+endmenu

@@ -1,5 +1,25 @@
 # ESP32-P4 和开发板存储配置
 CONFIG_IDF_TARGET="esp32p4"
+
+# BLE Wi-Fi provisioning runs the NimBLE host on P4 and uses the C6
+# controller through ESP-Hosted HCI over the existing SDIO link.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_CONTROLLER_DISABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=n
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_TRANSPORT_UART=n
+CONFIG_ESP_HOSTED_ENABLE_BT_NIMBLE=y
+CONFIG_ESP_HOSTED_NIMBLE_HCI_VHCI=y
+CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_2=y
+CONFIG_NETWORK_PROV_NETWORK_TYPE_WIFI=y
+CONFIG_NETWORK_PROV_AUTOSTOP_TIMEOUT=5
+CONFIG_NETWORK_PROV_BLE_SEC_CONN=y
+# The current C6 runs ESP-Hosted 2.3.x while the P4 host uses 2.7.x. Stop
+# advertising and disconnect the provisioning client after success, but keep
+# the idle BLE stack alive until the C6 firmware is upgraded and teardown is
+# revalidated with matching Host/Slave versions.
+CONFIG_NETWORK_PROV_KEEP_BLE_ON_AFTER_PROV=y
+CONFIG_NETWORK_PROV_DISCONNECT_AFTER_PROV=y
 # 当前 JC1060P470C 开发板实测芯片为 ESP32-P4 v1.3。
 # P4 v1.x 与 v3.x 的程序不兼容，必须选择低于 v3.0 的硬件分支。
 CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
@@ -18,8 +38,17 @@ CONFIG_SPIRAM_XIP_FROM_PSRAM=y
 CONFIG_CACHE_L2_CACHE_256KB=y
 CONFIG_CACHE_L2_CACHE_LINE_128B=y
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=150000
-# USB-DWC 内部 DMA 可访问 PSRAM：让 UVC 收流的 URB 数据缓冲改落 PSRAM，避开
-# 稀缺的内部 DMA 池（视频编码器内部缓冲会占用较多可 DMA 内存）。
+# H.264 每帧回写约 720 KB 输入。分成 16 KB 缓存同步临界区，
+# 避免 USB HCD 在另一核等待缓存锁时长时间无法服务 ISOC。
+CONFIG_ESP_MM_CACHE_MSYNC_C2M_CHUNKED_OPS=y
+CONFIG_ESP_MM_CACHE_MSYNC_C2M_CHUNKED_OPS_MAX_LEN=0x4000
+# USB-DWC 内部 DMA 可访问 PSRAM：让 UVC 收流的 URB 数据缓冲落 PSRAM。
+# 必须落 PSRAM：8 x 18432 B = 144 KiB，而内部 DMA 池只有 146 KiB
+# （见启动日志 "Reserving pool of 146K of internal memory for DMA"）。codec-only
+# 档位能刚好塞下，完整档位的 WiFi(SDIO)/LVGL/LCD SPI 会先占用该池，分配必然失败；
+# 而分配失败又会被组件的 double-free 放大成开机重启循环（uvc_host.c:341 的
+# uvc_transfers_free 释放后不置空，被 uvc_host_stream_open 的错误路径二次调用）。
+# 代价是 6~10% UVC 丢帧；20 fps 门控下 30 fps 丢 10% 仍有约 27 fps，不影响帧率。
 CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM=y
 
 # 为测试任务和 USB Host 保留足够栈空间及控制传输缓冲区。

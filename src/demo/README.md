@@ -8,12 +8,70 @@
 - 屏幕横屏分辨率为 320×240，显示动态时间首页：日期、星期、天气、温度和大号时间；电量等电池管理完成后再接入。
 - 首页服务联网后通过公网 IP 自动取得坐标和时区，使用网络校时并从 Open-Meteo 获取当前天气；时间每秒刷新，天气每 30 分钟刷新。
 - Camera Task 初始化 ESP32-P4 高速 USB Host 和 UVC 驱动。
-- LRCPG720p 接入后优先使用 800×600 MJPEG 30 FPS，并每 10 秒输出 JPEG 完整性和收帧统计。
+- LRCPG720p 接入后优先使用 800×600 MJPEG；设备声明 30/25/15 FPS，没有 20 FPS 离散 MJPEG 档位，当前自动选择 ISOC alt=1，并每 5 秒输出视频链路统计。
 - 摄像头帧缓冲使用 PSRAM；首页图像作为 RGB565 资源嵌入固件。
-- Network Manager 通过 ESP-Hosted/SDIO 控制板载 ESP32-C6，以 STA 模式连接固定 WiFi，并通过 DHCP 获取 IPv4 地址。
+- Network Manager 通过 ESP-Hosted/SDIO 控制板载 ESP32-C6。首次使用或清除凭据后，设备以 BLE 广播等待 App 下发 WiFi；已有凭据时直接以 STA 模式连接并通过 DHCP 获取 IPv4 地址。
 - WiFi 断开后每 2 秒自动发起重连；连接状态和 IP 信息只由 Network Manager 对外提供。
-- Video Streamer 从完整 MJPEG 帧中抽取 15 FPS，经 P4 硬件 JPEG 直出 YUV422、轻量色度抽样/重排和 H.264 硬件编码，再由独立上传任务通过 WebSocket 实时发送到局域网 PC（每帧前置 16 字节自描述头携带分辨率与帧率）。当前编码参数为 800×600、1.5 Mbps、GOP 15。
+- Video Streamer 从完整 MJPEG 帧中处理 800×600@20 FPS 上限，经 P4 硬件 JPEG 直出 YUV422、CPU 分块色度抽样/重排和 H.264 硬件编码，再由独立上传任务通过 WebSocket 实时发送到局域网 PC（每帧前置 16 字节自描述头携带分辨率与帧率）。当前编码参数为 800×600、4 Mbps、GOP 20；实测编码约 15 FPS。
 - PC 服务器使用持久 PyAV H.264 解码器逐帧解码，通过 `/preview.mjpg` 向浏览器连续推送 MJPEG；浏览器预览不再反复打开和重解整个 GOP。
+
+## 2026-09-12 最新验证状态
+
+当前烧录档位为 `CAMERA_TEST_FULL=0`（WiFi + LVGL + SD GIF + WebSocket 全开）。UVC 丢帧的
+可控变量已于本日由**同一次运行内的 A/B** 定位为**编解码链路自身的 PSRAM 流量**：链路关闭时
+丢帧 2.1%、complete 29.4 fps；链路运行（16 fps）时丢帧 23.8%、complete 22.9 fps，而
+`callback_gap_max` 两种状态都是 9 ms。WiFi、LVGL/GIF 轮播、回调 memcpy 在该窗口内均在运行，
+已被排除。完整推导见 `../../../PROJECT_HANDOFF.md` 第 7 节与附录 A.5。
+
+```text
+芯片：ESP32-P4 revision v1.3
+UVC：800×600 MJPEG，requested 30 FPS，自动选择 ISOC alt=1，effective_MPS=3072
+URB：8 × 16 KB（MPS=3072 向上对齐为 18432 B/个，合计 144 KiB）；BULK=0
+USB DMA 内存：CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM=y（必须）
+MJPEG handoff：3 × 256 KB
+UVC complete：20～30 FPS（编解码链路关闭时可到 29～30 FPS）
+UVC drop：19%～29%（编解码链路关闭时只有 0%～6%）
+encoded：15～20 FPS ← 20 FPS 目标未达成
+JPEG_DEC：约 6.7 ms
+YUV_CONV：约 15.3 ms
+H264_ENC：约 8.3 ms
+callback_gap_max：9 ms —— 与丢帧率不相关，不要再用它做判据
+invalid：约 2.2 帧/秒（≈ 完整帧的 10%），camera_driver 的 SOI/EOI 浅检查看不到
+发送：sent == encoded，send_fail=0 —— 上传路径不是瓶颈
+```
+
+**`CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM` 必须为 `y`。** 内部 DMA 池只有
+146 KiB（启动日志 `Reserving pool of 146K of internal memory for DMA/internal
+allocations`），而 8 个 URB 要 144 KiB。codec-only 档位下摄像头是第一个抢池子的，144 挤
+146 刚好够，所以那里可以落内部 RAM 并做到 0% 丢帧；**完整档位的 WiFi(SDIO)/LVGL/LCD SPI
+会先占用同一个池，分配必然失败**，而失败又会被 `uvc_host.c` 的 double-free（约 341 行
+`uvc_transfers_free()` 释放后不置空，被错误路径二次调用）放大成开机重启循环。
+
+注意这条配置防的是**开机重启循环**，与上面的稳态丢帧是两回事——完整档位下 URB 本来就落在
+PSRAM，而编解码链路一关，丢帧立刻从 23.8% 掉到 2.1%。
+
+下一步是降低编解码链路的 PSRAM 压力（YUV 重排 15.3 ms 是三项里最大的一项）。**不要再做
+档位二分**：`callback_gap_max` 在丢帧 23.8% 和 2.1% 两种状态下都是 9 ms，对档位不敏感。
+原先"丢帧在启动约 34 s 后跳变、与 ESP-TLS / GIF 轮播重合"的线索也已证伪——后续日志里
+那些事件照常发生而丢帧降到 2.1%。
+
+## 2026-09-11 验证状态（历史）
+
+当天烧录的是隔离档位 `CAMERA_TEST_UVC_H264_ONLY=6`，暂停 UI/LVGL、天气 HTTPS、
+WiFi/ESP-Hosted 和 WebSocket，只保留 UVC、JPEG 硬解、CPU YUV 转换和 H.264 硬编。
+下列数字属于该档位，**不代表完整档位**。
+
+```text
+URB：96 × 32 KB（当时配置，后改为 8 × 16 KB）
+UVC complete：约 19～21 FPS
+UVC drop：约 31.6%～36.7%
+H.264 实际：约 15 FPS
+callback_gap_max：10 ms
+```
+
+CPU YUV 转换现在按 8 个 2 行宏块分块，块间执行 `taskYIELD()` 并插入 20 µs 短空隙，以缩短连续 PSRAM 访问窗口。该优化保持输出格式不变，但当前短测尚未证明能降低 UVC 丢帧。
+
+P4 v1.3 + ESP-IDF 5.5.5 上，DMA2D/PPA 的 YUV422→YUV420 路径返回 `ESP_ERR_NOT_SUPPORTED`，因此代码安全回退 CPU；不要移除版本判断强行调用私有 DMA2D API。首帧超时路径已改为等待所有 USB transfer 回调退出后完整重建 USB Host/UVC，最近一次重建后首帧耗时约 249 ms。
 
 ## 主组件结构
 
@@ -23,6 +81,11 @@ components/network/
 ├── wifi_manager.c/.h        esp_wifi_remote 事件、连接和自动重连
 ├── CMakeLists.txt           Network Manager 组件依赖
 └── idf_component.yml        ESP-Hosted/esp_wifi_remote 版本要求
+
+components/provisioning/
+├── provisioning_manager.c/.h  BLE 配网、Security 2、设备名和每设备 PoP
+├── Kconfig.projbuild           仅供开发验证的强制配网开关
+└── CMakeLists.txt              官方 network_provisioning 组件依赖
 
 components/video_streamer/
 ├── video_streamer.c/.h      JPEG 解码、YUV 重排、H.264 硬件编码和 HTTP 实时发送
@@ -50,7 +113,7 @@ main/
 
 UVC 组件还会创建 USB 事件任务和驱动后台任务。所有显式 LVGL 初始化都由 UI Task 发起，摄像头任务不直接操作 LVGL。
 
-`app_main()` 对网络只调用 `network_manager_init()` 和 `network_manager_start()`；WiFi 系统事件、DHCP 状态及重连逻辑均封装在 `components/network` 中。当前固定 SSID 和密码位于 `network_manager.c`，以后 BLE 配网阶段再改为读取 NVS。
+`app_main()` 对网络只调用 `network_manager_init()` 和 `network_manager_start()`；WiFi 系统事件、DHCP 状态、BLE 配网和重连逻辑均封装在 `components/network` 与 `components/provisioning` 中。固件不再包含固定 SSID 或密码，WiFi 凭据由 App 经 BLE 下发并保存在板载 C6 的 Flash。App 对接协议见 `BLE_WIFI_PROVISIONING.md`。
 
 ## ESP32-P4 与 ESP32-C6
 
@@ -109,11 +172,11 @@ idf.py -B build_main_verified -p COM17 flash monitor
 
 VS Code 工作区也已默认使用 `build_main_verified` 和 Ninja。
 
-2026-09-10 接入动态时间、天气 API 和镜像修正后的联合构建结果：
+2026-09-11 CPU 分块转换版本的联合构建结果：
 
 ```text
-lummiss_main.bin：0x19afb0
-8 MB 应用分区剩余：80%
+lummiss_main.bin：0xb2d60
+最小应用分区剩余：91%
 bootloader.bin：0x5310
 构建结果：通过
 ```
@@ -121,12 +184,12 @@ bootloader.bin：0x5310
 ## 烧录后的正常现象
 
 1. 串口出现 `APP_MAIN`，随后可看到 ESP-Hosted 初始化和 SDIO 与 C6 建链日志。
-2. 出现 `WiFi STA 已启动，开始连接路由器` 和 `正在通过 ESP32-C6 连接 WiFi`。
-3. 成功连接后出现 `WiFi 联网成功`，并输出非 `0.0.0.0` 的 IPv4、网关和掩码。这才表示 P4→C6→路由器→DHCP 链路完整成功。
+2. C6 已保存凭据时，出现 `C6 已保存 Wi-Fi 凭据，无需启动 BLE 配网`、`WiFi STA 已启动` 和连接日志。首次启动时则广播 `LUMMISS_XXXXXX`，等待 App 完成 BLE 配网。
+3. 成功连接后出现 `WiFi 联网成功`，并输出非 `0.0.0.0` 的 IPv4、网关和掩码。这表示 P4→C6→路由器→DHCP 链路完整成功；首次配网还会在约 5 秒后关闭 BLE 广播，再启动 OTA、UI 和视频任务。
 4. 屏幕黑底横屏显示时间首页，文字方向正常且不再左右镜像；当前不会显示电量。
 5. 联网前页面显示占位符；联网后串口依次出现“网络时间同步成功”“自动定位成功”和“天气更新”，随后页面显示当前日期、星期、时间、天气和温度。
-6. 摄像头插入高速 USB 口后，串口显示使用 `800x600 MJPEG 30 FPS` 和 `Stream started`。热复位后首流可能为 0 帧，10 秒后原地重开可恢复；实测恢复后输入约 22 FPS、完整 JPEG 约 20～21 FPS。
-7. PC 服务器运行时，`VIDEO_STREAM` 每 10 秒汇总一次，编码和发送应接近 15 FPS、码率约 1.5 Mbps、发送失败为 0，并显示 JPEG、YUV 重排、H.264 和 HTTP 四段平均耗时；浏览器页面中的“接收”和“网页预览”应接近 15 FPS，PC 的 `tools/camera_captures` 中生成持续增大的 `.h264` 文件。
+6. 摄像头插入高速 USB 口后，串口显示 `800x600 MJPEG`、自动选择 `ISOC alt=1` 和 `Stream started`。热复位后首流可能为 0 帧，完整停止并重建后可恢复；最近一次首帧耗时约 249 ms。
+7. 完整联网档位下，`VIDEO_STREAM` 每 5 秒汇总一次，实际编码通常约 15 FPS；当前 CPU 分块版本仍需重点观察 UVC 丢帧、H.264 耗时、发送失败和网页预览丢帧，不能预期仅靠分块达到 20 FPS。
 
 密码错误或路由器不可达时，串口会反复出现 `WiFi 已断开`、原因码和 2 秒后重连。若在这些日志之前就出现 Hosted/SDIO 初始化失败，应先检查板载 C6 固件；厂商提供的参考固件位于 `开发板示例/JC1060P470C_I_W_Y/8-Burn operation/Burn files/JC-C6-slave_v2.3.2.bin`。
 

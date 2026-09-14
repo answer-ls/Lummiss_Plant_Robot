@@ -10,4 +10,5 @@ idf_component_register(
         esp_wifi
         esp_wifi_remote
         esp_hosted
+        provisioning
         nvs_flash)

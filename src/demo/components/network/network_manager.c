@@ -4,19 +4,16 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_wifi.h"
 #include "esp_wifi_default.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "nvs_flash.h"
 
+#include "provisioning_manager.h"
 #include "wifi_manager.h"
 
 static const char *TAG = "NETWORK";
-
-/* 当前阶段按需求使用固件内固定凭据。烧录前修改下面两行，后续 BLE 配网
- * 完成后再改为从 NVS 读取，业务模块不要直接访问这两个值。 */
-#define LUMMISS_WIFI_SSID      "wcmgc"
-#define LUMMISS_WIFI_PASSWORD  "12344321"
 
 #define NETWORK_CONNECTED_BIT BIT0
 
@@ -25,6 +22,50 @@ static esp_netif_t *s_station_netif;
 static volatile network_state_t s_network_state = NETWORK_STATE_STOPPED;
 static bool s_initialized;
 static bool s_started;
+static bool s_provisioning_active;
+static bool s_has_ip;
+
+static void network_provisioning_event_callback(provisioning_event_t event,
+                                                void *user_ctx)
+{
+    (void)user_ctx;
+
+    switch (event) {
+    case PROVISIONING_EVENT_STARTED:
+        s_provisioning_active = true;
+        s_network_state = NETWORK_STATE_PROVISIONING;
+        xEventGroupClearBits(s_network_events, NETWORK_CONNECTED_BIT);
+        ESP_LOGI(TAG, "等待 App 通过 BLE 下发 Wi-Fi 凭据");
+        break;
+
+    case PROVISIONING_EVENT_CREDENTIALS_RECEIVED:
+        s_network_state = NETWORK_STATE_CONNECTING;
+        ESP_LOGI(TAG, "正在验证 App 下发的 Wi-Fi 凭据");
+        break;
+
+    case PROVISIONING_EVENT_SUCCEEDED:
+        /* 后续掉线由常驻 Wi-Fi Manager 自动重连。Connected bit 要等 BLE
+         * 服务真正结束后再设置，确保视频链路不会与配网 BLE 同时启动。 */
+        wifi_manager_set_auto_reconnect_enabled(true);
+        s_network_state = NETWORK_STATE_CONNECTED;
+        break;
+
+    case PROVISIONING_EVENT_FAILED:
+        s_network_state = NETWORK_STATE_PROVISIONING;
+        break;
+
+    case PROVISIONING_EVENT_STOPPED:
+        s_provisioning_active = false;
+        if (s_has_ip) {
+            s_network_state = NETWORK_STATE_CONNECTED;
+            xEventGroupSetBits(s_network_events, NETWORK_CONNECTED_BIT);
+            ESP_LOGI(TAG, "BLE 已关闭，网络业务可以启动");
+        } else {
+            s_network_state = NETWORK_STATE_DISCONNECTED;
+        }
+        break;
+    }
+}
 
 static void network_wifi_event_callback(wifi_manager_event_t event,
                                         const wifi_manager_event_data_t *data,
@@ -42,15 +83,21 @@ static void network_wifi_event_callback(wifi_manager_event_t event,
         if (data == NULL) {
             break;
         }
+        s_has_ip = true;
         s_network_state = NETWORK_STATE_CONNECTED;
-        xEventGroupSetBits(s_network_events, NETWORK_CONNECTED_BIT);
+        if (!s_provisioning_active) {
+            xEventGroupSetBits(s_network_events, NETWORK_CONNECTED_BIT);
+        }
         ESP_LOGI(TAG, "WiFi 联网成功");
         ESP_LOGI(TAG, "IPv4=" IPSTR "，网关=" IPSTR "，掩码=" IPSTR,
                  IP2STR(&data->ip), IP2STR(&data->gateway), IP2STR(&data->netmask));
         break;
 
     case WIFI_MANAGER_EVENT_DISCONNECTED:
-        s_network_state = NETWORK_STATE_DISCONNECTED;
+        s_has_ip = false;
+        s_network_state = s_provisioning_active
+                              ? NETWORK_STATE_PROVISIONING
+                              : NETWORK_STATE_DISCONNECTED;
         xEventGroupClearBits(s_network_events, NETWORK_CONNECTED_BIT);
         ESP_LOGW(TAG, "网络断开，C6 reason=%u，等待自动重连",
                  data != NULL ? data->disconnect_reason : 0);
@@ -61,7 +108,6 @@ static void network_wifi_event_callback(wifi_manager_event_t event,
     }
 }
 
-/* NVS 目前只建立基础能力；固定 WiFi 凭据仍使用 RAM 存储。 */
 static esp_err_t initialize_nvs(void)
 {
     esp_err_t err = nvs_flash_init();
@@ -129,11 +175,30 @@ esp_err_t network_manager_start(void)
         return ESP_OK;
     }
 
-    s_network_state = NETWORK_STATE_CONNECTING;
-    esp_err_t err = wifi_manager_start(LUMMISS_WIFI_SSID, LUMMISS_WIFI_PASSWORD);
+    wifi_manager_set_auto_reconnect_enabled(false);
+
+    bool provisioning_started = false;
+    esp_err_t err = provisioning_manager_start(
+        network_provisioning_event_callback, NULL, &provisioning_started);
     if (err != ESP_OK) {
         s_network_state = NETWORK_STATE_STOPPED;
-        ESP_LOGE(TAG, "启动 Network Manager 失败：%s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "启动 BLE 配网管理器失败：%s", esp_err_to_name(err));
+        return err;
+    }
+
+    if (provisioning_started) {
+        s_provisioning_active = true;
+        s_network_state = NETWORK_STATE_PROVISIONING;
+        s_started = true;
+        return ESP_OK;
+    }
+
+    s_network_state = NETWORK_STATE_CONNECTING;
+    err = wifi_manager_start_saved();
+    if (err != ESP_OK) {
+        s_network_state = NETWORK_STATE_STOPPED;
+        ESP_LOGE(TAG, "使用已保存凭据启动 Wi-Fi 失败：%s",
+                 esp_err_to_name(err));
         return err;
     }
 
@@ -152,6 +217,11 @@ bool network_manager_is_connected(void)
            (xEventGroupGetBits(s_network_events) & NETWORK_CONNECTED_BIT) != 0;
 }
 
+bool network_manager_is_provisioning(void)
+{
+    return s_provisioning_active;
+}
+
 bool network_manager_wait_connected(uint32_t timeout_ms)
 {
     if (s_network_events == NULL) {
@@ -167,4 +237,25 @@ bool network_manager_wait_connected(uint32_t timeout_ms)
                                            pdTRUE,
                                            wait_ticks);
     return (bits & NETWORK_CONNECTED_BIT) != 0;
+}
+
+esp_err_t network_manager_forget_wifi_credentials(void)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    wifi_manager_set_auto_reconnect_enabled(false);
+    esp_err_t err = esp_wifi_disconnect();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_STARTED &&
+        err != ESP_ERR_WIFI_NOT_CONNECT) {
+        ESP_LOGW(TAG, "清除凭据前断开 Wi-Fi 失败：%s", esp_err_to_name(err));
+    }
+
+    ESP_RETURN_ON_ERROR(esp_wifi_restore(), TAG, "清除 C6 Wi-Fi 凭据失败");
+    s_has_ip = false;
+    s_network_state = NETWORK_STATE_STOPPED;
+    xEventGroupClearBits(s_network_events, NETWORK_CONNECTED_BIT);
+    ESP_LOGI(TAG, "C6 Wi-Fi 凭据已清除；重启后进入 BLE 配网");
+    return ESP_OK;
 }

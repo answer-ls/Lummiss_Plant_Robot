@@ -7,6 +7,26 @@
 
 #include "esp_err.h"
 
+/* 对照测试模式：三者最多启用一个。正式联网预览时全部改为 0。 */
+#define VIDEO_STREAM_CODEC_ONLY_TEST 0
+#define VIDEO_STREAM_JPEG_ONLY_TEST 0
+#define VIDEO_STREAM_YUV_ONLY_TEST 0
+
+#define VIDEO_STREAM_WS_URL_MAX_LEN    256
+#define VIDEO_STREAM_WS_TOKEN_MAX_LEN  512
+#define VIDEO_STREAM_WS_ID_MAX_LEN     64
+
+typedef struct {
+    char ws_url[VIDEO_STREAM_WS_URL_MAX_LEN];
+    char token[VIDEO_STREAM_WS_TOKEN_MAX_LEN];
+    char device_id[VIDEO_STREAM_WS_ID_MAX_LEN];
+    char client_id[VIDEO_STREAM_WS_ID_MAX_LEN];
+} video_streamer_config_t;
+
+#if (VIDEO_STREAM_CODEC_ONLY_TEST + VIDEO_STREAM_JPEG_ONLY_TEST + VIDEO_STREAM_YUV_ONLY_TEST) > 1
+#error "Video test modes are mutually exclusive"
+#endif
+
 /* H.264 实时预览的目标分辨率。编码器分辨率、JPEG 解码尺寸校验、
  * 摄像头侧"可编码帧"门控三处共用此常量，改动实时预览分辨率只需改这里。
  * 约束：宽高必须是偶数（YUV 重排按像素对处理）。
@@ -49,7 +69,7 @@
 
 /* 初始化实时视频流水线（双任务并行，各自钉核）：
  *
- *   UVC 帧回调 submit_jpeg()  →  MJPEG 环槽 ×3
+ *   UVC 帧回调 → MJPEG 独立复制池 → camera handoff FIFO → MJPEG 环槽 ×3
  *   video_codec 任务（核 1）：JPEG 解码 → YUV 重排 → H.264 编码
  *          ↓ H.264 输出槽 ×8（free / ready 两条队列交接，无额外拷贝）
  *   video_upload 任务（核 0）：WebSocket 上传，失败自动重连，完成后归还槽
@@ -60,11 +80,16 @@
  *           YUV422 → 轻量抽样/重排 O_UYY_E_VYY → esp_h264 硬件编码 → WebSocket 上传。
  * 每帧前景 16 字节自描述头（见 video_streamer.c），分辨率随帧携带，
  * PC 端不需要在连接建立时协商几何参数。 */
-esp_err_t video_streamer_init(void);
+esp_err_t video_streamer_init(const video_streamer_config_t *config);
 
-/* 当输入来自 UVC 帧缓冲时，允许把缓冲所有权交给编解码任务，避免在
- * USB 等时传输回调里复制整帧。release_cb 会在 JPEG 解码完成或输入被
- * 丢弃时调用；回调返回后，调用方不得再访问 release_ctx。 */
+/* 如果在 video_streamer_init 之前调用，会在 WebSocket 上传任务启动时使用该配置。
+ * 若从未调用，init 将使用内部 fallback（本地 WS 调试地址）。
+ * 典型用法：main.c 在 OTA 完成后调用此函数，再启动摄像头任务。 */
+void video_streamer_set_config(const video_streamer_config_t *config);
+
+/* 当输入来自独立 MJPEG 复制池时，允许把该缓冲所有权交给编解码任务，
+ * 避免 handoff 任务再次复制。release_cb 会在 JPEG 解码完成或输入被丢弃
+ * 时调用；回调返回后，调用方不得再访问 release_ctx。 */
 typedef void (*video_streamer_input_release_cb_t)(void *release_ctx);
 
 /* 非阻塞提交一张 VIDEO_STREAM_WIDTH×VIDEO_STREAM_HEIGHT MJPEG 压缩帧。

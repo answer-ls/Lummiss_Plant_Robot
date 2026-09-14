@@ -7,9 +7,9 @@ LRCPG720p USB 摄像头
 → UVC 800×600 MJPEG（设备声明 30 FPS，实测约 22 FPS）
 → ESP32-P4 硬件 JPEG 直接解码为 UYVY/YUV422
 → 软件仅做垂直色度抽样和 O_UYY_E_VYY 字节重排
-→ ESP32-P4 H.264 硬件编码，目标 15 FPS / 1.5 Mbps / GOP 15
+→ ESP32-P4 H.264 硬件编码，编码上限 20 FPS / 4 Mbps / GOP 20（当前实测约 15 FPS）
 → 每帧前置 16 字节自描述头（magic/宽/高/帧率/帧类型/序号）
-→ WebSocket 二进制帧逐帧发送
+→ 独立上传任务通过 WebSocket 二进制帧逐帧发送（当前对照档位关闭网络）
 → ESP-Hosted / ESP32-C6 / WiFi
 → Windows PC 192.168.1.66:8001/ws
 → 保存 Annex-B `.h264` 码流（只落 payload）并生成浏览器预览
@@ -74,22 +74,45 @@ CAMERA: RX frames=... 完整800x600MJPEG +... fps=约22
 
 LRCPG720p 保存的 MJPEG 帧经头部检查为 YUV422 采样，ESP-IDF JPEG 驱动对应的直接输出顺序为 `U Y0 V Y1`。当前实现因此让 JPEG 硬件直接输出 YUV422，再对相邻两行的 U/V 求平均并重排为编码器需要的交错 YUV420。原有 RGB565 拆色、每像素 BT.601 乘法和限幅已全部删除；这也使视频链路不再受 RGB565 字节序影响。
 
-摄像头侧和视频输入槽统一预留 512 KB MJPEG 缓冲，并使用 3 个帧缓冲、4 个 32 KB URB。帧进入解码队列前检查 JPEG `FF D8`（SOI）和 `FF D9`（EOI），从尾部找到 EOI 后只提交有效 JPEG 数据。串口累计显示目标帧、完整帧、缺 SOI、缺 EOI和过大帧；损坏帧直接丢弃，不进入硬件解码器。`video_streamer` 组件单独使用 `-O3` 编译以降低 YUV 重排耗时。
+摄像头侧和视频输入槽统一预留 512 KB MJPEG 缓冲，并使用 3 个帧缓冲、8 个 16 KB URB（MPS=3072 向上对齐后每块占 18432 B）。当前自动选择 ISOC alt=1（`effective_MPS=3072`，设备 `BULK=0`）。帧进入解码队列前检查 JPEG `FF D8`（SOI）和 `FF D9`（EOI），从尾部找到 EOI 后只提交有效 JPEG 数据。串口累计显示目标帧、完整帧、缺 SOI、缺 EOI和过大帧；损坏帧直接丢弃，不进入硬件解码器。`video_streamer` 组件单独使用 `-O3` 编译以降低 YUV 重排耗时。
 
 1280×720 曾实测约 27 FPS 输入和约 14 FPS 编码，但持续出现 UVC 帧缓冲溢出及 JPEG 硬件解码错误，因此不作为当前实时传输分辨率。800×600 的最新实测中没有再出现 UVC 溢出或 JPEG 解码错误。
+
+## 2026-09-11 最新 CPU 分块转换状态
+
+本节记录的是隔离档位 `CAMERA_TEST_UVC_H264_ONLY=6` 的测量，暂停 UI/LVGL、天气 HTTPS、WiFi/ESP-Hosted 和 WebSocket，只保留 UVC→JPEG 硬解→CPU YUV 转换→H.264 硬编。**该档位下 URB 可以落内部 RAM 并做到 0% 丢帧，但这条路径不能推广到完整档位**——144 KiB 挤不进 146 KiB 的内部 DMA 池，会分配失败并触发组件 double-free 重启循环，完整档位必须让 URB 落 PSRAM（`CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM=y`）。摄像头的 MJPEG 描述符只有 30/25/15 FPS，没有 800×600 MJPEG 20 FPS 离散档位，因此日志中的 UVC requested 仍为 30 FPS，20 FPS 只作为编码处理上限。
+
+CPU 转换已由整帧连续重排改为 8 个 2 行宏块一段：每段完成后执行 `taskYIELD()`，并插入 20 µs 短空隙，降低单次连续 PSRAM 访问窗口。输出仍为 H.264 所需的 `O_UYY_E_VYY`，没有改变抽样和字节布局。
+
+实测结果：
+
+```text
+UVC complete       19.0～20.7 FPS
+UVC drop           31.6%～36.7%
+JPEG_DEC           6.6～6.8 ms
+YUV_CONV           15.0～15.4 ms
+H264_ENC           约 8.0 ms
+H.264 encoded      14.9～15.5 FPS
+callback_gap_max   10 ms
+SOI/EOI/非法头     本轮为 0
+```
+
+分块后转换耗时仍约 15 ms，短测 UVC 丢帧没有明显下降；因此这项改动目前只能确认降低了连续访问窗口，不能认为已经修复 UVC 丢包。后续应使用相同运行时长对比 tile 行数和块间空隙，并继续检查 PSRAM 仲裁与 USB ISOC 调度。
+
+P4 v1.3 + ESP-IDF 5.5.5 上 DMA2D/PPA 的 YUV422→YUV420 硬件路径不可用，初始化返回 `ESP_ERR_NOT_SUPPORTED`，代码自动回退 CPU。不要删除版本检查并强行调用私有 DMA2D API，否则可能再次出现 DMA2D 超时或 `transaction not in-flight`。
 
 ## 正常运行指标
 
 冷启动或恢复成功后，串口每 10 秒应出现：
 
 ```text
-CAMERA: RX frames=... 完整800x600MJPEG +约203～216，fps=约22，empty=0，缺SOI=累计值，缺EOI=0，过大=0
-VIDEO_STREAM: H.264：编码=约15 fps，发送=约15 fps，约1500 kbps，耗时 J=约6.7/Y=约15.5/H=约8.1/HTTP=约38～40 ms，失败=0
+CAMERA: UVC requested=30，complete=20～30 fps，drop=2.6%～32%，ISOC alt=1，URB=8×16 KB
+VIDEO_STREAM: H.264：编码=15～20 fps；耗时 J=约6.7/Y=约15.1/H=约8.3 ms；sent==encoded，send_fail=0
 ```
 
 PC 页面显示“最近 10 秒”的帧率和码率，不受历史 0 帧时段影响。服务器控制台也每 10 秒显示最近速率；若超过 2 秒未收到帧，页面最近速率会变为 0。固件中的“过载丢帧”只统计队列忙或队列写入失败；为把摄像头输入降至 15 FPS 而主动跳过的帧不会被误报为故障。
 
-2026-09-09 的 800×600 实测累计 673 个目标帧，其中 42 帧缺 SOI（约 6.2%）、缺 EOI 为 0、过大帧为 0。完整性门控将这些帧提前丢弃；H.264 编码和发送稳定在 14.8～15.0 FPS，发送失败为 0，过载累计仅 3 帧。HTTP 平均约 37～40 ms，峰值约 229 ms，由独立上传任务和 4 个输出槽吸收短时抖动。
+历史 800×600 联网测试中，H.264 编码和发送约 15 FPS、发送失败为 0；2026-09-11 的无网络对照测试确认，即使关闭 WebSocket，UVC 仍有约 30% 级丢帧，因此当前主要问题不能归因于网络发送。
 
 原始码流保存在：
 
