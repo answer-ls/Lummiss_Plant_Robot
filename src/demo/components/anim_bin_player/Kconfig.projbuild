@@ -1,0 +1,10 @@
+menu "Lummiss 动画播放器"
+
+config LUMMISS_ANIM_FIRST_FRAME_ONLY
+    bool "仅显示 LUM1 第一帧"
+    default n
+    help
+        仅用于 Stage 6 开发验证。播放器解析 BIN 后只显示第 0 帧，直到收到
+        stop。正常连续播放固件必须关闭此开关。
+
+endmenu

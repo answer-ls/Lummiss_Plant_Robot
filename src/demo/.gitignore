@@ -8,3 +8,5 @@ test_results/
 logs/
 # gif_resize_for_sd.py 的输出，由 项目文档/GIF 随时可重建，不入库
 tools/sd_gif_out/
+tools/anim_bin_out/
+tools/gif/

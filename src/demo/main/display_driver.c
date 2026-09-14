@@ -13,6 +13,8 @@
 #include "display_driver.h"
 #include "home_info.h"
 
+LV_FONT_DECLARE(lv_font_lummiss_weather_16);
+
 static const char *TAG = "DISPLAY";
 
 /* GMT020-02-8P（ST7789）原生为 240×320，本项目交换 X/Y 后横屏使用。 */
@@ -207,7 +209,8 @@ static void create_home_screen(void)
     lv_obj_set_style_radius(s_weather_dot, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_opa(s_weather_dot, LV_OPA_COVER, 0);
 
-    s_weather_label = create_label(panel, &lv_font_simsun_16_cjk, 190, 34, 54, 26);
+    s_weather_label = create_label(panel, &lv_font_lummiss_weather_16,
+                                   190, 34, 54, 26);
     s_temperature_label = create_label(panel, &lv_font_montserrat_20, 238, 32, 62, 30);
     s_time_label = create_label(panel, &lv_font_montserrat_48, 12, 91, 280, 68);
 

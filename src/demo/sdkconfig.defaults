@@ -78,17 +78,13 @@ CONFIG_LV_BUILD_EXAMPLES=n
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=65535
 CONFIG_LWIP_TCP_WND_DEFAULT=65535
 
-# SD 卡 GIF 运行时解码：lv_gif/gifdec 解 320x180 需要约 230KB 画布，
-# 超过 LVGL 内置堆的 128KB 上限，必须改走 malloc()（大块会落 PSRAM）。
+# LVGL 动态对象使用系统 malloc；表情播放器的两个 RGB565 帧缓冲由
+# anim_bin_player 明确一次性分配到 PSRAM，不再启用 GIF/文件系统解码器。
 CONFIG_LV_MEM_CUSTOM=y
-CONFIG_LV_USE_GIF=y
-# lv_gif 通过 LVGL 文件系统读卡：用 POSIX 驱动（底层 fopen），
-# 盘符 'S'，路径直接写 VFS 挂载点 /sdcard。
-CONFIG_LV_USE_FS_POSIX=y
-CONFIG_LV_FS_POSIX_LETTER=83
-CONFIG_LV_FS_POSIX_PATH=""
+# CONFIG_LV_USE_GIF is not set
+# CONFIG_LV_USE_FS_POSIX is not set
 
-# 卡上的素材目录是 expressions/，11 个字符超过 8.3；文件名 exp_01.gif 才是 8.3。
+# 卡上的素材目录是 expressions/，11 个字符超过 8.3；文件名 exp_01.bin 是 8.3。
 # 默认只认短名，按 "expressions" 打不开（FATFS 看到的是 EXPRESS~1）。
 CONFIG_FATFS_LONG_FILENAMES=y
 CONFIG_FATFS_LFN_HEAP=y
