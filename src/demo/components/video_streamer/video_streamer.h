@@ -23,6 +23,15 @@ typedef struct {
     char client_id[VIDEO_STREAM_WS_ID_MAX_LEN];
 } video_streamer_config_t;
 
+/* Agent WebSocket 与小智音频共用同一条连接，避免相同身份和 Token 建立
+ * 两个会话。回调运行在 WebSocket 任务中，必须快速返回。 */
+typedef struct {
+    void (*connection_changed)(bool connected, void *ctx);
+    void (*text_received)(const char *text, size_t len, void *ctx);
+    void (*audio_received)(const uint8_t *data, size_t len, void *ctx);
+    void *ctx;
+} video_streamer_agent_callbacks_t;
+
 #if (VIDEO_STREAM_CODEC_ONLY_TEST + VIDEO_STREAM_JPEG_ONLY_TEST + VIDEO_STREAM_YUV_ONLY_TEST) > 1
 #error "Video test modes are mutually exclusive"
 #endif
@@ -83,9 +92,15 @@ typedef struct {
 esp_err_t video_streamer_init(const video_streamer_config_t *config);
 
 /* 如果在 video_streamer_init 之前调用，会在 WebSocket 上传任务启动时使用该配置。
- * 若从未调用，init 将使用内部 fallback（本地 WS 调试地址）。
+ * 正式链路只接受 OTA 返回的 WSS 地址和动态 Token；未配置时不建立连接。
  * 典型用法：main.c 在 OTA 完成后调用此函数，再启动摄像头任务。 */
 void video_streamer_set_config(const video_streamer_config_t *config);
+
+/* 注册小智协议回调，并通过已鉴权的 Agent WSS 发送文本或原始 Opus 包。 */
+void video_streamer_set_agent_callbacks(
+    const video_streamer_agent_callbacks_t *callbacks);
+esp_err_t video_streamer_agent_send_text(const char *text);
+esp_err_t video_streamer_agent_send_audio(const uint8_t *data, size_t len);
 
 /* 当输入来自独立 MJPEG 复制池时，允许把该缓冲所有权交给编解码任务，
  * 避免 handoff 任务再次复制。release_cb 会在 JPEG 解码完成或输入被丢弃

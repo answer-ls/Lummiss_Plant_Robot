@@ -1,6 +1,6 @@
 # Lummiss 盆栽陪伴机器人项目交接说明
 
-更新时间：2026-09-14
+更新时间：2026-09-15
 
 ## 1. 当前结论
 
@@ -11,7 +11,9 @@
 - 阶段 6 的 BLE + WiFi 配网链路已经实机通过：ESP32-P4 经 ESP-Hosted/SDIO 使用板载 ESP32-C6 的 BLE Controller 和 WiFi。首次启动以 `LUMMISS_XXXXXX` 广播，App 通过官方 Unified Provisioning Security 2 下发凭据；成功后停止广播并启动业务。已有凭据时直接联网，断线自动重连。
 - 阶段 8 当前链路为 `800×600 MJPEG(YUV422) → P4 硬件 JPEG 直出 YUV422 → CPU 分块抽样/重排 O_UYY_E_VYY → H.264 硬件编码`；网络上传代码仍保留，但当前烧录的对照档位关闭 WebSocket。首帧超时会完整停止并确认 USB transfer 回调退出，再执行 USB Host/UVC 重建；本轮首帧重建后约 249 ms 成功。实测完整档位下 UVC 完整帧约 20～30 FPS、丢帧 19%～29%（2026-09-12 由同一次运行内的 A/B 定位为**编解码链路自身的 PSRAM 流量**，见第 7 节），H.264 实际约 15～20 FPS，**800×600@20 FPS 目标尚未达成**。RGB565 全帧 BT.601 软件换算已删除，编解码与网络上传已拆成两个 FreeRTOS 任务。
 - 2026-09-11 已确认：当前 P4 v1.3 + ESP-IDF 5.5.5 不能可靠使用 PPA/DMA2D 做 YUV422→YUV420；工程保留能力探测并回退 CPU。CPU 转换改为 8 个 2 行宏块一段，块间调度让出并插入 20 µs 短空隙，当前转换耗时约 15.0～15.4 ms。该改动未使短测 UVC 丢帧明显下降，剩余瓶颈仍是 H.264/PSRAM 与 USB ISOC 的长期争用或调度。
-- UI 状态机、传感器、触摸、LED、音频、小智、电机、专注模式、电源管理和整机联调均未进入实现阶段。
+- **2026-09-15 视频上传目标变更**：视频不再指向局域网 PC 的 `ws://<PC>:8001/ws`。该路径已断——代码里没有硬编码地址，`main.c` 只从 OTA 结果取 `websocket_url`，且 `ota_client.c` 现在会拒绝非 `wss://` 的返回值；而 PC 端 8001 服务与 8000 预览页仍在，但已经没有设备会连它。**当前视频与小智语音推的是同一条连接**：`wss://www.lummiss.com/server/lummiss/v1/`，用 OTA 下发的动态 Token 加 `Device-Id`/`Client-Id` 头鉴权。仓库内 `README.md` 与 `CAMERA_UPLOAD_TEST.md` 仍是旧 PC 地址的描述，尚未更新。
+- **2026-09-15 音频与小智**：新增 `components/xiaozhi_audio`（板载 ES8311 采集/播放 + Opus 编解码 + 小智协议）。语音链路**已端到端打通**（上行 Opus → 服务端 ASR → LLM → TTS → 下行 Opus 播放），但**与视频共存时失效**——已由 A/B 确认，是当前第一优先级问题，见第 10 节与附录 A.7。
+- UI 状态机、传感器、触摸、LED、电机、专注模式、电源管理和整机联调均未进入实现阶段。
 
 开发流程基线为根目录的 `盆栽陪伴机器人_开发文档.md`。本文只记录当前事实和下一步，不替代该设计文档。
 
@@ -67,7 +69,9 @@ src/esp_draw_bit     厂商示例副本，只作参考
 | `components/provisioning/provisioning_manager.c/.h` | BLE 配网、Security 2、设备名、每设备 PoP 和配网生命周期 |
 | `BLE_WIFI_PROVISIONING.md` | App 对接参数、二维码格式、配网流程和重新配网接口 |
 | `components/sd_card/sd_card.c/.h` | SDMMC Slot 0 挂载，含片上 LDO ch.4 供电和重试 |
-| `components/video_streamer/video_streamer.c/.h` | MJPEG 队列、硬件 JPEG 解码、CPU 分块 YUV422→YUV420、H.264 编码和 WebSocket 传输 |
+| `components/video_streamer/video_streamer.c/.h` | MJPEG 队列、硬件 JPEG 解码、CPU 分块 YUV422→YUV420、H.264 编码；**并持有唯一的 Agent WebSocket**（视频二进制帧、小智文本/Opus 都走它），对小智暴露 `video_streamer_set_agent_callbacks()` / `..._agent_send_text()` / `..._agent_send_audio()` |
+| `components/xiaozhi_audio/xiaozhi_audio.c/.h` | ES8311 采集/播放、Opus 编解码、小智协议（hello/listen/tts/stt/ping/pong）；不自己建连接，全部经 video_streamer 的 Agent WebSocket |
+| `components/ota_client/ota_client.c/.h` | 取 OTA 结果里的 `websocket_url` + 动态 Token，校验必须是 `wss://` 且 Token 非空；串口只打长度不打正文 |
 | `components/video_streamer/dma2d_yuv.c/.h` | DMA2D 硬件 YUV422→YUV420（**本板 v1.3 不可用**，仅 codec-only 档位以外永不生效） |
 | `tools/pc_camera_server.py` | PC 端 H.264 接收、保存、持久 PyAV 解码和 MJPEG 网页预览 |
 | `tools/capture_camera_serial.py` | 采集串口日志到文件，供实机对照测试复盘 |
@@ -91,9 +95,9 @@ src/esp_draw_bit     厂商示例副本，只作参考
 | 阶段 2：屏幕 | 部分完成 | ST7789 驱动、LVGL 8.4、320×240 动态时间首页、IP 定位、网络校时、天气 API、镜像修正、8 组表情资源保留、源码构建通过 | 真机颜色/方向/API/稳定性验收；LISTEN/THINK/REPLY/SLEEP/FAULT 页面；页面切换接口；电池管理完成后接入电量 |
 | 阶段 3：UI 状态机 | 未开始 | 当前只有静态时间首页 | Event Bus、状态请求、优先级、覆盖、恢复、超时和异常 |
 | 阶段 4：传感器/触摸/LED | 未开始 | 无 | 土壤、光照、温湿度、左右触摸、呼吸灯 |
-| 阶段 5：音频 | 未开始 | 无 | 麦克风、扬声器、I2S、PCM、Opus |
+| 阶段 5：音频 | 部分完成 | `components/xiaozhi_audio`：板载 ES8311 I2S 采集与播放、Opus 编解码、16 kHz 单声道 60 ms 分帧、上行/下行实时通路已实机工作 | AEC、全双工、产品化增益/音量、长时间稳定性 |
 | 阶段 6：Wi-Fi | 部分完成 | P4-C6 ESP-Hosted/SDIO、独立 Network Manager、固定凭据、DHCP 实机成功、2 秒自动重连 | NVS 凭据、BLE 配网、HTTP 通用封装 |
-| 阶段 7：小智 | 未开始 | 无 | 基础语音链路、UI 状态映射、MCP |
+| 阶段 7：小智 | 部分完成 | 客户端 hello、`listen` 启停、`tts`/`stt` 下行文本、二进制 Opus 下行、`ping`/`pong` 已实现；端到端语音链路实机打通 | **与视频共用一条 WebSocket 时失效**；`abort` 与鉴权失败后的清 Token/重 OTA 未接；UI 状态映射、MCP |
 | 阶段 8：摄像头 | 部分完成 | USB Host/UVC 枚举；800×600 MJPEG；JPEG 完整性门控；硬件 JPEG 解码；CPU 分块 YUV 转换；双任务 H.264 编码与 WebSocket 链路；16 字节帧头自描述分辨率；下行命令 ping/status；断线自动重连；PC 保存/持久解码/MJPEG 预览；首帧超时后的完整 USB Host/UVC 重建 | 10 分钟以上稳定性；浏览器实时画面长期验收；C6 固件版本对齐；正式 Camera API；运行期改分辨率 |
 | 阶段 9：旋转底座 | 未开始 | 无 | 电机、编码器、回零、角度、启停和堵转保护 |
 | 阶段 10：专注模式 | 未开始 | 无 | 全部功能 |
@@ -297,6 +301,41 @@ VS Code 当前默认使用 `build_main_verified`，生成器必须为 Ninja。�
 
 ## 10. 现在最需要解决的问题
 
+### 2026-09-15 新增（优先级高于下方各条）
+
+1. **视频和语音挤在同一条 WebSocket 上，把语音链路搞坏了——已由 A/B 确认，但根因还没定到具体机制。**
+   同一次烧录、同一段代码，只改"摄像头是否插着"：摄像头**开着**时，无论问什么都回兜底话术
+   （"主人，lummiss现在有点忙" / "我们稍后再试吧"）；摄像头**断开**时回真实答案
+   （"我一直都在呢，您请说。"，`SPK frames=46 drop=0`）。两次的麦克风电平、上行包数、
+   下行播放都正常，差别只在回答内容。**候选机制有两个，尚未区分**：
+
+   - **(a) 协议层**：后端文档 §6.1 规定"一个 Binary payload = 一个完整 Opus packet，禁止附加
+     WAV 头/Ogg/JSON/长度/序号/时间戳，禁止合并或拆分"。而我们把每帧十几 KB 的 H.264 也以
+     二进制帧发在同一条连接上，**服务端无法区分**，只能按 Opus 解 → 解出垃圾。
+   - **(b) 资源层**：编解码链路每帧约 30 ms 的 PSRAM 密集访问（JPEG 6.7 + YUV 重排 15.3 +
+     编码 8.3）把上行音频挤晚，ASR 收到断续音频。
+
+   一次构建就能区分：**摄像头照常跑、编码照常做，只是不往 WS 发视频帧**。语音恢复 → (a)；
+   语音仍坏 → (b)，要从任务优先级/钉核下手。`video_streamer.c:1200` 是唯一的视频发送点。
+
+   **顺带更正**：此前"没有 `stt` 消息 = 服务端没识别出来"的说法是错的。摄像头断开那一场
+   同样没有 `stt`，服务端却听懂了。这个配置下服务端不发 `stt`，判据只能是回答内容。
+
+2. **视频为什么必须在 WS 语义上离开语音通道（结构性，不是调参）。**
+   即便 (b) 才是主因，视频和 Opus 共用一条连接本身也是错的：后端文档明确禁止在同一条
+   Agent 连接上混发非 Opus 二进制帧，而且视频的 4 Mbps 会给语音加队头阻塞。后端目前**没有**
+   给出独立的视频上传端点（文档 §3/§4 只定义了 OTA 和这一条 Agent WS），所以要么向后端要
+   一个视频专用端点，要么视频暂时回到本地/明文通道，不能继续混在 Agent 连接里。
+
+3. **AES 的 DMA 描述符分配失败会拖垮 TLS，进而断掉整条语音+视频链路。**
+   实机反复出现 `esp-aes: Failed to allocate memory for ...`，随后 TLS 写失败、WS 断连，
+   再往后 JPEG_DEC 从 15 ms 涨到 662 ms、编码掉到 0 fps。**成因与已做的修改见附录 A.8。**
+   注意这一条**不是**上面第 1 条的根因——摄像头断开那一场也有同样的 `esp-aes` 报错，语音
+   却是好的。改动已落盘（`CONFIG_MBEDTLS_HARDWARE_AES=n`），**待实机复测**：判据是串口里
+   `esp-aes:` 一行都不再出现。
+
+以下为此前记录，编号不变：
+
 1. **UVC 丢帧拖垮了编码帧率，20 FPS 目标未达成。** 丢帧来源已由同一次运行内的 A/B 定位为**编解码链路自身的 PSRAM 流量**：关掉链路丢帧 2.1%，打开 23.8%，而 WiFi/LVGL/GIF 轮播/回调 memcpy 在两者中都在跑（见第 7 节）。URB 必须落 PSRAM 是**另一个**问题——它防的是开机重启循环（144 KiB 挤不进 146 KiB 内部 DMA 池触发组件 double-free），与稳态丢帧无关。**当前完整档位实测：UVC complete 20~30 FPS、丢帧 19%~29%、H.264 15~20 FPS。** 下一步是降低编解码链路的 PSRAM 压力（YUV 重排 15.3 ms 是三项里最大的一项），**不要再做档位二分**。
 2. **WebSocket 断线会恶化成 56 秒黑屏。** 2026-09-12 日志里 `transport_poll_write(0)` 触发一次后，重连上去不到 1 秒又断，连续 5 次，累计 56 秒无画面。成因是 `VIDEO_WS_SEND_TIMEOUT_MS` 过短（原 100 ms），被 `esp_websocket_client` 判为致命错误直接 abort；同时重连间隔是 8000 ms，比它自己注释里写的 2 秒长 4 倍。已改为写超时 2000 ms（与 `network_timeout_ms` 拆成两个宏）、重连 2000 ms，**待实机复测**。详见附录 A.6。
 3. **800×600 网页预览待最终验收。** 完整联网档位（`CAMERA_TEST_FULL=0`）已在实机跑通、WebSocket 正常连接、`sent == encoded` 且 `send_fail=0`；但设备侧只有 15~20 FPS，预览会卡在这个帧率上。需等第 1 条的 PSRAM 压力结论出来、帧率提上去之后再做正式验收；验收前应先确认第 2 条的断线问题已复测通过，否则预览会周期性中断。
@@ -308,6 +347,21 @@ VS Code 当前默认使用 `build_main_verified`，生成器必须为 Ninja。�
 9. **屏幕背光不可控。** BL 接 3V3 无法满足休眠、低电量和亮度调节，需要正式硬件增加背光驱动和 PWM GPIO。
 
 ## 11. 按流程继续的顺序
+
+### 2026-09-15 起
+
+1. **先复测 AES 改动**（附录 A.8）：烧录后看串口是否还有 `esp-aes:`，以及 WS 还会不会断。
+   这一条独立于视频，不管视频怎么改都要先确认这块干净。
+2. **判定第 10 节第 1 条的根因**：加一个默认关闭的编译开关，在 `video_streamer.c:1200`
+   跳过视频发送但保留整条编解码链路（摄像头照常跑、编码照常做、输出槽照常满）。语音恢复
+   → 协议层 (a) 或带宽；语音仍坏 → 资源层 (b)。**不要再用"切档位"来分离变量**（理由同
+   下方第 1 条），开/关整条链路或只关发送是已验证有效的手段。
+3. **按判定结果处理视频通道**：若是 (a)/(b)，向后端要一个独立的视频上传端点，或把视频
+   暂时放回本地明文 `ws://`——两者都能同时解决协议混发和 4 Mbps 给语音加队头阻塞的问题。
+4. **补齐小智协议的缺口**：`abort` 命令的本地响应、鉴权失败后的清 Token 与重新 OTA
+   （后端文档 §7 要求）、下行 24 kHz 与上行 16 kHz 的采样率映射复测。
+
+以下为此前顺序，仍然有效：
 
 1. **降低编解码链路的 PSRAM 流量**——这是唯一还在动的变量（见第 7 节 A/B）。按耗时排序，YUV 重排 15.3 ms 是三项里最大的一项，先评估 P4 v1.3 上 DMA2D/PPA 不可用时的替代路径；其次看 JPEG 解码 6.7 ms 的 PSRAM 读写量。**不要再做档位二分**：`callback_gap_max` 在丢帧 23.8% 和 2.1% 两种状态下都是 9 ms，对档位不敏感，拿它当判据只会得到噪声。若要继续分离变量，用已验证有效的手段——直接开/关整条编解码链路（WebSocket 断线就是这个效果），而不是切档位。
 2. **复测 WebSocket 断线修复**（附录 A.6）：烧录后长时间跑，确认不再出现"连上不到 1 秒又断"的循环。判据是 `transport_ws: Error transport_poll_write(0)` 不再出现；若仍出现，说明 2000 ms 写超时还不够，下一步要给 socket 加 `SO_SNDTIMEO`（写超时只约束那次 select，不约束随后的 `send()`）。
@@ -492,3 +546,94 @@ SOI/EOI 是否在场，`video_jpeg_structurally_valid()` 会逐段走 marker 结
 ⚠️ 写超时只约束那次 `select`，不约束随后的 `send()`（socket 是阻塞的，没设 `SO_SNDTIMEO`）。
 链路彻底卡死时 `send()` 要等 TCP 重传耗尽（`CONFIG_LWIP_TCP_MAXRTX=12`）才返回。若复测后
 仍出现 `transport_poll_write(0)`，下一步就是给 socket 加 `SO_SNDTIMEO`。
+
+### A.7 小智语音链路实测（2026-09-15）与视频共存 A/B
+
+链路：板载 ES8311 采集 → Opus 编码（16 kHz、单声道、60 ms/960 采样）→ `video_streamer`
+的 Agent WSS 上行；下行二进制帧 → Opus 解码（24 kHz、单声道、60 ms）→ ES8311 播放。
+
+**判读用的四个数**（这套判据是这一轮摸出来的，比看日志文本靠谱）：
+
+| 数 | 健康值 | 说明 |
+| --- | --- | --- |
+| `MIC packets` | 每 5 秒 +84 | 60 ms 帧长 = 16.7 包/秒；**只在 `video_streamer_agent_send_audio()` 返回 `ESP_OK` 后自增**，所以它涨就是真交给 WebSocket 了 |
+| 上行包长 | 约 106 字节 | ≈ 14 kbps |
+| `mic peak` | 说话时 11676 | **环境底噪就是 284～544，不要以为这是增益不够去调 `XIAOZHI_CODEC_INPUT_GAIN_DB`（已经是 30 dB）**，必须真说话再看 |
+| `SPK frames / drop` | `drop=0` 且 frames 在涨 | `frames=0 drop=0` = **服务端一个二进制帧都没发**，不是本地解码失败；只有 `frames=0` 而 `drop>0` 才是本地问题（`s_playback_drops++` 在 `incoming_audio_callback()` 里数据空/超长/队列满时加） |
+
+一次完整成功（摄像头断开，2026-09-15）：
+
+```text
+小智开始回答
+小智回答文本：{"type":"tts","state":"sentence_start",...}
+小智回答结束，恢复麦克风上行
+SPK frames 0 → 62 → 85，drop=0
+mic peak=11676
+```
+
+**A/B（同一次烧录、同一段代码，唯一差别是摄像头插着与否）**：
+
+| 摄像头 | 服务端回答 | 下行 | 上行 |
+| --- | --- | --- | --- |
+| 开着 | "主人，lummiss现在有点忙" / "我们稍后再试吧"（兜底话术，问什么都一样） | `SPK frames=62`，随后 `send_fail=1`、TTS 结束后 WS 断 | 正常 |
+| 断开 | "我一直都在呢，您请说。"（真实回答） | `SPK frames=46 drop=0` | 正常 |
+
+**两次都没有 `stt` 消息。** 所以"没有 `stt` = 服务端没识别出来"是错的判据，这一版服务端
+不发 `stt`；能用的判据只有**回答内容**。候选机制见第 10 节第 1 条。
+
+**已知未解**：TTS 刚结束（`小智回答结束` 后 47 ms）WS 断过一次，报
+`H.264 发送失败：259`（`ESP_ERR_INVALID_STATE`）+ `unexpected data readable on
+socket=54` + `Connection terminated while waiting for clean TCP close`，2 秒后自动重连并
+拿到新 `session_id`，`send_fail` 计 1。原因未定位。
+
+### A.8 AES 的 DMA 描述符分配失败：排查过程与结论（2026-09-15）
+
+**症状链**：`esp-aes: Failed to allocate memory for ...` → `esp-tls-mbedtls:
+mbedtls_ssl_handshake returned -0x0001` / TLS 写失败 → WS 断连 → 再往后 `JPEG_DEC` 从
+15 ms 涨到 662 ms、编码掉到 0 fps。流量只有约 4 Mbps，硬件加速省下的那点 CPU 毫无意义。
+
+**踩过的坑：先只关了 `CONFIG_MBEDTLS_HARDWARE_GCM`，无效。** 因为 AES 有**两个**描述符
+消费者，GCM 那条只是其中之一：
+
+| 消费者 | 位置 | 谁在用 |
+| --- | --- | --- |
+| `esp_aes_process_dma_gcm()` | `esp_aes_gcm.c:736` | 硬件 GCM |
+| `esp_aes_process_dma()` | `port/aes/dma/esp_aes_dma_core.c:541` | **每个非 GCM 记录**：CBC / CTR / ECB，以及软件 GCM 走 CTR 时 |
+
+关掉 GCM 只是把报错从 `len buffer`（GCM 那条，`:841`）换成 `start/end alignment buffer`
+（通用那条，`:469` / `:491`）——错误换了个函数照样出，现象一点没变。
+
+**为什么 AES 一定要去啃那块 146 KiB 的池子**：
+
+- P4 上选哪份 `esp_aes.c` 由 `mbedtls/CMakeLists.txt:209-215` 的 `AES_PERIPHERAL_TYPE`
+  决定，而它只看 SOC 能力 `CONFIG_SOC_AES_SUPPORT_DMA`——**没有 Kconfig 可以关掉 DMA 路径**；
+- `esp_aes_process_dma()` 对**每一次** AES 运算都要调两遍 `generate_descriptor_list()`
+  （`:616` / `:622`），**16 字节的 ECB 也一样，没有小缓冲区直通捷径**；
+- 每次从 `MALLOC_CAP_DMA|MALLOC_CAP_INTERNAL` 里 `heap_caps_aligned_calloc` 描述符数组
+  （`:357-359`）和最多两个对齐缓冲（`:467` / `:489`）——和 UVC URB、WiFi SDIO 抢同一块内存。
+
+**这条路径失败即泄漏**：GCM 的 `len_desc`/`len_buf` 分配失败（`:833-845`）是裸
+`return -1`，跳过了函数末尾的 `cleanup:`，而 `aad`/`input`/`output` 三组描述符和 6 个
+alignment buffer 此时都已分配成功。失败一次池子就永久小一截，下一次更容易失败——正好解释
+现象为什么是单向恶化而不是偶发抖动。
+
+**最终修改**：`CONFIG_MBEDTLS_HARDWARE_AES=n`（`sdkconfig.defaults` 与 `sdkconfig` 都改）。
+`port/include/mbedtls/esp_config.h:152-166` 显示 `MBEDTLS_AES_ALT` 与 `MBEDTLS_GCM_ALT`
+**都由这一个开关控制**，关掉后 mbedtls 完全走自己的软件 `aes.c` / `gcm.c`，上面那条路径
+一次都不会被调到。代价是纯软件 AES（GHASH 本来就是软件算的）：约 4 Mbps 的 TLS 流量，
+400 MHz RISC-V 上软件 AES 约 10 MB/s，占不到一个核的 5%。
+
+**已排除的旁支**（免得再查一遍）：
+
+- **不是 SHA**：`esp_sha_gdma_impl.c` 里没有任何堆分配（静态描述符），日志里也从没出现过
+  `esp-sha:` 的错误；
+- **不是 flash 加密或 NVS 加密**：两者都 `is not set`；
+- **工程里没有别处直接调 `esp_aes_*` / `mbedtls_aes_*`**。
+
+**一条没解释清、但不要据此推翻结论的现象**：报错时刻的 `[VIDEO] MEM` 行显示
+`DMA=65/22 KB INT=103/31 KB`，看着还有余量，而失败的是 ≤256 字节的小分配。MEM 行是 10 秒
+周期的快照，很可能没落在失败那一瞬间（握手/重连时 UVC 与 WiFi 同时在抢池子）。`DMA_DESC_MEM_ALIGN_SIZE`
+在 P4 上是 8（`GDMA_LL_AXI_DESC_ALIGNMENT`），所以也不是对齐粒度把池子切碎导致的。
+
+**待复测判据**：串口里 `esp-aes:` 一行都不再出现。注意这一条**不是**视频/语音 A/B 的根因
+——摄像头断开那一场也有 `esp-aes` 报错，语音却是好的。

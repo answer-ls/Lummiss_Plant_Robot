@@ -116,3 +116,41 @@ CONFIG_ESP_HOSTED_USE_MEMPOOL=y
 CONFIG_ESP_WIFI_REMOTE_ENABLED=y
 CONFIG_SLAVE_IDF_TARGET_ESP32C6=y
 CONFIG_ESP_WIFI_REMOTE_LIBRARY_HOSTED=y
+
+# 同型号 JC1060P470C 厂商示例的板载 ES8311 音频配置。
+CONFIG_CODEC_ES8311_SUPPORT=y
+CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y
+
+# 小智服务、麦克风和扬声器任务使用 PSRAM 栈，避免继续挤占
+# USB/WiFi 共用的内部 DMA 内存；PCM DMA 缓冲仍在内部 RAM。
+
+# 关掉硬件 AES —— 这是 P4 上唯一能把 AES 那条 DMA 描述符路径整个摘掉的开关。
+#
+# 起因：实机报 `esp-aes: Failed to allocate memory for len buffer`，随后 TLS 写
+# 失败、WS 断连，再往后 JPEG_DEC 从 15 ms 涨到 662 ms、编码掉到 0 fps。
+#
+# 为什么 AES 会去啃内部 DMA 池：P4 上 AES 走的是 port/aes/dma/esp_aes.c。走哪份
+# esp_aes.c 由 CMakeLists 的 AES_PERIPHERAL_TYPE 决定，而它只看 SOC 能力
+# CONFIG_SOC_AES_SUPPORT_DMA —— **没有 Kconfig 可选**。于是 esp_aes_process_dma()
+# 对每一次 AES 运算都要调两遍 generate_descriptor_list()，从
+# MALLOC_CAP_DMA|MALLOC_CAP_INTERNAL 里 heap_caps_aligned_calloc 出描述符数组和
+# 最多两个对齐缓冲；这条路径没有“小缓冲区直通”的捷径，16 字节的 ECB 也一样。
+# 也就是说无论用哪种密码套件，每个 TLS 记录都要和 UVC/WiFi 抢同一块 146 KiB 的
+# 池子（开机日志 "Reserving pool of 146K of internal memory for DMA"）。
+#
+# 先只关了 MBEDTLS_HARDWARE_GCM，没用：AES 有**两个**描述符消费者，GCM 那条
+# (esp_aes_process_dma_gcm) 只是其中之一，通用那条 esp_aes_process_dma() 仍在每个
+# 记录上分配。关了 GCM 只是把报错从 "len buffer" 换成 "start/end alignment
+# buffer"——错误换了个函数照样出，页面上的现象一点没变。
+#
+# 更要紧的是这条路径**失败即泄漏**：esp_aes_dma_core.c 里 GCM 的 len_desc/len_buf
+# 分配失败时是裸 `return -1`，跳过了函数末尾的 cleanup:，而 aad/input/output 三组
+# 描述符和 6 个 alignment buffer 此时都已分配成功。失败一次池子就永久小一截，
+# 下一次更容易失败——正好解释现象为什么是单向恶化而不是偶发抖动。
+#
+# CONFIG_MBEDTLS_HARDWARE_AES=n 时 port/include/mbedtls/esp_config.h:152 不再定义
+# MBEDTLS_AES_ALT 与 MBEDTLS_GCM_ALT，mbedtls 完全走自己的软件 aes.c / gcm.c，
+# 上面那条路径一次都不会被调到（本工程没有 flash 加密/NVS 加密，也没有别处直接
+# 调 esp_aes_*）。代价是纯软件 AES——GHASH 本来就是软件算的：实测 TLS 流量约
+# 4 Mbps，软件 AES 在 400 MHz RISC-V 上约 10 MB/s，占不到一个核的 5%。
+CONFIG_MBEDTLS_HARDWARE_AES=n

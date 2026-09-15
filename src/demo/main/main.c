@@ -15,6 +15,7 @@
 #include "screen_carousel.h"
 #include "test_profile.h"
 #include "video_streamer.h"
+#include "xiaozhi_audio.h"
 
 static const char *TAG = "APP_MAIN";
 
@@ -145,6 +146,16 @@ void app_main(void)
         } else {
             ESP_LOGW(TAG, "WiFi 连接超时，跳过 OTA 检查");
         }
+    }
+#endif
+
+#if TP_HAS(XIAOZHI)
+    /* 小智初始化板载 ES8311，并注册到 video_streamer 的共享 Agent WSS。
+     * 连接仍使用上面 OTA 注入的 URL、Token、Device-Id 和 Client-Id。 */
+    esp_err_t xiaozhi_error = xiaozhi_audio_start();
+    if (xiaozhi_error != ESP_OK) {
+        ESP_LOGE(TAG, "启动小智语音服务失败：%s",
+                 esp_err_to_name(xiaozhi_error));
     }
 #endif
 

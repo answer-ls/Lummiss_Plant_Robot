@@ -27,9 +27,7 @@ static const char *TAG = "VIDEO_STREAM";
 
 static video_streamer_config_t s_ws_config;
 
-/* WebSocket 地址从 OTA 动态获取，代码中不再硬编码。
- * 本地调试用仍可通过本地 WS URL 方式（非 WSS）在 codec-only 档位下测试。 */
-#define VIDEO_STREAM_WS_LOCAL_URL     "ws://192.168.1.66:8001/ws"
+/* WebSocket 地址和动态 Token 必须来自项目 OTA，正式固件不保留明文 WS fallback。 */
 /* 分辨率统一取 video_streamer.h 的公共常量，与摄像头侧"可编码帧"门控一致。 */
 #define VIDEO_WIDTH                   VIDEO_STREAM_WIDTH
 #define VIDEO_HEIGHT                  VIDEO_STREAM_HEIGHT
@@ -151,14 +149,30 @@ static video_streamer_config_t s_ws_config;
  * 因此出现连续 5 次"连上不到 1 秒又断"，累计 56 秒黑屏。放宽到 2 秒的代价是
  * 阻塞期间占住输出槽，但断线代价是重连 2 秒起，取小的那个。 */
 #define VIDEO_WS_SEND_TIMEOUT_MS      2000
-/* WebSocket 客户端自身的读写轮询超时：保持短，不参与上面的致命判定。
- * 不要和单帧发送超时合并成一个宏。 */
-#define VIDEO_WS_NETWORK_TIMEOUT_MS   100
+#define VIDEO_WS_AUDIO_SEND_TIMEOUT_MS 200
+/* 建连超时。名字看着像"轮询超时"，但 esp_websocket_client.c:1204 把它原样传给
+ * esp_transport_connect(host, port, network_timeout_ms)，TLS 路径下即
+ * esp_tls_cfg_t.timeout_ms——**整个 TLS 握手的超时预算**。
+ *
+ * 另有三处用途：读轮询（:1085）、PING/PONG/CLOSE（:1142/:1306/:1359）。
+ * 数据帧发送不走它：send_with_opcode 用的是调用方传进来的 timeout（:740），
+ * 那才是 VIDEO_WS_SEND_TIMEOUT_MS。所以这两个宏仍然要分开，只是不能把建连
+ * 那一侧压得太短。
+ *
+ * 100 是错的：公网到 www.lummiss.com 的 TLS 握手偶尔能挤进 100 ms（于是首次
+ * 连接侥幸成功），但大多数时候超时，报
+ *   esp-tls: Failed to open new connection in specified timeout
+ *   transport_error=ESP_ERR_ESP_TLS_CONNECTION_TIMEOUT
+ * 且**每次重连都失败**——现象就是连上一次之后再也连不上，OTA 明明还是通的
+ * （一次性 HTTPS 请求不吃这个超时）。恢复组件默认的 10 秒。 */
+#define VIDEO_WS_NETWORK_TIMEOUT_MS   10000
 /* 发送起始速率的闸门。跟随 VIDEO_ENCODE_FPS 而不是写死数字：上游 20 fps 的
  * 提交门控已经限过流，这里再拿一个过时的 25 去放行只会让两处口径对不上。 */
 #define VIDEO_WS_SEND_INTERVAL_US     (1000000LL / VIDEO_ENCODE_FPS)
 /* 下行命令的累积缓冲：服务器下发的 JSON 命令很短。 */
-#define VIDEO_WS_COMMAND_MAX          192
+#define VIDEO_WS_COMMAND_MAX          1024
+#define VIDEO_WS_AUDIO_PACKET_MAX     1400
+#define VIDEO_WS_AUDIO_QUEUE_DEPTH    4
 #define VIDEO_REPORT_INTERVAL_US      (5 * 1000 * 1000LL)
 /* 门控按 VIDEO_ENCODE_FPS 的帧周期推进；允许提前 5 ms 接帧，
  * 避免整数取整导致的周期漂移。 */
@@ -185,6 +199,11 @@ typedef struct {
     int frame_type;
     int64_t ready_us;
 } video_out_slot_t;
+
+typedef struct {
+    uint16_t size;
+    uint8_t data[VIDEO_WS_AUDIO_PACKET_MAX];
+} video_agent_audio_packet_t;
 
 /* 结构校验的失败原因。camera_driver 侧只检查 SOI/EOI 是否在场，而等时传输
  * 丢包打坏帧头段长度、头尾标记却仍然完好的帧只有这里能拦住。把原因拆开计数
@@ -240,6 +259,10 @@ static QueueHandle_t s_input_queue;
 /* 输出槽所有权两条队列：free=可写槽，ready=已编码待发送槽。 */
 static QueueHandle_t s_out_free;
 static QueueHandle_t s_out_ready;
+static QueueHandle_t s_agent_audio_queue;
+static StaticQueue_t s_agent_audio_queue_control;
+static uint8_t *s_agent_audio_queue_storage;
+static QueueSetHandle_t s_upload_queue_set;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static video_stream_stats_t s_stats;
 static int64_t s_next_submit_us;
@@ -251,11 +274,16 @@ static bool s_stream_enabled = true;
 static volatile bool s_ws_connected;
 static volatile bool s_yuv_busy;
 static int64_t s_next_ws_send_us;
+static esp_websocket_client_handle_t s_ws_client;
+static video_streamer_agent_callbacks_t s_agent_callbacks;
 
 /* 下行命令的累积缓冲。WebSocket 事件回调运行在客户端自己的任务里，
  * 与上传任务并发，但这两个变量只有该回调会写，因此不需要加锁。 */
 static char s_ws_command[VIDEO_WS_COMMAND_MAX];
 static size_t s_ws_command_len;
+static uint8_t s_ws_audio_packet[VIDEO_WS_AUDIO_PACKET_MAX];
+static size_t s_ws_audio_len;
+static bool s_ws_receiving_binary;
 
 static void video_drop_pending_output(void)
 {
@@ -318,6 +346,36 @@ static void video_stream_log_error_limited(const char *message, int error)
         ESP_LOGW(TAG, "%s：%d", message, error);
         last_log_us = now_us;
     }
+}
+
+/* WEBSOCKET_EVENT_ERROR 的 error_handle 是 esp_websocket_error_codes_t：前三个
+ * 字段是"与 esp_tls_last_error 兼容的部分"，只在 esp-tls 层面失败时才被填；
+ * 后面的 error_type / esp_ws_handshake_status_code / esp_transport_sock_errno
+ * 是 esp-websocket 与 tcp_transport 的扩展，走 TLS 连接失败这条路时**不会赋值**。
+ *
+ * 这里原先读的恰好是最后的 esp_transport_sock_errno，于是打出
+ * "WebSocket 出错：1341551172" ——那不是错误码，是未初始化内存里残留的 PSRAM
+ * 地址，把真正的 ESP_ERR_ESP_TLS_CONNECTION_TIMEOUT 藏掉了。改报前三个字段。
+ * 仍按 5 秒限频：断线重连期间这个事件每 2 秒来一次。 */
+static void video_stream_log_ws_error(const esp_websocket_event_data_t *data)
+{
+    static int64_t last_log_us;
+    const int64_t now_us = esp_timer_get_time();
+    if (last_log_us != 0 && now_us - last_log_us < 5 * 1000 * 1000LL) {
+        return;
+    }
+    last_log_us = now_us;
+    if (data == NULL) {
+        ESP_LOGW(TAG, "WebSocket 出错：无错误详情");
+        return;
+    }
+    ESP_LOGW(TAG,
+             "WebSocket 出错：type=%d last_err=%s(0x%x) tls_stack_err=%d handshake=%d",
+             (int)data->error_handle.error_type,
+             esp_err_to_name(data->error_handle.esp_tls_last_esp_err),
+             (unsigned)data->error_handle.esp_tls_last_esp_err,
+             data->error_handle.esp_tls_stack_err,
+             data->error_handle.esp_ws_handshake_status_code);
 }
 
 /*
@@ -655,6 +713,10 @@ static void video_ws_handle_command(esp_websocket_client_handle_t client,
                  "{\"type\":\"video_state\",\"ok\":true,"
                  "\"video_enabled\":%s}",
                  enabled ? "true" : "false");
+    } else if (strcmp(cmd, "tts") == 0 || strcmp(cmd, "stt") == 0 ||
+               strcmp(cmd, "listen") == 0 || strcmp(cmd, "abort") == 0) {
+        /* 语音协议交给已注册的 Agent 回调处理，此处不重复打印。 */
+        return;
     } else {
         /* 未知命令：不回复，避免在云端协议下产生噪音。
          * tts/stt/listen/abort 等语音/控制协议命令在此接收但暂不处理。 */
@@ -684,8 +746,7 @@ static void video_ws_event_handler(void *handler_args,
     switch ((esp_websocket_event_id_t)event_id) {
     case WEBSOCKET_EVENT_CONNECTED:
         __atomic_store_n(&s_ws_connected, true, __ATOMIC_SEQ_CST);
-        ESP_LOGI(TAG, "WebSocket 已连接：%s",
-                 s_ws_config.ws_url[0] ? s_ws_config.ws_url : VIDEO_STREAM_WS_LOCAL_URL);
+        ESP_LOGI(TAG, "WebSocket 已连接：%s", s_ws_config.ws_url);
 
         /* 发送应用层 Hello，遵循 OTA 与 WebSocket 接口规范。 */
         {
@@ -699,6 +760,7 @@ static void video_ws_event_handler(void *handler_args,
                      "\"variantCode\":\"DESKTOP_PET_V1\","
                      "\"manifestVersion\":1,"
                      "\"capabilities\":["
+                     "{\"code\":\"audio.play\",\"version\":1},"
                      "{\"code\":\"camera.capture\",\"version\":1}"
                      "]}}");
             int sent = esp_websocket_client_send_text(
@@ -710,6 +772,9 @@ static void video_ws_event_handler(void *handler_args,
                 ESP_LOGW(TAG, "Hello 发送失败：%d", sent);
             }
         }
+        if (s_agent_callbacks.connection_changed != NULL) {
+            s_agent_callbacks.connection_changed(true, s_agent_callbacks.ctx);
+        }
         break;
 
     case WEBSOCKET_EVENT_DISCONNECTED:
@@ -718,22 +783,57 @@ static void video_ws_event_handler(void *handler_args,
         __atomic_store_n(&s_ws_connected, false, __ATOMIC_SEQ_CST);
         ESP_LOGW(TAG, "WebSocket 连接断开，等待自动重连");
         s_ws_command_len = 0;
+        s_ws_audio_len = 0;
+        s_ws_receiving_binary = false;
+        if (s_agent_callbacks.connection_changed != NULL) {
+            s_agent_callbacks.connection_changed(false, s_agent_callbacks.ctx);
+        }
         break;
 
     case WEBSOCKET_EVENT_ERROR:
         __atomic_store_n(&s_ws_connected, false, __ATOMIC_SEQ_CST);
-        video_stream_log_error_limited(
-            "WebSocket 出错",
-            data != NULL ? data->error_handle.esp_transport_sock_errno : 0);
+        video_stream_log_ws_error(data);
         break;
 
     case WEBSOCKET_EVENT_DATA:
-        /* 只收文本帧（下行命令）。二进制帧是上行视频，服务器不会回传。
-         * 命令远小于缓冲，正常只有一次事件；超出缓冲时组件会按偏移分多次投递。 */
-        if (data == NULL || (data->op_code != 0x01 && data->op_code != 0x00)) {
+        /* 文本帧承载 Hello/STT/TTS/控制；服务端下行二进制帧是一个完整
+         * Opus packet。两类消息都可能被组件按 payload_offset 分片。 */
+        if (data == NULL) {
             break;
         }
-        if (data->op_code == 0x01) {
+        if (data->op_code == 0x02 && data->payload_offset == 0) {
+            s_ws_audio_len = 0;
+            s_ws_receiving_binary = true;
+        }
+        if (data->op_code == 0x02 ||
+            (data->op_code == 0x00 && s_ws_receiving_binary)) {
+            const size_t offset = (size_t)data->payload_offset;
+            const size_t chunk = (size_t)data->data_len;
+            if (offset + chunk > sizeof(s_ws_audio_packet)) {
+                ESP_LOGW(TAG, "下行 Opus 包过大，已丢弃：%u bytes",
+                         (unsigned)(offset + chunk));
+                s_ws_audio_len = 0;
+                s_ws_receiving_binary = false;
+                break;
+            }
+            memcpy(s_ws_audio_packet + offset, data->data_ptr, chunk);
+            s_ws_audio_len = offset + chunk;
+            if (data->fin) {
+                if (s_agent_callbacks.audio_received != NULL) {
+                    s_agent_callbacks.audio_received(
+                        s_ws_audio_packet, s_ws_audio_len,
+                        s_agent_callbacks.ctx);
+                }
+                s_ws_audio_len = 0;
+                s_ws_receiving_binary = false;
+            }
+            break;
+        }
+        if (data->op_code != 0x01 && data->op_code != 0x00) {
+            break;
+        }
+        s_ws_receiving_binary = false;
+        if (data->op_code == 0x01 && data->payload_offset == 0) {
             s_ws_command_len = 0;
         }
         if (s_ws_command_len + (size_t)data->data_len >= sizeof(s_ws_command)) {
@@ -753,6 +853,11 @@ static void video_ws_event_handler(void *handler_args,
             }
 
             video_ws_handle_command(data->client, s_ws_command);
+            if (s_agent_callbacks.text_received != NULL) {
+                s_agent_callbacks.text_received(
+                    s_ws_command, s_ws_command_len,
+                    s_agent_callbacks.ctx);
+            }
             s_ws_command_len = 0;
         }
         break;
@@ -853,12 +958,33 @@ static void video_stream_report(int64_t now_us)
     ESP_LOGI(TAG,
              "[VIDEO] Queue MJPEG=%u/%u YUV=%u/1 H264=%u/%u "
              "drop_input=%" PRIu32 " drop_output=%" PRIu32 " rate_limit=%" PRIu32
-             " invalid=%" PRIu32 " send_fail=%" PRIu32 " PSRAM_free=%u KB",
+             " invalid=%" PRIu32 " send_fail=%" PRIu32,
              (unsigned)input_used, (unsigned)input_capacity,
              s_yuv_busy ? 1U : 0U, (unsigned)output_used, (unsigned)output_capacity,
              current.dropped, current.slot_dropped, current.rate_limited,
-             current.input_invalid, current.send_failed,
-             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U));
+             current.input_invalid, current.send_failed);
+
+    /* 三个内存池分开打。之前只打 PSRAM_free，而 PSRAM 一直有 23 MB 空闲——看不出
+     * 问题：实机报的是 `esp-aes: Failed to allocate memory for len buffer`，那是
+     * mbedtls 硬件 AES-GCM 从 MALLOC_CAP_DMA 里要 **16 字节**描述符都要不到
+     * （esp_aes_dma_core.c:355 AES_DMA_ALLOC_CAPS = DMA|8BIT，:841 的
+     * aes_dma_calloc(4, sizeof(uint32_t))），池子满了而不是要得太大。
+     *
+     * 这个池子就是开机日志 "Reserving pool of 146K of internal memory for
+     * DMA/internal allocations" 的那 146 KiB（CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=
+     * 150000）。同时养着 JPEG 解码器，正好对得上后半段 JPEG_DEC 从 15 ms 涨到 662 ms。
+     *
+     * free 和 largest 要一起看：free 高而 largest 小是碎片化，两个都低才是真耗尽。
+     * INT 列是内部 RAM 总量（DMA 是它的子集），用来区分"内部 RAM 整体紧张"和
+     * "只有 DMA 那一档被吃光"。 */
+    ESP_LOGI(TAG,
+             "[VIDEO] MEM DMA=%u/%u KB INT=%u/%u KB PSRAM=%u/%u KB",
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_DMA) / 1024U),
+             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_DMA) / 1024U),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024U),
+             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024U),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U),
+             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024U));
 
     /* invalid 的原因拆分，按窗口增量打印且只列非零项。这是唯一能把"整帧丢失"
      * 和"帧内损坏"分开的地方：camera_driver 的 SOI/EOI 计数看不到后者。 */
@@ -940,10 +1066,22 @@ static void video_upload_task(void *arg)
 {
     (void)arg;
 
-    const bool use_tls = (strncmp(s_ws_config.ws_url, "wss://", 6) == 0);
-    const char *ws_uri = s_ws_config.ws_url[0] != '\0'
-                         ? s_ws_config.ws_url
-                         : VIDEO_STREAM_WS_LOCAL_URL;
+    if (strncmp(s_ws_config.ws_url, "wss://", 6) != 0 ||
+        s_ws_config.token[0] == '\0' ||
+        s_ws_config.device_id[0] == '\0' ||
+        s_ws_config.client_id[0] == '\0') {
+        ESP_LOGE(TAG, "缺少 OTA WSS 地址、Token 或设备身份，视频不建立 WebSocket");
+        video_streamer_set_enabled(false);
+        for (;;) {
+            unsigned dropped_index;
+            if (xQueueReceive(s_out_ready, &dropped_index,
+                              portMAX_DELAY) == pdTRUE) {
+                xQueueSend(s_out_free, &dropped_index, portMAX_DELAY);
+            }
+        }
+    }
+
+    const char *ws_uri = s_ws_config.ws_url;
 
     esp_websocket_client_config_t ws_config = {
         .uri = ws_uri,
@@ -958,11 +1096,9 @@ static void video_upload_task(void *arg)
         .network_timeout_ms = VIDEO_WS_NETWORK_TIMEOUT_MS,
     };
 
-    if (use_tls) {
-        ws_config.transport = WEBSOCKET_TRANSPORT_OVER_SSL;
-        ws_config.cert_pem = NULL;
-        ws_config.crt_bundle_attach = esp_crt_bundle_attach;
-    }
+    ws_config.transport = WEBSOCKET_TRANSPORT_OVER_SSL;
+    ws_config.cert_pem = NULL;
+    ws_config.crt_bundle_attach = esp_crt_bundle_attach;
 
     /* 构建自定义请求头：Device-Id、Client-Id、Authorization。 */
     char ws_headers[1024] = {0};
@@ -994,10 +1130,12 @@ static void video_upload_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
+    __atomic_store_n(&s_ws_client, ws_client, __ATOMIC_SEQ_CST);
     esp_websocket_register_events(ws_client, WEBSOCKET_EVENT_ANY,
                                   video_ws_event_handler, NULL);
     if (esp_websocket_client_start(ws_client) != ESP_OK) {
         ESP_LOGE(TAG, "启动 WebSocket 客户端失败");
+        __atomic_store_n(&s_ws_client, NULL, __ATOMIC_SEQ_CST);
         esp_websocket_client_destroy(ws_client);
         vTaskDelete(NULL);
         return;
@@ -1005,7 +1143,27 @@ static void video_upload_task(void *arg)
 
     unsigned out_index;
     while (true) {
-        if (xQueueReceive(s_out_ready, &out_index, portMAX_DELAY) != pdTRUE) {
+        QueueSetMemberHandle_t ready = xQueueSelectFromSet(
+            s_upload_queue_set, portMAX_DELAY);
+
+        /* 音频包只有几十到几百字节且每 60 ms 必须发送，优先于大块 H.264。
+         * 发送仍集中在本任务，避免多个任务并发争用 WebSocket 客户端锁。 */
+        video_agent_audio_packet_t audio_packet;
+        if (xQueueReceive(s_agent_audio_queue, &audio_packet, 0) == pdTRUE) {
+            if (__atomic_load_n(&s_ws_connected, __ATOMIC_SEQ_CST) &&
+                esp_websocket_client_is_connected(ws_client)) {
+                int sent = esp_websocket_client_send_bin(
+                    ws_client, (const char *)audio_packet.data,
+                    audio_packet.size,
+                    pdMS_TO_TICKS(VIDEO_WS_AUDIO_SEND_TIMEOUT_MS));
+                if (sent != audio_packet.size) {
+                    video_stream_log_error_limited("Opus 音频发送失败", ESP_FAIL);
+                }
+            }
+            continue;
+        }
+        if (ready != s_out_ready ||
+            xQueueReceive(s_out_ready, &out_index, 0) != pdTRUE) {
             continue;
         }
         video_out_slot_t *slot = &s_out_slots[out_index];
@@ -1144,8 +1302,24 @@ static void video_codec_task(void *arg)
 #if !VIDEO_STREAM_JPEG_ONLY_TEST && !VIDEO_STREAM_YUV_ONLY_TEST
     s_out_free = xQueueCreate(VIDEO_OUT_SLOT_COUNT, sizeof(unsigned));
     s_out_ready = xQueueCreate(VIDEO_OUT_SLOT_COUNT, sizeof(unsigned));
-    if (s_out_free == NULL || s_out_ready == NULL) {
-        ESP_LOGE(TAG, "创建 H.264 输出槽队列失败");
+    s_agent_audio_queue_storage = heap_caps_calloc(
+        VIDEO_WS_AUDIO_QUEUE_DEPTH,
+        sizeof(video_agent_audio_packet_t),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_agent_audio_queue_storage != NULL) {
+        s_agent_audio_queue = xQueueCreateStatic(
+            VIDEO_WS_AUDIO_QUEUE_DEPTH,
+            sizeof(video_agent_audio_packet_t),
+            s_agent_audio_queue_storage,
+            &s_agent_audio_queue_control);
+    }
+    s_upload_queue_set = xQueueCreateSet(
+        VIDEO_OUT_SLOT_COUNT + VIDEO_WS_AUDIO_QUEUE_DEPTH);
+    if (s_out_free == NULL || s_out_ready == NULL ||
+        s_agent_audio_queue == NULL || s_upload_queue_set == NULL ||
+        xQueueAddToSet(s_out_ready, s_upload_queue_set) != pdPASS ||
+        xQueueAddToSet(s_agent_audio_queue, s_upload_queue_set) != pdPASS) {
+        ESP_LOGE(TAG, "创建视频/音频上传队列失败");
         goto codec_fail;
     }
     for (unsigned i = 0; i < VIDEO_OUT_SLOT_COUNT; ++i) {
@@ -1447,6 +1621,22 @@ codec_fail:
         vTaskDelete(NULL);
         return;
     }
+    if (s_upload_queue_set != NULL) {
+        if (s_out_ready != NULL) {
+            xQueueRemoveFromSet(s_out_ready, s_upload_queue_set);
+        }
+        if (s_agent_audio_queue != NULL) {
+            xQueueRemoveFromSet(s_agent_audio_queue, s_upload_queue_set);
+        }
+        vQueueDelete(s_upload_queue_set);
+        s_upload_queue_set = NULL;
+    }
+    if (s_agent_audio_queue != NULL) {
+        vQueueDelete(s_agent_audio_queue);
+        s_agent_audio_queue = NULL;
+    }
+    heap_caps_free(s_agent_audio_queue_storage);
+    s_agent_audio_queue_storage = NULL;
     if (s_out_ready != NULL) {
         vQueueDelete(s_out_ready);
         s_out_ready = NULL;
@@ -1482,6 +1672,53 @@ void video_streamer_set_config(const video_streamer_config_t *config)
     }
 }
 
+void video_streamer_set_agent_callbacks(
+    const video_streamer_agent_callbacks_t *callbacks)
+{
+    portENTER_CRITICAL(&s_lock);
+    if (callbacks != NULL) {
+        s_agent_callbacks = *callbacks;
+    } else {
+        memset(&s_agent_callbacks, 0, sizeof(s_agent_callbacks));
+    }
+    portEXIT_CRITICAL(&s_lock);
+}
+
+esp_err_t video_streamer_agent_send_text(const char *text)
+{
+    if (text == NULL || text[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_websocket_client_handle_t client =
+        __atomic_load_n(&s_ws_client, __ATOMIC_SEQ_CST);
+    if (client == NULL ||
+        !__atomic_load_n(&s_ws_connected, __ATOMIC_SEQ_CST)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const int length = (int)strlen(text);
+    int sent = esp_websocket_client_send_text(
+        client, text, length, pdMS_TO_TICKS(VIDEO_WS_SEND_TIMEOUT_MS));
+    return sent == length ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t video_streamer_agent_send_audio(const uint8_t *data, size_t len)
+{
+    if (data == NULL || len == 0 || len > VIDEO_WS_AUDIO_PACKET_MAX) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_agent_audio_queue == NULL ||
+        !__atomic_load_n(&s_ws_connected, __ATOMIC_SEQ_CST)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    video_agent_audio_packet_t packet = {
+        .size = (uint16_t)len,
+    };
+    memcpy(packet.data, data, len);
+    return xQueueSend(s_agent_audio_queue, &packet, 0) == pdTRUE
+               ? ESP_OK
+               : ESP_ERR_TIMEOUT;
+}
+
 esp_err_t video_streamer_init(const video_streamer_config_t *config)
 {
     if (s_initialized) {
@@ -1492,7 +1729,7 @@ esp_err_t video_streamer_init(const video_streamer_config_t *config)
         memcpy(&s_ws_config, config, sizeof(s_ws_config));
         ESP_LOGI(TAG, "WebSocket 配置已接收（init 参数）：%s", s_ws_config.ws_url);
     } else if (s_ws_config.ws_url[0] == '\0') {
-        /* 未通过 set_config 或 init 参数传入配置，使用本地 fallback */
+        /* 未通过 set_config 或 init 参数传入时保持空配置，上传任务会拒绝建连。 */
         memset(&s_ws_config, 0, sizeof(s_ws_config));
     }
 

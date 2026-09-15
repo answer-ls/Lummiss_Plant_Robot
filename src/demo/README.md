@@ -12,10 +12,47 @@
 - 摄像头帧缓冲使用 PSRAM；首页图像作为 RGB565 资源嵌入固件。
 - Network Manager 通过 ESP-Hosted/SDIO 控制板载 ESP32-C6。首次使用或清除凭据后，设备以 BLE 广播等待 App 下发 WiFi；已有凭据时直接以 STA 模式连接并通过 DHCP 获取 IPv4 地址。
 - WiFi 断开后每 2 秒自动发起重连；连接状态和 IP 信息只由 Network Manager 对外提供。
-- Video Streamer 从完整 MJPEG 帧中处理 800×600@20 FPS 上限，经 P4 硬件 JPEG 直出 YUV422、CPU 分块色度抽样/重排和 H.264 硬件编码，再由独立上传任务通过 WebSocket 实时发送到局域网 PC（每帧前置 16 字节自描述头携带分辨率与帧率）。当前编码参数为 800×600、4 Mbps、GOP 20；实测编码约 15 FPS。
-- PC 服务器使用持久 PyAV H.264 解码器逐帧解码，通过 `/preview.mjpg` 向浏览器连续推送 MJPEG；浏览器预览不再反复打开和重解整个 GOP。
+- Video Streamer 从完整 MJPEG 帧中处理 800×600@20 FPS 上限，经 P4 硬件 JPEG 直出 YUV422、CPU 分块色度抽样/重排和 H.264 硬件编码，再由独立上传任务通过 WebSocket 二进制帧发送（每帧前置 16 字节自描述头携带分辨率与帧率）。当前编码参数为 800×600、4 Mbps、GOP 20；实测编码约 15～20 FPS。
+- **上传目标已改为云端**：地址与动态 Token 来自 OTA 结果，当前为 `wss://www.lummiss.com/server/lummiss/v1/`，用 `Device-Id` / `Client-Id` / `Authorization: Bearer <token>` 三个头鉴权；`ota_client` 现在会拒绝非 `wss://` 的返回值。**代码里已无局域网地址**，PC 端 `tools/pc_camera_server.py`（8000 预览页 / 8001 WS）仍在但已无设备连接，本文件下方的旧描述属于历史。
+- 新增 `components/xiaozhi_audio`：板载 ES8311 麦克风/扬声器 + Opus 编解码 + 小智协议（hello/listen/tts/stt/ping/pong）。**它不自己建连接**，与视频共用 `video_streamer` 持有的同一条 Agent WebSocket。
 
-## 2026-09-12 最新验证状态
+## 2026-09-15 最新验证状态
+
+**视频 + 语音已同时跑在云端那条 WSS 上，语音链路本身能通，但两者共存时语音失效。**
+
+语音链路端到端打通的证据（**摄像头断开**时）：
+`小智开始回答` → `小智回答文本：{"type":"tts","state":"sentence_start",...}` →
+`小智回答结束，恢复麦克风上行`，`SPK frames` 0→62→85、`drop=0`，`mic peak=11676`。
+
+```text
+上行：16 kHz 单声道 60 ms Opus，约 106 字节/包 ≈ 14 kbps，每 5 秒 +84 包
+下行：24 kHz 单声道 60 ms Opus
+判据：SPK frames=0 且 drop=0 = 服务端没发（不是本地解码失败）
+      mic peak 几百是环境底噪（284~544），说话时才是 11676，别去调 30 dB 增益
+      本版服务端不发 stt，只能用回答内容判断识别结果
+```
+
+**A/B（同一次烧录、唯一差别是摄像头插着与否）**：
+
+| 摄像头 | 服务端回答 | 下行 |
+| --- | --- | --- |
+| 开着 | "主人，lummiss现在有点忙" / "我们稍后再试吧"（兜底话术） | `SPK frames=62`，随后 `send_fail=1`、TTS 结束后 WS 断 |
+| 断开 | "我一直都在呢，您请说。"（真实回答） | `SPK frames=46 drop=0` |
+
+候选根因有两个，**尚未区分**：(a) 协议层 —— 后端文档要求"一个 Binary payload = 一个完整
+Opus packet"，而我们把每帧十几 KB 的 H.264 也发在同一条连接上，服务端无法区分；
+(b) 资源层 —— 编解码链路每帧约 30 ms 的 PSRAM 密集访问把上行音频挤晚。区分办法：保留
+整条编解码链路但跳过 `video_streamer.c:1200` 的发送，看语音是否恢复。详见
+`../../../PROJECT_HANDOFF.md` 第 10 节与附录 A.7。
+
+**另一个独立问题：AES 的 DMA 描述符分配失败会拖垮 TLS，进而断掉整条链路。**
+报错链是 `esp-aes: Failed to allocate memory ...` → TLS 写失败 → WS 断连 →
+`JPEG_DEC` 从 15 ms 涨到 662 ms、编码掉到 0 fps。已改为 `CONFIG_MBEDTLS_HARDWARE_AES=n`
+（P4 上 AES 恒走 DMA 描述符路径、没有 Kconfig 可关，只有整个关掉硬件 AES 才能摘掉它），
+**待复测**，判据是串口里不再出现 `esp-aes:`。这条**不是**上面 A/B 的根因——摄像头断开那一场
+也有同样的报错而语音是好的。推导过程见附录 A.8。
+
+## 2026-09-12 验证状态（历史）
 
 当前烧录档位为 `CAMERA_TEST_FULL=0`（WiFi + LVGL + SD GIF + WebSocket 全开）。UVC 丢帧的
 可控变量已于本日由**同一次运行内的 A/B** 定位为**编解码链路自身的 PSRAM 流量**：链路关闭时
@@ -88,19 +125,30 @@ components/provisioning/
 └── CMakeLists.txt              官方 network_provisioning 组件依赖
 
 components/video_streamer/
-├── video_streamer.c/.h      JPEG 解码、YUV 重排、H.264 硬件编码和 HTTP 实时发送
-├── CMakeLists.txt           编码器、HTTP 与 Network Manager 依赖
-└── idf_component.yml        esp_h264 1.4.0 版本要求
+├── video_streamer.c/.h      JPEG 解码、YUV 重排、H.264 硬件编码；并持有唯一的 Agent
+│                            WebSocket（视频二进制帧 + 小智文本/Opus 都走它）
+├── CMakeLists.txt           esp_websocket_client 等依赖
+└── idf_component.yml        esp_h264 1.4.0、esp_websocket_client 版本要求
+
+components/xiaozhi_audio/
+├── xiaozhi_audio.c/.h       ES8311 采集/播放、Opus 编解码和小智协议
+└── CMakeLists.txt           esp_audio_codec、esp_codec_dev 依赖
+
+components/ota_client/
+├── ota_client.c/.h          取 OTA 结果里的 WSS 地址与动态 Token（串口只打长度不打正文）
+└── CMakeLists.txt           HTTPS/JSON 依赖
 
 components/home_info/
 ├── home_info.c/.h           自动定位、网络校时、天气 API 和线程安全快照
 └── CMakeLists.txt           HTTPS、JSON 与 Network Manager 依赖
 
 main/
-├── main.c                    唯一 app_main()，创建 FreeRTOS 任务
+├── main.c                    唯一 app_main()，创建 FreeRTOS 任务；先跑 OTA，再把结果
+│                             交给 video_streamer，然后按档位启动小智/天气/摄像头
+├── test_profile.h            启动组合档位的唯一定义点（档位 0~8 与功能位映射）
 ├── display_driver.c/.h       ST7789、LVGL 和动态时间天气首页
+├── screen_carousel.c/.h      TF 卡表情轮播（当前是 anim_bin_player 的 RGB565 BIN 双缓冲）
 ├── camera_driver.c/.h        USB Host 和 UVC 摄像头管理
-├── gif_assets.c/.h           保留的 8 组表情动画资源，当前首页不编译
 └── idf_component.yml         管理组件版本
 ```
 
@@ -161,7 +209,9 @@ cmd /c _build_main.bat
 .\_start_camera_server.bat
 ```
 
-首次运行会自动安装 `tools/camera_server_requirements.txt` 中的 PyAV、OpenCV 和 websockets。服务器启动后访问 `http://127.0.0.1:8000/`；页面显示H.264接收帧率、浏览器预览帧率和预览队列丢帧数，并提供下发命令按钮。视频帧走 WebSocket `ws://<PC>:8001/ws`，HTTP（8000）负责预览页与下行命令 `/cmd?cmd=ping|status`。
+首次运行会自动安装 `tools/camera_server_requirements.txt` 中的 PyAV、OpenCV 和 websockets。服务器启动后访问 `http://127.0.0.1:8000/`；页面显示H.264接收帧率、浏览器预览帧率和预览队列丢帧数，并提供下发命令按钮。
+
+⚠️ **这一段是历史**：视频帧原本走局域网 `ws://<PC>:8001/ws`，HTTP（8000）负责预览页与下行命令 `/cmd?cmd=ping|status`。当前固件的上传目标由 OTA 下发（`wss://www.lummiss.com/server/lummiss/v1/`），**PC 服务器还能起，但不会有设备连它**，页面会一直是 0 帧。要用它做本地预览，需要让 `video_streamer` 回到本地地址。
 
 在已经激活 ESP-IDF 5.5.5 的终端中：
 
@@ -190,6 +240,8 @@ bootloader.bin：0x5310
 5. 联网前页面显示占位符；联网后串口依次出现“网络时间同步成功”“自动定位成功”和“天气更新”，随后页面显示当前日期、星期、时间、天气和温度。
 6. 摄像头插入高速 USB 口后，串口显示 `800x600 MJPEG`、自动选择 `ISOC alt=1` 和 `Stream started`。热复位后首流可能为 0 帧，完整停止并重建后可恢复；最近一次首帧耗时约 249 ms。
 7. 完整联网档位下，`VIDEO_STREAM` 每 5 秒汇总一次，实际编码通常约 15 FPS；当前 CPU 分块版本仍需重点观察 UVC 丢帧、H.264 耗时、发送失败和网页预览丢帧，不能预期仅靠分块达到 20 FPS。
+8. OTA 完成后串口出现 `OTA 响应已接收（N 字节）`（**只打长度，不打正文**——正文含动态 Token），随后 `WS 已连接`。视频与小智共用这一条连接。
+9. `CAMERA_TEST_FULL`（档位 0）会启动小智：串口出现 `小智` 相关日志和 `MIC packets` / `SPK frames` 周期统计。说话时 `mic peak` 应到一万以上；服务端回话时 `SPK frames` 增长且 `drop=0`。**当前摄像头开着时语音会失效**（服务端回兜底话术），详见上方 2026-09-15 状态。
 
 密码错误或路由器不可达时，串口会反复出现 `WiFi 已断开`、原因码和 2 秒后重连。若在这些日志之前就出现 Hosted/SDIO 初始化失败，应先检查板载 C6 固件；厂商提供的参考固件位于 `开发板示例/JC1060P470C_I_W_Y/8-Burn operation/Burn files/JC-C6-slave_v2.3.2.bin`。
 

@@ -43,10 +43,11 @@
 #define TP_SD       (1u << 3)   /* TF 卡 + GIF 轮播 */
 #define TP_WIFI     (1u << 4)   /* Network Manager / ESP-Hosted / C6 */
 #define TP_WEATHER  (1u << 5)   /* 天气 HTTPS 和首页信息 */
+#define TP_XIAOZHI  (1u << 6)   /* 板载 ES8311 麦克风/扬声器和小智语音会话 */
 
 /* 档位 → 功能位，唯一的映射点。 */
 #if   CAMERA_TEST_PROFILE == CAMERA_TEST_FULL
-#  define TP_BITS (TP_UVC | TP_HANDOFF | TP_UI | TP_SD | TP_WIFI | TP_WEATHER)
+#  define TP_BITS (TP_UVC | TP_HANDOFF | TP_UI | TP_SD | TP_WIFI | TP_WEATHER | TP_XIAOZHI)
 #elif CAMERA_TEST_PROFILE == CAMERA_TEST_UVC_ONLY
 #  define TP_BITS (TP_UVC)
 #elif CAMERA_TEST_PROFILE == CAMERA_TEST_UVC_UI

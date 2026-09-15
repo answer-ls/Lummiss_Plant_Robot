@@ -171,7 +171,8 @@ esp_err_t ota_client_check(ota_result_t *result)
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "OTA 响应（%d 字节）：%s", (int)ota_buffer_len, ota_buffer);
+    /* OTA 响应包含 WebSocket 动态 Token，串口只能记录长度，不能输出正文。 */
+    ESP_LOGI(TAG, "OTA 响应已接收（%d 字节）", (int)ota_buffer_len);
 
     if (ota_json_field_exists(ota_buffer, "error")) {
         char err_msg[256] = {0};
@@ -226,8 +227,19 @@ esp_err_t ota_client_check(ota_result_t *result)
         ESP_LOGE(TAG, "%s", result->error);
         return ESP_FAIL;
     }
+    if (strncmp(result->websocket_url, "wss://", 6) != 0) {
+        snprintf(result->error, sizeof(result->error),
+                 "OTA 返回了非 WSS WebSocket 地址");
+        result->has_error = true;
+        ESP_LOGE(TAG, "%s", result->error);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
     if (result->websocket_token[0] == '\0') {
-        ESP_LOGW(TAG, "OTA 响应中 websocket.token 为空");
+        snprintf(result->error, sizeof(result->error),
+                 "OTA 响应中 websocket.token 为空");
+        result->has_error = true;
+        ESP_LOGE(TAG, "%s", result->error);
+        return ESP_ERR_INVALID_RESPONSE;
     }
 
     /* C. activation */

@@ -1,9 +1,11 @@
 dependencies:
-  idf: ">=5.5.3,<6.0"
+  idf: '>=5.5.3,<6.0'
   espressif/usb_host_uvc:
-    version: "2.5.1"
+    version: 2.5.1
   espressif/esp_lvgl_port:
-    version: "2.9.0"
+    version: 2.9.0
   lvgl/lvgl:
-    version: "8.4.*"
+    version: 8.4.*
     public: true
+  espressif/esp_audio_codec: ~2.4.1
+  espressif/esp_codec_dev: ~1.5.6
