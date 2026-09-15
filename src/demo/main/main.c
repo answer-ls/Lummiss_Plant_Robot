@@ -19,14 +19,16 @@
 
 static const char *TAG = "APP_MAIN";
 
+#define APP_USB_CORE 0
+#define APP_UI_CORE  1
+
 /* UI 初始化包含 LCD、LVGL 和动态时间天气首页。
- * 初始化完成后，LVGL Port 的内部任务负责定时器和屏幕刷新；本任务保持存活，
- * 后续可以在这里接收 UI 队列事件，统一执行页面和表情切换。 */
+ * 初始化完成后，LVGL Port 的内部任务负责定时器和屏幕刷新。 */
 #if TP_HAS(UI)
 static void ui_task(void *arg)
 {
     (void)arg;
-    ESP_LOGI(TAG, "UI Task 启动");
+    ESP_LOGI(TAG, "UI Task 启动（CPU%d）", xPortGetCoreID());
     display_driver_start();
 
 #if TP_HAS(SD)
@@ -39,10 +41,8 @@ static void ui_task(void *arg)
              CAMERA_TEST_PROFILE, test_profile_name());
 #endif
 
-    while (true) {
-        /* 页面刷新由 LVGL 定时器完成，本任务保留给后续 UI 事件队列。 */
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
+    /* 当前没有 UI 事件队列，初始化任务完成后退出，减少常驻空任务。 */
+    vTaskDelete(NULL);
 }
 #endif
 
@@ -50,7 +50,7 @@ static void ui_task(void *arg)
 static void camera_task(void *arg)
 {
     (void)arg;
-    ESP_LOGI(TAG, "Camera Task 启动");
+    ESP_LOGI(TAG, "Camera Task 启动（CPU%d）", xPortGetCoreID());
     camera_driver_run();
 
     /* 驱动通常不会返回；发生不可恢复错误时结束当前任务并保留系统日志。 */
@@ -63,6 +63,9 @@ void app_main(void)
     ESP_LOGI(TAG,
              "Lummiss 基础工程启动：FreeRTOS + 屏幕 + USB 摄像头 + WiFi + H.264 实时流");
     ESP_LOGI(TAG, "测试档位=%d（%s）", CAMERA_TEST_PROFILE, test_profile_name());
+    ESP_LOGI(TAG,
+             "任务分配：CPU0=USB/UVC+ESP-Hosted+WebSocket+音频，"
+             "CPU1=视频编解码+LVGL+动画");
 
     /* 设备身份：MAC (Device-Id) 和 UUID (Client-Id) 必须优先初始化，
      * OTA 请求和 WebSocket 建连均依赖这两个标识。 */
@@ -172,14 +175,16 @@ void app_main(void)
 
     BaseType_t result;
 #if TP_HAS(UI)
-    result = xTaskCreate(ui_task, "ui_task", 8192, NULL, 6, NULL);
+    result = xTaskCreatePinnedToCore(ui_task, "ui_task", 8192, NULL, 6,
+                                     NULL, APP_UI_CORE);
     assert(result == pdPASS);
 #else
     ESP_LOGI(TAG, "测试档位=%d（%s）：跳过 UI/LVGL",
              CAMERA_TEST_PROFILE, test_profile_name());
 #endif
 
-    result = xTaskCreate(camera_task, "camera_task", 8192, NULL, 7, NULL);
+    result = xTaskCreatePinnedToCore(camera_task, "camera_task", 8192, NULL, 7,
+                                     NULL, APP_USB_CORE);
     assert(result == pdPASS);
 
     ESP_LOGI(TAG, "测试档位=%d（%s）：已完成所选任务启动",

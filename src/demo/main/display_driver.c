@@ -92,7 +92,9 @@ static void lcd_initialize(esp_lcd_panel_io_handle_t *out_io,
 static void lvgl_initialize(esp_lcd_panel_io_handle_t io,
                             esp_lcd_panel_handle_t panel)
 {
-    const lvgl_port_cfg_t port_config = ESP_LVGL_PORT_INIT_CONFIG();
+    lvgl_port_cfg_t port_config = ESP_LVGL_PORT_INIT_CONFIG();
+    /* CPU0 承担 USB 与网络实时任务，LVGL 固定到 CPU1。 */
+    port_config.task_affinity = 1;
     ESP_ERROR_CHECK(lvgl_port_init(&port_config));
 
     const lvgl_port_display_cfg_t display_config = {

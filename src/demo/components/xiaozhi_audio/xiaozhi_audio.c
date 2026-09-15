@@ -20,6 +20,7 @@
 #include "esp_log.h"
 #include "esp_opus_dec.h"
 #include "esp_opus_enc.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/idf_additions.h"
@@ -48,9 +49,19 @@ static const char *TAG = "XIAOZHI_AUDIO";
 #define XIAOZHI_FRAME_DURATION_MS     60
 #define XIAOZHI_CODEC_INPUT_GAIN_DB   30.0f
 #define XIAOZHI_CODEC_OUTPUT_VOLUME   60
-#define XIAOZHI_PLAYBACK_QUEUE_DEPTH  6
+/* 深度按"下行会被突发注入多少包"定，不是按播放节奏定。
+ *
+ * 未开启 ESP_WS_CLIENT_SEPARATE_TX_LOCK 时，收发共用 client->lock：上传一帧
+ * H.264 期间下行 Opus 收不进来，锁释放后才连续回调，形成网络突发。当前已经
+ * 开启独立 TX 锁，但仍保留较深队列，用于吸收公网和 ESP-Hosted 本身的抖动。
+ * 原值 6 = 360 ms，实测第一次回答 40 帧里丢了 12 帧（30%）。
+ * 24 = 1.44 s 突发余量；存储全在 PSRAM（每包 ≤1.4 KB），不占内部内存。
+ * 队列真被打满时仍然是丢最旧、保最新的策略（见 incoming_audio_callback）。 */
+#define XIAOZHI_PLAYBACK_QUEUE_DEPTH  24
 #define XIAOZHI_MAX_OPUS_PACKET       1400
 #define XIAOZHI_PCM_BUFFER_BYTES      4096
+#define XIAOZHI_PCM_POOL_SIZE         3
+#define XIAOZHI_PCM_QUEUE_DEPTH       2
 /* 栈需求由音频编解码组件自己给出：managed_components/espressif__esp_audio_codec/
  * README.md 的 Encoder/Decoder 两节结尾——"to support all encoders the running on
  * stack size should about 40k"、"To support all decoders, the task running the
@@ -66,9 +77,21 @@ static const char *TAG = "XIAOZHI_AUDIO";
  * 以上，所以直接按厂商给的数字定，不再一点点往上加。编码和解码需求差一倍，拆开。
  * 栈落在 PSRAM（创建时带 MALLOC_CAP_SPIRAM），合计约 60 KB，不占内部 RAM。 */
 #define XIAOZHI_CAPTURE_STACK_BYTES   40960
-#define XIAOZHI_PLAYBACK_STACK_BYTES  20480
+#define XIAOZHI_DECODE_STACK_BYTES    20480
+#define XIAOZHI_OUTPUT_STACK_BYTES    6144
 #define XIAOZHI_SERVICE_STACK_BYTES   7168
 #define XIAOZHI_REPORT_MS             5000
+
+/* I2S 输出留在 CPU0，并提高到视频上传任务之上，优先及时补充 DMA；Opus 解码
+ * 移到 CPU1，与阻塞的 I2S 写入彻底分开。解码优先级略高于视频编解码，保证
+ * 每 60 ms 准备好一帧 PCM，但仍低于 USB/UVC 的实时任务。 */
+#define XIAOZHI_CAPTURE_CORE           0
+#define XIAOZHI_CAPTURE_PRIORITY       6
+#define XIAOZHI_DECODE_CORE            1
+#define XIAOZHI_DECODE_PRIORITY        9
+#define XIAOZHI_OUTPUT_CORE            0
+#define XIAOZHI_OUTPUT_PRIORITY       10
+#define XIAOZHI_SERVICE_PRIORITY       5
 
 #define XIAOZHI_EVENT_CHAT_CONNECTED  BIT0
 #define XIAOZHI_EVENT_DISCONNECTED    BIT1
@@ -80,6 +103,11 @@ typedef struct {
     uint16_t size;
     uint8_t data[XIAOZHI_MAX_OPUS_PACKET];
 } xiaozhi_opus_packet_t;
+
+typedef struct {
+    uint8_t *data;
+    uint16_t size;
+} xiaozhi_pcm_frame_t;
 
 typedef struct {
     i2c_master_bus_handle_t i2c_bus;
@@ -97,7 +125,7 @@ typedef struct {
     uint8_t *capture_raw;
     uint8_t *capture_pcm;
     uint8_t *capture_opus;
-    uint8_t *playback_pcm;
+    uint8_t *playback_pcm[XIAOZHI_PCM_POOL_SIZE];
 } xiaozhi_audio_context_t;
 
 static xiaozhi_audio_context_t s_audio;
@@ -105,9 +133,18 @@ static EventGroupHandle_t s_events;
 static QueueHandle_t s_playback_queue;
 static StaticQueue_t s_playback_queue_control;
 static uint8_t *s_playback_queue_storage;
+static QueueHandle_t s_pcm_free_queue;
+static QueueHandle_t s_pcm_ready_queue;
+static StaticQueue_t s_pcm_free_queue_control;
+static StaticQueue_t s_pcm_ready_queue_control;
+static uint8_t s_pcm_free_queue_storage[
+    XIAOZHI_PCM_POOL_SIZE * sizeof(uint8_t *)];
+static uint8_t s_pcm_ready_queue_storage[
+    XIAOZHI_PCM_QUEUE_DEPTH * sizeof(xiaozhi_pcm_frame_t)];
 static TaskHandle_t s_service_task;
 static TaskHandle_t s_capture_task;
-static TaskHandle_t s_playback_task;
+static TaskHandle_t s_decode_task;
+static TaskHandle_t s_output_task;
 static bool s_started;
 
 static uint32_t s_capture_frames;
@@ -115,7 +152,101 @@ static uint32_t s_capture_bytes;
 static uint32_t s_capture_errors;
 static uint32_t s_playback_frames;
 static uint32_t s_playback_drops;
+/* drop 的两条来源必须分开看：qovf 是"队列被突发打满、丢最旧包"（丢帧率随
+ * 网络/视频发送抖动，加深队列能治），derr 是"Opus 解码或 codec 写入失败"
+ * （加深队列没用，得看包本身或 I2S）。合在一起时报 30% 丢帧根本没法定位。 */
+static uint32_t s_playback_queue_overflow;
+static uint32_t s_playback_errors;
 static char s_session_id[80];
+
+/* 下行语音诊断只记录计数和耗时，不改变播放路径。这里使用临界区保护，
+ * 因为 WebSocket 回调和扬声器任务可能运行在不同 CPU。 */
+typedef struct {
+    uint64_t rx_bytes;
+    uint64_t rx_gap_us_total;
+    uint64_t decode_us_total;
+    uint64_t write_us_total;
+    uint64_t wait_us_total;
+    uint32_t rx_packets;
+    uint32_t rx_gap_samples;
+    uint32_t decode_calls;
+    uint32_t decode_errors;
+    uint32_t write_calls;
+    uint32_t write_errors;
+    uint32_t wait_samples;
+    uint32_t starvation_count;
+    uint32_t output_late_count;
+    uint32_t queue_peak;
+    uint32_t pcm_queue_peak;
+    uint32_t rx_gap_us_max;
+    uint32_t decode_us_max;
+    uint32_t write_us_max;
+    uint32_t wait_us_max;
+    uint32_t output_gap_us_max;
+    int64_t last_rx_us;
+    int64_t last_output_us;
+    bool output_started;
+    bool decode_in_flight;
+    bool output_in_flight;
+} xiaozhi_playback_stats_t;
+
+static xiaozhi_playback_stats_t s_playback_stats;
+static portMUX_TYPE s_playback_stats_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static uint32_t elapsed_us_clamped(int64_t start_us, int64_t end_us)
+{
+    const int64_t elapsed = end_us - start_us;
+    return elapsed <= 0 ? 0U :
+           elapsed > UINT32_MAX ? UINT32_MAX : (uint32_t)elapsed;
+}
+
+static void update_max_u32(uint32_t *maximum, uint32_t value)
+{
+    if (value > *maximum) {
+        *maximum = value;
+    }
+}
+
+static void reset_speech_timing_stats(void)
+{
+    const uint32_t queue_depth = s_playback_queue == NULL
+        ? 0U : uxQueueMessagesWaiting(s_playback_queue);
+    portENTER_CRITICAL(&s_playback_stats_lock);
+    s_playback_stats.last_rx_us = 0;
+    s_playback_stats.last_output_us = 0;
+    s_playback_stats.output_started = false;
+    s_playback_stats.queue_peak = queue_depth;
+    s_playback_stats.pcm_queue_peak = 0;
+    s_playback_stats.rx_gap_us_max = 0;
+    s_playback_stats.decode_us_max = 0;
+    s_playback_stats.write_us_max = 0;
+    s_playback_stats.wait_us_max = 0;
+    s_playback_stats.output_gap_us_max = 0;
+    portEXIT_CRITICAL(&s_playback_stats_lock);
+}
+
+static bool playback_pipeline_empty(void)
+{
+    bool work_in_flight;
+    portENTER_CRITICAL(&s_playback_stats_lock);
+    work_in_flight = s_playback_stats.decode_in_flight ||
+                     s_playback_stats.output_in_flight;
+    portEXIT_CRITICAL(&s_playback_stats_lock);
+
+    return !work_in_flight &&
+           (s_playback_queue == NULL ||
+            uxQueueMessagesWaiting(s_playback_queue) == 0) &&
+           (s_pcm_ready_queue == NULL ||
+            uxQueueMessagesWaiting(s_pcm_ready_queue) == 0);
+}
+
+static void restore_uplink_after_playback(void)
+{
+    if ((xEventGroupGetBits(s_events) & XIAOZHI_EVENT_SPEAKING) == 0 &&
+        playback_pipeline_empty()) {
+        xEventGroupSetBits(s_events, XIAOZHI_EVENT_UPLINK_ENABLED);
+    }
+}
 
 static void stop_worker_tasks(void)
 {
@@ -125,9 +256,13 @@ static void stop_worker_tasks(void)
         vTaskDeleteWithCaps(s_capture_task);
         s_capture_task = NULL;
     }
-    if (s_playback_task != NULL) {
-        vTaskDeleteWithCaps(s_playback_task);
-        s_playback_task = NULL;
+    if (s_decode_task != NULL) {
+        vTaskDeleteWithCaps(s_decode_task);
+        s_decode_task = NULL;
+    }
+    if (s_output_task != NULL) {
+        vTaskDeleteWithCaps(s_output_task);
+        s_output_task = NULL;
     }
 }
 
@@ -136,11 +271,13 @@ static void audio_hw_cleanup(void)
     heap_caps_free(s_audio.capture_pcm);
     heap_caps_free(s_audio.capture_raw);
     heap_caps_free(s_audio.capture_opus);
-    heap_caps_free(s_audio.playback_pcm);
     s_audio.capture_pcm = NULL;
     s_audio.capture_raw = NULL;
     s_audio.capture_opus = NULL;
-    s_audio.playback_pcm = NULL;
+    for (size_t i = 0; i < XIAOZHI_PCM_POOL_SIZE; i++) {
+        heap_caps_free(s_audio.playback_pcm[i]);
+        s_audio.playback_pcm[i] = NULL;
+    }
 
     if (s_audio.opus_encoder != NULL) {
         esp_opus_enc_close(s_audio.opus_encoder);
@@ -372,8 +509,9 @@ static esp_err_t audio_codec_init(void)
 
 static esp_err_t audio_work_buffers_init(void)
 {
-    /* I2S DMA 直接读写的 PCM 必须放内部 DMA 内存；Opus 包也保持在内部 RAM，
-     * 避免编解码库访问不支持 DMA 的地址。四个缓冲只在启动时申请一次。 */
+    /* 采集缓冲继续使用内部内存。播放 PCM 放 PSRAM：IDF 的 i2s_channel_write()
+     * 会 memcpy 到驱动自己的 DMA 描述符，不要求调用方缓冲本身具备 DMA 能力。
+     * 这样新增双缓冲不会挤占日志中最低只剩约 1 KB 的 DMA 堆。 */
     const size_t capture_raw_size =
         (size_t)s_audio.encoder_input_size *
         XIAOZHI_CODEC_SAMPLE_RATE / XIAOZHI_UPLINK_SAMPLE_RATE;
@@ -386,14 +524,22 @@ static esp_err_t audio_work_buffers_init(void)
     s_audio.capture_opus = heap_caps_malloc(
         (size_t)s_audio.encoder_output_size,
         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    s_audio.playback_pcm = heap_caps_malloc(
-        XIAOZHI_PCM_BUFFER_BYTES,
-        MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    for (size_t i = 0; i < XIAOZHI_PCM_POOL_SIZE; i++) {
+        s_audio.playback_pcm[i] = heap_caps_malloc(
+            XIAOZHI_PCM_BUFFER_BYTES,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
     if (s_audio.capture_raw == NULL || s_audio.capture_pcm == NULL ||
-        s_audio.capture_opus == NULL ||
-        s_audio.playback_pcm == NULL) {
+        s_audio.capture_opus == NULL) {
         ESP_LOGE(TAG, "小智音频工作缓冲分配失败");
         return ESP_ERR_NO_MEM;
+    }
+    for (size_t i = 0; i < XIAOZHI_PCM_POOL_SIZE; i++) {
+        if (s_audio.playback_pcm[i] == NULL) {
+            ESP_LOGE(TAG, "小智 PCM 缓冲池分配失败：%u/%u",
+                     (unsigned)i, XIAOZHI_PCM_POOL_SIZE);
+            return ESP_ERR_NO_MEM;
+        }
     }
     return ESP_OK;
 }
@@ -417,20 +563,86 @@ static void resample_mic_24k_to_16k(const int16_t *input,
 static void report_audio_stats(uint32_t peak)
 {
     static TickType_t last_report_tick;
+    static xiaozhi_playback_stats_t previous;
     const TickType_t now = xTaskGetTickCount();
     if ((now - last_report_tick) < pdMS_TO_TICKS(XIAOZHI_REPORT_MS)) {
         return;
     }
     last_report_tick = now;
+
+    xiaozhi_playback_stats_t current;
+    portENTER_CRITICAL(&s_playback_stats_lock);
+    current = s_playback_stats;
+    /* 峰值按 5 秒窗口重新开始，便于把卡顿时刻与 VIDEO 日志对齐。 */
+    s_playback_stats.queue_peak = 0;
+    s_playback_stats.pcm_queue_peak = 0;
+    s_playback_stats.rx_gap_us_max = 0;
+    s_playback_stats.decode_us_max = 0;
+    s_playback_stats.write_us_max = 0;
+    s_playback_stats.wait_us_max = 0;
+    s_playback_stats.output_gap_us_max = 0;
+    portEXIT_CRITICAL(&s_playback_stats_lock);
+
+    const uint32_t rx_gap_samples =
+        current.rx_gap_samples - previous.rx_gap_samples;
+    const uint32_t decode_calls = current.decode_calls - previous.decode_calls;
+    const uint32_t write_calls = current.write_calls - previous.write_calls;
+    const uint32_t wait_samples = current.wait_samples - previous.wait_samples;
+    const uint32_t rx_gap_avg_us = rx_gap_samples == 0 ? 0U : (uint32_t)(
+        (current.rx_gap_us_total - previous.rx_gap_us_total) / rx_gap_samples);
+    const uint32_t decode_avg_us = decode_calls == 0 ? 0U : (uint32_t)(
+        (current.decode_us_total - previous.decode_us_total) / decode_calls);
+    const uint32_t write_avg_us = write_calls == 0 ? 0U : (uint32_t)(
+        (current.write_us_total - previous.write_us_total) / write_calls);
+    const uint32_t wait_avg_us = wait_samples == 0 ? 0U : (uint32_t)(
+        (current.wait_us_total - previous.wait_us_total) / wait_samples);
+
     ESP_LOGI(TAG,
              "MIC packets=%" PRIu32 " bytes=%" PRIu32 " peak=%" PRIu32
-             " read_err=%" PRIu32 " | SPK frames=%" PRIu32 " drop=%" PRIu32,
+             " read_err=%" PRIu32 " | SPK frames=%" PRIu32 " drop=%" PRIu32
+             " (qovf=%" PRIu32 " derr=%" PRIu32
+             " queue=%u/%u)",
              s_capture_frames,
              s_capture_bytes,
              peak,
              s_capture_errors,
              s_playback_frames,
-             s_playback_drops);
+             s_playback_drops,
+             s_playback_queue_overflow,
+             s_playback_errors,
+             s_playback_queue == NULL
+                 ? 0U
+                 : (unsigned)uxQueueMessagesWaiting(s_playback_queue),
+             XIAOZHI_PLAYBACK_QUEUE_DEPTH);
+    ESP_LOGI(TAG,
+             "AUDIO_DIAG 5s: rx=%" PRIu32 " bytes=%" PRIu64
+             " gap_avg/max=%" PRIu32 "/%" PRIu32 "us"
+             " | opus_q=%u/%" PRIu32 " pcm_q=%u/%" PRIu32
+             " | dec_avg/max=%" PRIu32 "/%" PRIu32 "us err=%" PRIu32
+             " | i2s_avg/max=%" PRIu32 "/%" PRIu32 "us err=%" PRIu32
+             " | wait_avg/max=%" PRIu32 "/%" PRIu32
+             "us starve=%" PRIu32 " out_gap_max=%" PRIu32
+             "us late=%" PRIu32,
+             current.rx_packets - previous.rx_packets,
+             current.rx_bytes - previous.rx_bytes,
+             rx_gap_avg_us, current.rx_gap_us_max,
+             s_playback_queue == NULL
+                 ? 0U
+                 : (unsigned)uxQueueMessagesWaiting(s_playback_queue),
+             current.queue_peak,
+             s_pcm_ready_queue == NULL
+                 ? 0U
+                 : (unsigned)uxQueueMessagesWaiting(s_pcm_ready_queue),
+             current.pcm_queue_peak,
+             decode_avg_us, current.decode_us_max,
+             current.decode_errors - previous.decode_errors,
+             write_avg_us, current.write_us_max,
+             current.write_errors - previous.write_errors,
+             wait_avg_us, current.wait_us_max,
+             current.starvation_count - previous.starvation_count,
+             current.output_gap_us_max,
+             current.output_late_count - previous.output_late_count);
+    previous = current;
 }
 
 static void capture_task(void *arg)
@@ -500,17 +712,32 @@ static void capture_task(void *arg)
     }
 }
 
-static void playback_task(void *arg)
+static void decode_task(void *arg)
 {
     (void)arg;
-    uint8_t *pcm = s_audio.playback_pcm;
-
     xiaozhi_opus_packet_t packet;
     for (;;) {
         if (xQueueReceive(s_playback_queue, &packet, portMAX_DELAY) != pdTRUE) {
             continue;
         }
         if ((xEventGroupGetBits(s_events) & XIAOZHI_EVENT_CHANNEL_ACTIVE) == 0) {
+            continue;
+        }
+
+        /* 缓冲池有三个块：一个供解码器写入，最多两个在 PCM 就绪队列中。
+         * 只有扬声器写完后才归还，保证解码器不会覆盖正在播放的数据。 */
+        portENTER_CRITICAL(&s_playback_stats_lock);
+        s_playback_stats.decode_in_flight = true;
+        portEXIT_CRITICAL(&s_playback_stats_lock);
+
+        uint8_t *pcm = NULL;
+        if (xQueueReceive(s_pcm_free_queue, &pcm, portMAX_DELAY) != pdTRUE ||
+            pcm == NULL) {
+            portENTER_CRITICAL(&s_playback_stats_lock);
+            s_playback_stats.decode_in_flight = false;
+            portEXIT_CRITICAL(&s_playback_stats_lock);
+            s_playback_drops++;
+            s_playback_errors++;
             continue;
         }
 
@@ -523,19 +750,116 @@ static void playback_task(void *arg)
             .len = XIAOZHI_PCM_BUFFER_BYTES,
         };
         esp_audio_dec_info_t info = {0};
+        const int64_t decode_start_us = esp_timer_get_time();
         esp_audio_err_t audio_error = esp_opus_dec_decode(
             s_audio.opus_decoder, &input, &output, &info);
+        const uint32_t decode_us = elapsed_us_clamped(
+            decode_start_us, esp_timer_get_time());
+        portENTER_CRITICAL(&s_playback_stats_lock);
+        s_playback_stats.decode_calls++;
+        s_playback_stats.decode_us_total += decode_us;
+        update_max_u32(&s_playback_stats.decode_us_max, decode_us);
         if (audio_error != ESP_AUDIO_ERR_OK || output.decoded_size == 0) {
+            s_playback_stats.decode_errors++;
+            s_playback_stats.decode_in_flight = false;
+            portEXIT_CRITICAL(&s_playback_stats_lock);
+            xQueueSend(s_pcm_free_queue, &pcm, portMAX_DELAY);
             s_playback_drops++;
+            s_playback_errors++;
             continue;
         }
-        if (esp_codec_dev_write(s_audio.codec_device,
-                                pcm,
-                                (int)output.decoded_size) != ESP_CODEC_DEV_OK) {
+        portEXIT_CRITICAL(&s_playback_stats_lock);
+
+        xiaozhi_pcm_frame_t frame = {
+            .data = pcm,
+            .size = (uint16_t)output.decoded_size,
+        };
+        if (xQueueSend(s_pcm_ready_queue, &frame, portMAX_DELAY) != pdTRUE) {
+            xQueueSend(s_pcm_free_queue, &pcm, portMAX_DELAY);
             s_playback_drops++;
+            s_playback_errors++;
+        }
+
+        const uint32_t pcm_depth = uxQueueMessagesWaiting(s_pcm_ready_queue);
+        portENTER_CRITICAL(&s_playback_stats_lock);
+        update_max_u32(&s_playback_stats.pcm_queue_peak, pcm_depth);
+        s_playback_stats.decode_in_flight = false;
+        portEXIT_CRITICAL(&s_playback_stats_lock);
+        restore_uplink_after_playback();
+    }
+}
+
+static void output_task(void *arg)
+{
+    (void)arg;
+    xiaozhi_pcm_frame_t frame;
+
+    for (;;) {
+        const int64_t wait_start_us = esp_timer_get_time();
+        if (xQueueReceive(s_pcm_ready_queue, &frame, portMAX_DELAY) != pdTRUE) {
             continue;
         }
+        const uint32_t wait_us = elapsed_us_clamped(
+            wait_start_us, esp_timer_get_time());
+
+        portENTER_CRITICAL(&s_playback_stats_lock);
+        s_playback_stats.output_in_flight = true;
+        if (s_playback_stats.output_started) {
+            s_playback_stats.wait_samples++;
+            s_playback_stats.wait_us_total += wait_us;
+            update_max_u32(&s_playback_stats.wait_us_max, wait_us);
+            if (wait_us > (XIAOZHI_FRAME_DURATION_MS + 15U) * 1000U) {
+                s_playback_stats.starvation_count++;
+            }
+        }
+        portEXIT_CRITICAL(&s_playback_stats_lock);
+
+        if ((xEventGroupGetBits(s_events) & XIAOZHI_EVENT_CHANNEL_ACTIVE) == 0) {
+            xQueueSend(s_pcm_free_queue, &frame.data, portMAX_DELAY);
+            portENTER_CRITICAL(&s_playback_stats_lock);
+            s_playback_stats.output_in_flight = false;
+            portEXIT_CRITICAL(&s_playback_stats_lock);
+            continue;
+        }
+
+        const int64_t write_start_us = esp_timer_get_time();
+        const int codec_result = esp_codec_dev_write(
+            s_audio.codec_device, frame.data, frame.size);
+        const int64_t write_end_us = esp_timer_get_time();
+        const uint32_t write_us = elapsed_us_clamped(
+            write_start_us, write_end_us);
+
+        portENTER_CRITICAL(&s_playback_stats_lock);
+        s_playback_stats.write_calls++;
+        s_playback_stats.write_us_total += write_us;
+        update_max_u32(&s_playback_stats.write_us_max, write_us);
+        if (codec_result != ESP_CODEC_DEV_OK) {
+            s_playback_stats.write_errors++;
+            s_playback_stats.output_in_flight = false;
+            portEXIT_CRITICAL(&s_playback_stats_lock);
+            xQueueSend(s_pcm_free_queue, &frame.data, portMAX_DELAY);
+            s_playback_drops++;
+            s_playback_errors++;
+            continue;
+        }
+        if (s_playback_stats.last_output_us != 0) {
+            const uint32_t output_gap_us = elapsed_us_clamped(
+                s_playback_stats.last_output_us, write_start_us);
+            update_max_u32(&s_playback_stats.output_gap_us_max, output_gap_us);
+            if (output_gap_us > (XIAOZHI_FRAME_DURATION_MS + 15U) * 1000U) {
+                s_playback_stats.output_late_count++;
+            }
+        }
+        s_playback_stats.last_output_us = write_start_us;
+        s_playback_stats.output_started = true;
+        s_playback_stats.output_in_flight = false;
+        portEXIT_CRITICAL(&s_playback_stats_lock);
         s_playback_frames++;
+        xQueueSend(s_pcm_free_queue, &frame.data, portMAX_DELAY);
+
+        /* tts/stop 可能先于 I2S 播完最后几包到达。等队列真正排空后再恢复
+         * 麦克风，避免把扬声器尾音重新上传给服务端。 */
+        restore_uplink_after_playback();
     }
 }
 
@@ -545,8 +869,23 @@ static void incoming_audio_callback(const uint8_t *data, size_t len, void *ctx)
     if (data == NULL || len == 0 || len > XIAOZHI_MAX_OPUS_PACKET ||
         s_playback_queue == NULL) {
         s_playback_drops++;
+        s_playback_errors++;
         return;
     }
+
+    const int64_t now_us = esp_timer_get_time();
+    portENTER_CRITICAL(&s_playback_stats_lock);
+    s_playback_stats.rx_packets++;
+    s_playback_stats.rx_bytes += len;
+    if (s_playback_stats.last_rx_us != 0) {
+        const uint32_t gap_us = elapsed_us_clamped(
+            s_playback_stats.last_rx_us, now_us);
+        s_playback_stats.rx_gap_samples++;
+        s_playback_stats.rx_gap_us_total += gap_us;
+        update_max_u32(&s_playback_stats.rx_gap_us_max, gap_us);
+    }
+    s_playback_stats.last_rx_us = now_us;
+    portEXIT_CRITICAL(&s_playback_stats_lock);
 
     xiaozhi_opus_packet_t packet = {
         .size = (uint16_t)len,
@@ -554,6 +893,7 @@ static void incoming_audio_callback(const uint8_t *data, size_t len, void *ctx)
     memcpy(packet.data, data, len);
     if (xQueueSend(s_playback_queue, &packet, 0) != pdTRUE) {
         /* 扬声器来不及播放时丢掉最旧包，优先保持实时性。 */
+        s_playback_queue_overflow++;
         xiaozhi_opus_packet_t oldest;
         if (xQueueReceive(s_playback_queue, &oldest, 0) == pdTRUE) {
             s_playback_drops++;
@@ -562,6 +902,11 @@ static void incoming_audio_callback(const uint8_t *data, size_t len, void *ctx)
             s_playback_drops++;
         }
     }
+
+    const uint32_t queue_depth = uxQueueMessagesWaiting(s_playback_queue);
+    portENTER_CRITICAL(&s_playback_stats_lock);
+    update_max_u32(&s_playback_stats.queue_peak, queue_depth);
+    portEXIT_CRITICAL(&s_playback_stats_lock);
 }
 
 static void server_connection_callback(bool connected, void *ctx)
@@ -686,13 +1031,18 @@ static void server_text_callback(const char *text, size_t len, void *ctx)
             return;
         }
         if (strcmp(state, "start") == 0) {
+            reset_speech_timing_stats();
             xEventGroupClearBits(s_events, XIAOZHI_EVENT_UPLINK_ENABLED);
             xEventGroupSetBits(s_events, XIAOZHI_EVENT_SPEAKING);
             ESP_LOGI(TAG, "小智开始回答");
         } else if (strcmp(state, "stop") == 0) {
             xEventGroupClearBits(s_events, XIAOZHI_EVENT_SPEAKING);
-            xEventGroupSetBits(s_events, XIAOZHI_EVENT_UPLINK_ENABLED);
-            ESP_LOGI(TAG, "小智回答结束，恢复麦克风上行");
+            if (playback_pipeline_empty()) {
+                xEventGroupSetBits(s_events, XIAOZHI_EVENT_UPLINK_ENABLED);
+                ESP_LOGI(TAG, "小智回答结束，恢复麦克风上行");
+            } else {
+                ESP_LOGI(TAG, "服务端回答结束，等待扬声器播放完剩余音频");
+            }
         } else if (strcmp(state, "sentence_start") == 0) {
             ESP_LOGI(TAG, "小智回答文本：%.*s", (int)len, text);
         }
@@ -709,6 +1059,14 @@ static void abort_audio_service(void)
     if (s_playback_queue != NULL) {
         vQueueDelete(s_playback_queue);
         s_playback_queue = NULL;
+    }
+    if (s_pcm_ready_queue != NULL) {
+        vQueueDelete(s_pcm_ready_queue);
+        s_pcm_ready_queue = NULL;
+    }
+    if (s_pcm_free_queue != NULL) {
+        vQueueDelete(s_pcm_free_queue);
+        s_pcm_free_queue = NULL;
     }
     heap_caps_free(s_playback_queue_storage);
     s_playback_queue_storage = NULL;
@@ -752,13 +1110,45 @@ static void service_task(void *arg)
         return;
     }
 
+    s_pcm_free_queue = xQueueCreateStatic(
+        XIAOZHI_PCM_POOL_SIZE,
+        sizeof(uint8_t *),
+        s_pcm_free_queue_storage,
+        &s_pcm_free_queue_control);
+    s_pcm_ready_queue = xQueueCreateStatic(
+        XIAOZHI_PCM_QUEUE_DEPTH,
+        sizeof(xiaozhi_pcm_frame_t),
+        s_pcm_ready_queue_storage,
+        &s_pcm_ready_queue_control);
+    if (s_pcm_free_queue == NULL || s_pcm_ready_queue == NULL) {
+        ESP_LOGE(TAG, "创建小智 PCM 双缓冲队列失败");
+        abort_audio_service();
+        return;
+    }
+    for (size_t i = 0; i < XIAOZHI_PCM_POOL_SIZE; i++) {
+        if (xQueueSend(s_pcm_free_queue,
+                       &s_audio.playback_pcm[i], 0) != pdTRUE) {
+            ESP_LOGE(TAG, "初始化小智 PCM 缓冲池失败");
+            abort_audio_service();
+            return;
+        }
+    }
+
     BaseType_t task_result = xTaskCreatePinnedToCoreWithCaps(
-        capture_task, "xiaozhi_mic", XIAOZHI_CAPTURE_STACK_BYTES, NULL, 6,
-        &s_capture_task, 0, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        output_task, "xiaozhi_spk", XIAOZHI_OUTPUT_STACK_BYTES, NULL,
+        XIAOZHI_OUTPUT_PRIORITY, &s_output_task, XIAOZHI_OUTPUT_CORE,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (task_result == pdPASS) {
         task_result = xTaskCreatePinnedToCoreWithCaps(
-            playback_task, "xiaozhi_spk", XIAOZHI_PLAYBACK_STACK_BYTES, NULL, 6,
-            &s_playback_task, 0, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            decode_task, "xiaozhi_dec", XIAOZHI_DECODE_STACK_BYTES, NULL,
+            XIAOZHI_DECODE_PRIORITY, &s_decode_task, XIAOZHI_DECODE_CORE,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    if (task_result == pdPASS) {
+        task_result = xTaskCreatePinnedToCoreWithCaps(
+            capture_task, "xiaozhi_mic", XIAOZHI_CAPTURE_STACK_BYTES, NULL,
+            XIAOZHI_CAPTURE_PRIORITY, &s_capture_task, XIAOZHI_CAPTURE_CORE,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     }
     if (task_result != pdPASS) {
         ESP_LOGE(TAG, "创建小智音频工作任务失败");
@@ -766,13 +1156,17 @@ static void service_task(void *arg)
         return;
     }
 
-    ESP_LOGI(TAG, "小智已注册到共享 Agent WebSocket，等待 OTA 鉴权连接");
+    ESP_LOGI(TAG,
+             "小智音频流水线已就绪：MIC=CPU%d/P%d，DEC=CPU%d/P%d，"
+             "SPK=CPU%d/P%d，PCM=%u帧",
+             XIAOZHI_CAPTURE_CORE, XIAOZHI_CAPTURE_PRIORITY,
+             XIAOZHI_DECODE_CORE, XIAOZHI_DECODE_PRIORITY,
+             XIAOZHI_OUTPUT_CORE, XIAOZHI_OUTPUT_PRIORITY,
+             XIAOZHI_PCM_QUEUE_DEPTH);
 
-    /* WebSocket 的断线和重连由 video_streamer 管理；音频任务只根据回调
-     * 更新状态，不再创建第二条连接。 */
-    for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
+    /* 初始化已完成；收发由 MIC、SPK 和 WebSocket 任务负责，无需保留空转任务。 */
+    s_service_task = NULL;
+    vTaskDeleteWithCaps(NULL);
 }
 
 esp_err_t xiaozhi_audio_start(void)
@@ -800,9 +1194,9 @@ esp_err_t xiaozhi_audio_start(void)
         "xiaozhi_service",
         XIAOZHI_SERVICE_STACK_BYTES,
         NULL,
-        5,
+        XIAOZHI_SERVICE_PRIORITY,
         &s_service_task,
-        0,
+        XIAOZHI_CAPTURE_CORE,
         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (result != pdPASS) {
         s_started = false;

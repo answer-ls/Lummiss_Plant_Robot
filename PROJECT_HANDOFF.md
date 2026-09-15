@@ -12,7 +12,7 @@
 - 阶段 8 当前链路为 `800×600 MJPEG(YUV422) → P4 硬件 JPEG 直出 YUV422 → CPU 分块抽样/重排 O_UYY_E_VYY → H.264 硬件编码`；网络上传代码仍保留，但当前烧录的对照档位关闭 WebSocket。首帧超时会完整停止并确认 USB transfer 回调退出，再执行 USB Host/UVC 重建；本轮首帧重建后约 249 ms 成功。实测完整档位下 UVC 完整帧约 20～30 FPS、丢帧 19%～29%（2026-09-12 由同一次运行内的 A/B 定位为**编解码链路自身的 PSRAM 流量**，见第 7 节），H.264 实际约 15～20 FPS，**800×600@20 FPS 目标尚未达成**。RGB565 全帧 BT.601 软件换算已删除，编解码与网络上传已拆成两个 FreeRTOS 任务。
 - 2026-09-11 已确认：当前 P4 v1.3 + ESP-IDF 5.5.5 不能可靠使用 PPA/DMA2D 做 YUV422→YUV420；工程保留能力探测并回退 CPU。CPU 转换改为 8 个 2 行宏块一段，块间调度让出并插入 20 µs 短空隙，当前转换耗时约 15.0～15.4 ms。该改动未使短测 UVC 丢帧明显下降，剩余瓶颈仍是 H.264/PSRAM 与 USB ISOC 的长期争用或调度。
 - **2026-09-15 视频上传目标变更**：视频不再指向局域网 PC 的 `ws://<PC>:8001/ws`。该路径已断——代码里没有硬编码地址，`main.c` 只从 OTA 结果取 `websocket_url`，且 `ota_client.c` 现在会拒绝非 `wss://` 的返回值；而 PC 端 8001 服务与 8000 预览页仍在，但已经没有设备会连它。**当前视频与小智语音推的是同一条连接**：`wss://www.lummiss.com/server/lummiss/v1/`，用 OTA 下发的动态 Token 加 `Device-Id`/`Client-Id` 头鉴权。仓库内 `README.md` 与 `CAMERA_UPLOAD_TEST.md` 仍是旧 PC 地址的描述，尚未更新。
-- **2026-09-15 音频与小智**：新增 `components/xiaozhi_audio`（板载 ES8311 采集/播放 + Opus 编解码 + 小智协议）。语音链路**已端到端打通**（上行 Opus → 服务端 ASR → LLM → TTS → 下行 Opus 播放），但**与视频共存时失效**——已由 A/B 确认，是当前第一优先级问题，见第 10 节与附录 A.7。
+- **2026-09-15 音频与小智**：新增 `components/xiaozhi_audio`（板载 ES8311 采集/播放 + Opus 编解码 + 小智协议）。语音链路**已端到端打通**（上行 Opus → 服务端 ASR → LLM → TTS → 下行 Opus 播放），且**摄像头推流时同样可用**——同日稍早那份"与视频共存时失效"的 A/B 结论**已被推翻**（更正见附录 A.7）。当前第一优先级问题改为**内部 DMA 池被挤碎**、ESP-Hosted 收包路径取不到缓冲就 assert 重启，见第 10 节第 1 条与附录 A.9。
 - UI 状态机、传感器、触摸、LED、电机、专注模式、电源管理和整机联调均未进入实现阶段。
 
 开发流程基线为根目录的 `盆栽陪伴机器人_开发文档.md`。本文只记录当前事实和下一步，不替代该设计文档。
@@ -303,36 +303,66 @@ VS Code 当前默认使用 `build_main_verified`，生成器必须为 Ninja。�
 
 ### 2026-09-15 新增（优先级高于下方各条）
 
-1. **视频和语音挤在同一条 WebSocket 上，把语音链路搞坏了——已由 A/B 确认，但根因还没定到具体机制。**
-   同一次烧录、同一段代码，只改"摄像头是否插着"：摄像头**开着**时，无论问什么都回兜底话术
-   （"主人，lummiss现在有点忙" / "我们稍后再试吧"）；摄像头**断开**时回真实答案
-   （"我一直都在呢，您请说。"，`SPK frames=46 drop=0`）。两次的麦克风电平、上行包数、
-   下行播放都正常，差别只在回答内容。**候选机制有两个，尚未区分**：
+1. **全系统共用的那块内部 DMA 池被挤碎，ESP-Hosted 收包路径取不到缓冲就 assert 重启
+   ——这是当前第一优先级问题。**
 
-   - **(a) 协议层**：后端文档 §6.1 规定"一个 Binary payload = 一个完整 Opus packet，禁止附加
-     WAV 头/Ogg/JSON/长度/序号/时间戳，禁止合并或拆分"。而我们把每帧十几 KB 的 H.264 也以
-     二进制帧发在同一条连接上，**服务端无法区分**，只能按 Opus 解 → 解出垃圾。
-   - **(b) 资源层**：编解码链路每帧约 30 ms 的 PSRAM 密集访问（JPEG 6.7 + YUV 重排 15.3 +
-     编码 8.3）把上行音频挤晚，ASR 收到断续音频。
+   启动日志里 `esp_psram: Reserving pool of 146K of internal memory for DMA/internal
+   allocations` 那一行就是它，大小 = `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL`（当前
+   150000）。所有需要内部 DMA 的东西——Hosted SDIO、USB URB、I2S、LCD/SPI、JPEG/H264
+   驱动、LVGL 绘制缓冲、FatFS 的 bounce、音频 codec——都从**这同一块池子**取。
+   **实测它整场只剩 3～13 KB 空闲、最大连续块 1 KB**，也就是
+   `[VIDEO] MEM DMA=x/y KB` 里的 y。
 
-   一次构建就能区分：**摄像头照常跑、编码照常做，只是不往 WS 发视频帧**。语音恢复 → (a)；
-   语音仍坏 → (b)，要从任务优先级/钉核下手。`video_streamer.c:1200` 是唯一的视频发送点。
+   ESP-Hosted 的 SDIO 收包路径（`CONFIG_ESP_HOSTED_SDIO_OPTIMIZATION_RX_STREAMING_MODE=y`
+   选中的 streaming 分支）要为**每个包**取一块 **1664 字节、64 字节对齐**的内部 DMA 缓冲，
+   **取不到直接 `assert`，没有错误分支**：
 
-   **顺带更正**：此前"没有 `stt` 消息 = 服务端没识别出来"的说法是错的。摄像头断开那一场
-   同样没有 `stt`，服务端却听懂了。这个配置下服务端不发 `stt`，判据只能是回答内容。
+   ```text
+   assert failed: sdio_push_data_to_queue sdio_drv.c:862 (pkt_rxbuff)
+   --- 0x480210b0: hosted_malloc_align at port_esp_hosted_host_os.c:132
+   --- 0x480205c2: sdio_push_data_to_queue at sdio_drv.c:866
+   --- 0x480206fa: sdio_data_to_rx_buf_task at sdio_drv.c:904
+   ```
 
-2. **视频为什么必须在 WS 语义上离开语音通道（结构性，不是调参）。**
-   即便 (b) 才是主因，视频和 Opus 共用一条连接本身也是错的：后端文档明确禁止在同一条
-   Agent 连接上混发非 Opus 二进制帧，而且视频的 4 Mbps 会给语音加队头阻塞。后端目前**没有**
-   给出独立的视频上传端点（文档 §3/§4 只定义了 OTA 和这一条 Agent WS），所以要么向后端要
-   一个视频专用端点，要么视频暂时回到本地/明文通道，不能继续混在 Agent 连接里。
+   实测 `[VIDEO] MEM DMA=10/1 KB INT=13/1 KB PSRAM=23174/23040 KB` 之后立刻崩在这一行
+   （运行 64.8 秒处）。**注意 PSRAM 那边空着 23 MB——这是碎片，不是总量不够。**
 
-3. **AES 的 DMA 描述符分配失败会拖垮 TLS，进而断掉整条语音+视频链路。**
+   同一块池子被挤空时还会连带出这一串（都不必单独去查）：
+   `allocate_dma_buf: not enough mem`（表情动画读不出来）、
+   `transport: STA TX transport buffer unavailable, drop=1`（这一条会优雅丢弃）、
+   TLS `PK verify failed 0x4290` + `HOME_INFO: HTTPS 请求失败`。
+
+   **两个旋钮**（详细代码路径见附录 A.9）：
+
+   - **把占用还回去**：每个长期占着的内部 DMA 缓冲都值钱。已删掉 `anim_bin_player.c`
+     里那块 16 KB 的 `MALLOC_CAP_INTERNAL|MALLOC_CAP_DMA` 读缓存——它只是 `fread` 的目标
+     地址，真正被 SDMMC 当 DMA 目标的是 FatFS 自己的窗口，删掉是纯赚，还少一趟 memcpy。
+   - **放大池子**：`CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL` 150000 → 200000。给太多会
+     **明确报错**（`app_startup.c:176-180` 打 `Could not reserve internal/DMA pool` 然后
+     abort），不会静默降级，所以可以放心试、崩了往回调。**这是下一次烧录要验的第一件事。**
+
+   本次已落盘的改动（删 16 KB 读缓存、下行队列 6→24、上传任务排空上行音频，见 A.9）
+   **都还没实机复测**；`CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL` 那一条**只是建议，还没落盘**
+   （`sdkconfig.defaults:40` 仍是 150000）。
+
+2. **视频仍然应该在 WS 语义上离开语音通道（结构性，与第 1 条无关）。**
+   后端文档 §6.1 规定"一个 Binary payload = 一个完整 Opus packet，禁止附加 WAV 头/Ogg/JSON/
+   长度/序号/时间戳，禁止合并或拆分"，而我们把每帧十几 KB 的 H.264 也以二进制帧发在同一条
+   连接上，**服务端无法从帧本身区分两类流**；另外视频的 4 Mbps 会给语音加队头阻塞。后端
+   目前**没有**给出独立的视频上传端点（文档 §3/§4 只定义了 OTA 和这一条 Agent WS），所以
+   要么向后端要一个视频专用端点，要么视频暂时回到本地/明文通道。
+   **注意：这一条不再有"A/B 证明语音因此失效"作为支撑**——那次 A/B 已被推翻。它是按协议
+   约束和带宽理由提出的，优先级排在下面第 1 条之后。
+
+3. **AES 的 DMA 描述符分配失败会拖垮 TLS，进而断掉整条语音+视频链路——它同时也是第 1 条
+   那块池子的大户。**
    实机反复出现 `esp-aes: Failed to allocate memory for ...`，随后 TLS 写失败、WS 断连，
    再往后 JPEG_DEC 从 15 ms 涨到 662 ms、编码掉到 0 fps。**成因与已做的修改见附录 A.8。**
-   注意这一条**不是**上面第 1 条的根因——摄像头断开那一场也有同样的 `esp-aes` 报错，语音
-   却是好的。改动已落盘（`CONFIG_MBEDTLS_HARDWARE_AES=n`），**待实机复测**：判据是串口里
-   `esp-aes:` 一行都不再出现。
+   `esp_aes_process_dma()` 对**每一次** AES 运算都要从 `MALLOC_CAP_DMA|MALLOC_CAP_INTERNAL`
+   分配描述符数组和对齐缓冲，而且 GCM 路径分配失败是裸 `return -1`、**跳过 `cleanup:`
+   泄漏**已分配的那几组——这正好解释了池子为什么单向恶化而不是偶发抖动。
+   改动已落盘（`CONFIG_MBEDTLS_HARDWARE_AES=n`），**待实机复测**：判据是串口里 `esp-aes:`
+   一行都不再出现。
 
 以下为此前记录，编号不变：
 
@@ -350,15 +380,24 @@ VS Code 当前默认使用 `build_main_verified`，生成器必须为 Ninja。�
 
 ### 2026-09-15 起
 
-1. **先复测 AES 改动**（附录 A.8）：烧录后看串口是否还有 `esp-aes:`，以及 WS 还会不会断。
-   这一条独立于视频，不管视频怎么改都要先确认这块干净。
-2. **判定第 10 节第 1 条的根因**：加一个默认关闭的编译开关，在 `video_streamer.c:1200`
-   跳过视频发送但保留整条编解码链路（摄像头照常跑、编码照常做、输出槽照常满）。语音恢复
-   → 协议层 (a) 或带宽；语音仍坏 → 资源层 (b)。**不要再用"切档位"来分离变量**（理由同
-   下方第 1 条），开/关整条链路或只关发送是已验证有效的手段。
-3. **按判定结果处理视频通道**：若是 (a)/(b)，向后端要一个独立的视频上传端点，或把视频
-   暂时放回本地明文 `ws://`——两者都能同时解决协议混发和 4 Mbps 给语音加队头阻塞的问题。
-4. **补齐小智协议的缺口**：`abort` 命令的本地响应、鉴权失败后的清 Token 与重新 OTA
+1. **先做第 10 节第 1 条的 `SPIRAM_MALLOC_RESERVE_INTERNAL` 实验**：150000 → 200000，
+   只改这一行，别的都不动。判据三个：
+   - 开机有没有打 `Could not reserve internal/DMA pool`——有就是给多了，往下调；
+   - 第一个 5 秒统计行里 `[VIDEO] MEM DMA=x/**y** KB` 的最大连续块 y 有没有从 1 KB 涨上去；
+   - 能不能活过 65 秒、不再见到 `sdio_drv.c:862` 那条 assert。
+
+   **注意 `sdkconfig.defaults` 的改动只在 sdkconfig 重建时生效**，要么删掉 `sdkconfig`
+   重新 `set-target esp32p4`，要么直接改 `sdkconfig`（`MBEDTLS_HARDWARE_AES` 那次就是
+   两个文件都改了）。删 `sdkconfig` 时**不要**连 `sdkconfig.defaults` 一起删。
+2. **同时复测 AES 改动**（附录 A.8）：烧录后看串口是否还有 `esp-aes:`，以及 WS 还会不会断。
+   这一条与第 1 条同源（都是那块池子），一起看。
+3. **看 TTS 卡顿有没有好转**：`SPK frames=` 那行新增的两个栏 `qovf=` / `derr=`。
+   本次一并改了三处（下行队列 6→24、上传任务排空上行音频、`anim_bin_player` 让出 16 KB），
+   判据是 `qovf` 归零或大幅下降；**若以 `derr` 为主，说明问题在 Opus 解码/codec 写入侧，
+   加深队列没用**。用户报的"语音模糊不清，很卡顿"就应该落在这两个数上。
+4. **视频通道搬迁（第 10 节第 2 条）排在上面之后**：向后端要一个独立的视频上传端点，或把
+   视频暂时放回本地明文 `ws://`——两者都能同时解决协议混发和 4 Mbps 给语音加队头阻塞。
+5. **补齐小智协议的缺口**：`abort` 命令的本地响应、鉴权失败后的清 Token 与重新 OTA
    （后端文档 §7 要求）、下行 24 kHz 与上行 16 kHz 的采样率映射复测。
 
 以下为此前顺序，仍然有效：
@@ -547,7 +586,7 @@ SOI/EOI 是否在场，`video_jpeg_structurally_valid()` 会逐段走 marker 结
 链路彻底卡死时 `send()` 要等 TCP 重传耗尽（`CONFIG_LWIP_TCP_MAXRTX=12`）才返回。若复测后
 仍出现 `transport_poll_write(0)`，下一步就是给 socket 加 `SO_SNDTIMEO`。
 
-### A.7 小智语音链路实测（2026-09-15）与视频共存 A/B
+### A.7 小智语音链路实测（2026-09-15）与视频共存 A/B（**A/B 结论已推翻，见本节末尾更正**）
 
 链路：板载 ES8311 采集 → Opus 编码（16 kHz、单声道、60 ms/960 采样）→ `video_streamer`
 的 Agent WSS 上行；下行二进制帧 → Opus 解码（24 kHz、单声道、60 ms）→ ES8311 播放。
@@ -556,10 +595,10 @@ SOI/EOI 是否在场，`video_jpeg_structurally_valid()` 会逐段走 marker 结
 
 | 数 | 健康值 | 说明 |
 | --- | --- | --- |
-| `MIC packets` | 每 5 秒 +84 | 60 ms 帧长 = 16.7 包/秒；**只在 `video_streamer_agent_send_audio()` 返回 `ESP_OK` 后自增**，所以它涨就是真交给 WebSocket 了 |
+| `MIC packets` | 每 5 秒 +84 | 60 ms 帧长 = 16.7 包/秒；**只在 `video_streamer_agent_send_audio()` 返回 `ESP_OK` 后自增**，所以它涨 = 确实进了视频上传任务的队列（**不等于已经发出去了**，真正发送在那边）；队列满走 `read_err=`（`s_capture_errors`） |
 | 上行包长 | 约 106 字节 | ≈ 14 kbps |
 | `mic peak` | 说话时 11676 | **环境底噪就是 284～544，不要以为这是增益不够去调 `XIAOZHI_CODEC_INPUT_GAIN_DB`（已经是 30 dB）**，必须真说话再看 |
-| `SPK frames / drop` | `drop=0` 且 frames 在涨 | `frames=0 drop=0` = **服务端一个二进制帧都没发**，不是本地解码失败；只有 `frames=0` 而 `drop>0` 才是本地问题（`s_playback_drops++` 在 `incoming_audio_callback()` 里数据空/超长/队列满时加） |
+| `SPK frames / drop` | `drop=0` 且 frames 在涨 | `frames=0 drop=0` = **服务端一个二进制帧都没发**，不是本地解码失败。`drop` 已于 2026-09-15 拆成 `qovf=`（猝发打满队列，丢最旧包，加深队列有效）和 `derr=`（Opus 解码/codec 写入失败，加深队列无效），见下方更正与 A.9 |
 
 一次完整成功（摄像头断开，2026-09-15）：
 
@@ -571,20 +610,35 @@ SPK frames 0 → 62 → 85，drop=0
 mic peak=11676
 ```
 
-**A/B（同一次烧录、同一段代码，唯一差别是摄像头插着与否）**：
+**A/B（同一次烧录、同一段代码，唯一差别是摄像头插着与否）——结论已推翻，见下**：
 
 | 摄像头 | 服务端回答 | 下行 | 上行 |
 | --- | --- | --- | --- |
 | 开着 | "主人，lummiss现在有点忙" / "我们稍后再试吧"（兜底话术，问什么都一样） | `SPK frames=62`，随后 `send_fail=1`、TTS 结束后 WS 断 | 正常 |
 | 断开 | "我一直都在呢，您请说。"（真实回答） | `SPK frames=46 drop=0` | 正常 |
 
-**两次都没有 `stt` 消息。** 所以"没有 `stt` = 服务端没识别出来"是错的判据，这一版服务端
-不发 `stt`；能用的判据只有**回答内容**。候选机制见第 10 节第 1 条。
+**两次都没有 `stt` 消息。**（当时的推论是"这个配置下服务端不发 `stt`，判据只能用回答内容"
+——**这条已被推翻**，见下方更正。）
+
+**更正（2026-09-15 当日稍晚）：上面这张表的 A/B 结论不成立，"服务端不发 `stt`"也是错的。**
+
+- **摄像头推流时语音是通的。** 另一次运行里摄像头开着、视频 13.9～15.6 fps 稳定上传
+  （`send_fail=0`），同时上行 16.7 包/秒不断，服务端正常识别
+  （`{"type":"stt","text":"好"}`）并回了完整回答，整场连续跑了 65 秒。所以"摄像头开着
+  语音就失效、只回兜底话术"**不要再照它找根因**；那次 A/B 时上传路径还在抢占/中断，
+  变量没控干净（那次也是 64.8 秒时那条 Hosted assert 崩掉的同一场，见 A.9）。
+- **服务端这一版会发 `stt`**（实测 `{"type": "stt", "text": "好"}`），可以重新拿它当
+  识别判据用。
+- **它也会自己发起一轮**：用户全程没出声（`peak` 一直在 331～626 的底噪带里）时也会发
+  `tts state=start`，内容形如"您请说，我正听着。"。所以"有回答"既不等于"听懂了"、
+  也不等于"用户说过话"。设备侧只有 `listen mode:auto`，VAD 在服务端。
+- 表里 `drop` 只有一栏，现已拆成 `qovf=` / `derr=`（见上方判读表和 A.9）。
 
 **已知未解**：TTS 刚结束（`小智回答结束` 后 47 ms）WS 断过一次，报
 `H.264 发送失败：259`（`ESP_ERR_INVALID_STATE`）+ `unexpected data readable on
 socket=54` + `Connection terminated while waiting for clean TCP close`，2 秒后自动重连并
-拿到新 `session_id`，`send_fail` 计 1。原因未定位。
+拿到新 `session_id`，`send_fail` 计 1。原因未定位。**但它是偶发的**：摄像头开着的那一场
+连续跑 65 秒、`send_fail=0`，没有复现这条断连。
 
 ### A.8 AES 的 DMA 描述符分配失败：排查过程与结论（2026-09-15）
 
@@ -636,4 +690,68 @@ alignment buffer 此时都已分配成功。失败一次池子就永久小一截
 在 P4 上是 8（`GDMA_LL_AXI_DESC_ALIGNMENT`），所以也不是对齐粒度把池子切碎导致的。
 
 **待复测判据**：串口里 `esp-aes:` 一行都不再出现。注意这一条**不是**视频/语音 A/B 的根因
-——摄像头断开那一场也有 `esp-aes` 报错，语音却是好的。
+——摄像头断开那一场也有 `esp-aes` 报错，语音却是好的。但它和 A.9 是同源问题：AES 每次运算
+都从**同一块**内部 DMA 池取描述符和对齐缓冲，失败还会泄漏，是那块池子最主要的长期消耗者。
+
+### A.9 内部 DMA 池被挤碎导致 ESP-Hosted assert 重启（2026-09-15）
+
+**崩溃现场**（运行 64.8 秒处，摄像头开 + 视频推流 + 语音提问，MHARTID=1）：
+
+```text
+E (13764) allocate_dma_buf: not enough mem              ← 表情动画读不出
+E (...)   transport: STA TX transport buffer unavailable, drop=1
+-- 崩溃前最后一条 5 秒统计快照：
+I (13864) [VIDEO] MEM DMA=10/1 KB INT=13/1 KB PSRAM=23174/23040 KB
+E (13870) PK verify failed 0x4290 / HOME_INFO: HTTPS 请求失败
+assert failed: sdio_push_data_to_queue sdio_drv.c:862 (pkt_rxbuff)
+--- 0x480210b0: hosted_malloc_align at port_esp_hosted_host_os.c:132
+--- 0x480205c2: sdio_push_data_to_queue at sdio_drv.c:866
+--- 0x480206fa: sdio_data_to_rx_buf_task at sdio_drv.c:904
+```
+
+**这一串是同一个根因的连锁反应。** `MEM DMA=10/1` 读作"池子剩 10 KB 空闲、但**最大连续块
+只有 1 KB**"，而 Hosted 每个包要的是 1664 字节**单块** → 取不到。PSRAM 那边还空着 23 MB，
+所以不是总量问题，是这块 146 KB 的池子被切碎了。`PK verify failed 0x4290` 同理是**内存**
+原因而不是时钟：它出现在 13870，紧跟 13764 那句 `allocate_dma_buf: not enough mem`，
+时间上就在崩溃前约 100 ms。
+
+**逐包分配的代码路径**（免得再翻一遍）：
+`sdio_push_data_to_queue()`（`sdio_drv.c:844`，streaming 分支从 `:810` 的 `#else` 起）
+→ `sdio_buffer_alloc` → `mempool_alloc(buf_mp_g, MAX_SDIO_BUFFER_SIZE, MEMSET_REQUIRED)`
+→ `hosted_malloc_align` = `heap_caps_aligned_alloc(align, size, INTERNAL|DMA|8BIT)`
+（`port_esp_hosted_host_os.c:131`）→ **`assert(pkt_rxbuff)`，没有错误分支**。
+mempool 是空表起步、按需长出来的（`mempool.c:19` / `:104`），所以稳态下每个在途包都占一块。
+寄存器转储里的 size=0x680(1664)、align=0x40(64) 就是这个请求。
+
+那条 assert **只在 streaming 分支里**；非 streaming 分支（`sdio_drv.c:779` 起）是原地把整块
+transfer buffer 排队、没有这条断言。当前由
+`CONFIG_ESP_HOSTED_SDIO_OPTIMIZATION_RX_STREAMING_MODE=y` 选中——**如果调池子仍不稳，
+这是另一个可以拿来换稳定性的开关**（代价是每包一次拷贝）。
+
+**本次已做的改动（均未实机复测）：**
+
+| 改动 | 位置 | 理由 |
+| --- | --- | --- |
+| 动画改用固定 4 KB 内部 DMA 读缓存 | `components/anim_bin_player/anim_bin_player.c` | FatFS 大块读取会把调用方 Buffer 直接交给 SDMMC；LUM1 帧偏移通常不满足 PSRAM 128 字节对齐，直接读整帧会申请大块 bounce buffer。4 KB 分块兼顾稳定性与内部内存 |
+| SD 同时打开文件数 8 → 2 | `components/sd_card/sd_card.c` | 每个 FatFS 文件缓存占 4 KB，当前轮播只需一个动画文件，保留一个余量即可 |
+| 下行播放队列 6 → 24 | `xiaozhi_audio.c:51` | 24 × 60 ms = 1.44 s，装得下一次猝发；队列存储在 PSRAM，只占约 34 KB |
+| `drop` 拆成 `qovf=` / `derr=` | `xiaozhi_audio.c` | 前者是猝发打满（加深队列有效），后者是解码/codec 写入失败（加深无效）——不拆开就分不清该调哪个 |
+| 移除 TTS 首播预缓存 | `xiaozhi_audio.c` | 实测 24 包队列无溢出，预缓存没有解决播放变慢，恢复 Git 基线的收到即播 |
+| MIC/SPK 恢复 CPU0，优先级 6 | `xiaozhi_audio.c` | Git 基线在该配置下播放流畅；CPU1 已持续承担 JPEG/YUV/H.264，不再把 I2S 初始化和播放迁到 CPU1 |
+| 开启 WebSocket 独立 TX 锁 | `sdkconfig.defaults` / `sdkconfig` | 新日志中 H.264 `max_SEND=1407/1934 ms`，同时 TTS 队列从空转为突发并出现 `qovf=4`；独立 TX 锁允许客户端在视频发送阻塞时继续接收下行 Opus |
+| 上传任务每轮最多排空 8 个上行音频包 | `video_streamer.c` `VIDEO_UPLOAD_AUDIO_DRAIN_MAX` | 免得一帧视频发完才轮到音频 |
+
+`CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL` 已由 150000 调到 200000。
+机制是 `esp_psram_extram_reserve_dma_pool()`（`esp_psram.c:635`）在开机时从内部堆里挖出
+连续块、重新注册成独立 heap region；给多了会**明确报错**（`app_startup.c:176-180`：
+`Could not reserve internal/DMA pool (error 0x%x)` 然后 `abort()`），不会静默降级。
+
+**TTS 卡顿的量化**（就是用户报的"语音模糊不清，很卡顿"）：同一次运行里
+`SPK frames=28 drop=12`——一次回答 40 帧丢 12 帧，30%。成因是 `esp_websocket_client`
+收发共用同一把 `client->lock`：上传任务每发一帧视频最长持锁
+`VIDEO_WS_SEND_TIMEOUT_MS=2000 ms`，期间下行 Opus 只能堆在 TCP 接收缓冲里，锁一放就成串
+回调进来；而播放队列原来只有 6 个槽（60 ms × 6 = 360 ms），一突发就丢最旧包。
+
+**一个同类但独立的坑**：`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384` 让 ≤16 KB 的
+`malloc()` 优先走内部 RAM。当前通过限制 FatFS 文件数和将动画中转块缩到 4 KB 控制占用；
+仍需观察日志中的 `MEM DMA=空闲/最大块`，最大块低于 2 KB 时 ESP-Hosted 仍可能分配失败。

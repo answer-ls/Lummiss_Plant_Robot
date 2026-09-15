@@ -22,7 +22,7 @@ static const char *TAG = "ANIM_BIN";
 #define ANIM_MAX_WIDTH             320U
 #define ANIM_MAX_HEIGHT            240U
 #define ANIM_BUFFER_SIZE           (ANIM_MAX_WIDTH * ANIM_MAX_HEIGHT * 2U)
-#define ANIM_SD_READ_CHUNK         (16U * 1024U)
+#define ANIM_SD_READ_CHUNK         (4U * 1024U)
 #define ANIM_MAX_FRAMES            1024U
 #define ANIM_PATH_MAX              128U
 #define ANIM_TASK_STACK            8192U
@@ -222,9 +222,15 @@ static esp_err_t read_frame(FILE *file, const anim_bin_frame_t *frame,
                             uint8_t *buffer, anim_stats_t *stats)
 {
     const int64_t start_us = esp_timer_get_time();
-    if (fseek(file, (long)frame->offset, SEEK_SET) != 0) {
+    /* 正常帧按文件顺序连续读取，仅循环回到第 0 帧时重新定位。 */
+    const long current_offset = ftell(file);
+    if ((current_offset < 0 || (uint32_t)current_offset != frame->offset) &&
+        fseek(file, (long)frame->offset, SEEK_SET) != 0) {
         return ESP_FAIL;
     }
+    /* FatFS 会把大块 fread 的目标直接交给 SDMMC。LUM1 数据偏移通常不满足
+     * PSRAM 的 128 字节 DMA 对齐，直接读整帧会临时申请接近 150 KB 的内部
+     * bounce buffer。固定 4 KB 内部 DMA Buffer 可避免该申请和运行期失败。 */
     size_t total_read = 0;
     while (total_read < frame->size) {
         const size_t remaining = frame->size - total_read;
@@ -533,8 +539,6 @@ esp_err_t anim_bin_player_init(lv_obj_t *parent)
         goto no_memory;
     }
 
-    /* 固定的小块内部 DMA Buffer 避免 FatFS 为每个完整帧临时申请约
-     * 150 KB bounce buffer；分块完成后再复制到非显示中的 PSRAM。 */
     s_sd_read_buffer = heap_caps_malloc(
         ANIM_SD_READ_CHUNK,
         MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);

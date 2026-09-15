@@ -50,7 +50,9 @@ static esp_err_t sd_card_try_mount(sdmmc_host_t *host, int width)
 
     const esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = false,
-        .max_files = 8,
+        /* 当前只会同时打开动画文件和一个备用句柄。FatFS 每个文件都有 4 KB
+         * 内部缓存，限制为 2 可给 USB、I2S 和 ESP-Hosted 留出 DMA 内存。 */
+        .max_files = 2,
         .allocation_unit_size = 16 * 1024,
     };
 

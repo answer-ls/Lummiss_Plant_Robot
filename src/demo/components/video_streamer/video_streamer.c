@@ -112,7 +112,7 @@ static video_streamer_config_t s_ws_config;
 #define VIDEO_UPLOAD_PRIORITY         9
 #define VIDEO_UPLOAD_CORE             0
 #define VIDEO_REPORT_PRIORITY         4
-#define VIDEO_REPORT_CORE             0
+#define VIDEO_REPORT_CORE             1
 
 /* WebSocket 客户端会自建一个任务：钉核 0、优先级低于上传任务（9），
  * 免得收命令和自动重连去抢上传任务的 CPU。 */
@@ -150,6 +150,11 @@ static video_streamer_config_t s_ws_config;
  * 阻塞期间占住输出槽，但断线代价是重连 2 秒起，取小的那个。 */
 #define VIDEO_WS_SEND_TIMEOUT_MS      2000
 #define VIDEO_WS_AUDIO_SEND_TIMEOUT_MS 200
+/* 没有视频帧时，上传任务按此周期检查音频队列；低于 60 ms 音频包周期。 */
+#define VIDEO_UPLOAD_POLL_MS          10
+/* 每轮最多排空的音频包数。上限存在的意义只是防止极端情况下一直有音频到达而
+ * 饿死视频；正常 16.7 包/秒远低于这个速率。 */
+#define VIDEO_UPLOAD_AUDIO_DRAIN_MAX  8
 /* 建连超时。名字看着像"轮询超时"，但 esp_websocket_client.c:1204 把它原样传给
  * esp_transport_connect(host, port, network_timeout_ms)，TLS 路径下即
  * esp_tls_cfg_t.timeout_ms——**整个 TLS 握手的超时预算**。
@@ -172,7 +177,17 @@ static video_streamer_config_t s_ws_config;
 /* 下行命令的累积缓冲：服务器下发的 JSON 命令很短。 */
 #define VIDEO_WS_COMMAND_MAX          1024
 #define VIDEO_WS_AUDIO_PACKET_MAX     1400
-#define VIDEO_WS_AUDIO_QUEUE_DEPTH    4
+/* 音频队列深度按「视频发送阻塞多久」定，不是按音频包周期定。
+ *
+ * 发送是单任务串行的：一帧 H.264 撞上 TCP 背压时会占住这个任务最多
+ * VIDEO_WS_SEND_TIMEOUT_MS（2 秒，见上面的注释），这段时间里 Opus 包只能堆在
+ * 队列里。原值 4 = 只有 240 ms 余量，一次 2 秒阻塞就丢 ~29 包（16.7 包/秒），
+ * 上行留下 2 秒空洞——服务端的 VAD/ASR 看到的是一段断掉的语音，而这恰好发生在
+ * 视频把链路压满的时候，跟「摄像头开着语音就失效」的 A/B 现象方向一致。
+ * 16 = 约 1 秒余量，条目在 PSRAM（每条约 1.4 KB 上限），代价可忽略。
+ * 队列满时 xQueueSend 返回失败，xiaozhi_audio 会计进 s_capture_errors
+ * 而不是 MIC packets，所以溢出是看得见的。 */
+#define VIDEO_WS_AUDIO_QUEUE_DEPTH    16
 #define VIDEO_REPORT_INTERVAL_US      (5 * 1000 * 1000LL)
 /* 门控按 VIDEO_ENCODE_FPS 的帧周期推进；允许提前 5 ms 接帧，
  * 避免整数取整导致的周期漂移。 */
@@ -262,7 +277,6 @@ static QueueHandle_t s_out_ready;
 static QueueHandle_t s_agent_audio_queue;
 static StaticQueue_t s_agent_audio_queue_control;
 static uint8_t *s_agent_audio_queue_storage;
-static QueueSetHandle_t s_upload_queue_set;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static video_stream_stats_t s_stats;
 static int64_t s_next_submit_us;
@@ -1143,27 +1157,33 @@ static void video_upload_task(void *arg)
 
     unsigned out_index;
     while (true) {
-        QueueSetMemberHandle_t ready = xQueueSelectFromSet(
-            s_upload_queue_set, portMAX_DELAY);
-
-        /* 音频包只有几十到几百字节且每 60 ms 必须发送，优先于大块 H.264。
-         * 发送仍集中在本任务，避免多个任务并发争用 WebSocket 客户端锁。 */
-        video_agent_audio_packet_t audio_packet;
-        if (xQueueReceive(s_agent_audio_queue, &audio_packet, 0) == pdTRUE) {
-            if (__atomic_load_n(&s_ws_connected, __ATOMIC_SEQ_CST) &&
-                esp_websocket_client_is_connected(ws_client)) {
-                int sent = esp_websocket_client_send_bin(
-                    ws_client, (const char *)audio_packet.data,
-                    audio_packet.size,
-                    pdMS_TO_TICKS(VIDEO_WS_AUDIO_SEND_TIMEOUT_MS));
-                if (sent != audio_packet.size) {
-                    video_stream_log_error_limited("Opus 音频发送失败", ESP_FAIL);
-                }
+        /* 先把积压的音频排空，再等视频槽：上一帧被 TCP 背压拖住时队列里会堆最多
+         * 16 条，这时候补语音比立刻发下一帧重要（见 VIDEO_WS_AUDIO_QUEUE_DEPTH）。
+         * 发送仍集中在本任务，避免两个队列并发争用 WebSocket 客户端锁。 */
+        const bool ws_ready = __atomic_load_n(&s_ws_connected, __ATOMIC_SEQ_CST) &&
+                              esp_websocket_client_is_connected(ws_client);
+        for (int drained = 0; drained < VIDEO_UPLOAD_AUDIO_DRAIN_MAX; drained++) {
+            video_agent_audio_packet_t audio_packet;
+            if (xQueueReceive(s_agent_audio_queue, &audio_packet, 0) != pdTRUE) {
+                break;
             }
-            continue;
+            /* 断连时照样出队：留着的话重连后会把一段过期的语音补发上去，
+             * 服务端拿到的新 session 里出现幻听。 */
+            if (!ws_ready) {
+                continue;
+            }
+            int sent = esp_websocket_client_send_bin(
+                ws_client, (const char *)audio_packet.data,
+                audio_packet.size,
+                pdMS_TO_TICKS(VIDEO_WS_AUDIO_SEND_TIMEOUT_MS));
+            if (sent != audio_packet.size) {
+                video_stream_log_error_limited("Opus 音频发送失败", ESP_FAIL);
+                break;
+            }
         }
-        if (ready != s_out_ready ||
-            xQueueReceive(s_out_ready, &out_index, 0) != pdTRUE) {
+
+        if (xQueueReceive(s_out_ready, &out_index,
+                          pdMS_TO_TICKS(VIDEO_UPLOAD_POLL_MS)) != pdTRUE) {
             continue;
         }
         video_out_slot_t *slot = &s_out_slots[out_index];
@@ -1313,12 +1333,8 @@ static void video_codec_task(void *arg)
             s_agent_audio_queue_storage,
             &s_agent_audio_queue_control);
     }
-    s_upload_queue_set = xQueueCreateSet(
-        VIDEO_OUT_SLOT_COUNT + VIDEO_WS_AUDIO_QUEUE_DEPTH);
     if (s_out_free == NULL || s_out_ready == NULL ||
-        s_agent_audio_queue == NULL || s_upload_queue_set == NULL ||
-        xQueueAddToSet(s_out_ready, s_upload_queue_set) != pdPASS ||
-        xQueueAddToSet(s_agent_audio_queue, s_upload_queue_set) != pdPASS) {
+        s_agent_audio_queue == NULL) {
         ESP_LOGE(TAG, "创建视频/音频上传队列失败");
         goto codec_fail;
     }
@@ -1620,16 +1636,6 @@ codec_fail:
         /* 上传任务一旦启动就独占 HTTP client，无法在此回收，保持现状并退出。 */
         vTaskDelete(NULL);
         return;
-    }
-    if (s_upload_queue_set != NULL) {
-        if (s_out_ready != NULL) {
-            xQueueRemoveFromSet(s_out_ready, s_upload_queue_set);
-        }
-        if (s_agent_audio_queue != NULL) {
-            xQueueRemoveFromSet(s_agent_audio_queue, s_upload_queue_set);
-        }
-        vQueueDelete(s_upload_queue_set);
-        s_upload_queue_set = NULL;
     }
     if (s_agent_audio_queue != NULL) {
         vQueueDelete(s_agent_audio_queue);

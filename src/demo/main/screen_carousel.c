@@ -21,6 +21,7 @@ static const char *TAG = "CAROUSEL";
 
 #define CAROUSEL_TASK_STACK       6144
 #define CAROUSEL_TASK_PRIORITY    5
+#define CAROUSEL_TASK_CORE        1
 #define CAROUSEL_SLOT_MS          5000
 #define CAROUSEL_TIMER_PERIOD_MS  50
 #define CAROUSEL_DIR_PRIMARY      SD_CARD_MOUNT_POINT "/expressions"
@@ -243,9 +244,9 @@ void screen_carousel_start(void)
         return;
     }
     s_started = true;
-    const BaseType_t created = xTaskCreate(
+    const BaseType_t created = xTaskCreatePinnedToCore(
         carousel_task, "screen_carousel", CAROUSEL_TASK_STACK, NULL,
-        CAROUSEL_TASK_PRIORITY, NULL);
+        CAROUSEL_TASK_PRIORITY, NULL, CAROUSEL_TASK_CORE);
     if (created != pdPASS) {
         s_started = false;
         ESP_LOGE(TAG, "轮播任务创建失败，屏幕停在天气首页");
