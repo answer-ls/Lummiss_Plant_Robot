@@ -36,6 +36,16 @@
 /* ← 改这一行切换档位 */
 #define CAMERA_TEST_PROFILE                CAMERA_TEST_FULL
 
+/* 完整系统基线开启 H.264 视频编码和 WebSocket 视频上传；
+ * 设为 0 只关闭视频流，保留小智音频使用的同一条 WebSocket 连接。 */
+#define CAMERA_VIDEO_STREAM_ENABLED        1
+
+/* 纯 UVC 冷启动测试一次只允许请求一种模式。修改下面最后一行后必须重新
+ * 编译、复位开发板并让摄像头重新枚举，禁止在同一次运行中轮换分辨率。 */
+#define CAMERA_UVC_COLD_TEST_640X480        1
+#define CAMERA_UVC_COLD_TEST_1280X720       2
+#define CAMERA_UVC_COLD_TEST_MODE           CAMERA_UVC_COLD_TEST_640X480
+
 /* 功能位。档位号本身不参与任何生产代码的判断，判断只认这些位。 */
 #define TP_UVC      (1u << 0)   /* USB Host + UVC 取流（目前恒开，留位以备"无摄像头"档位） */
 #define TP_HANDOFF  (1u << 1)   /* 把 UVC 帧复制后交给 video_streamer 下游 */

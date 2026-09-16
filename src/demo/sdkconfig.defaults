@@ -162,3 +162,8 @@ CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y
 # 调 esp_aes_*）。代价是纯软件 AES——GHASH 本来就是软件算的：实测 TLS 流量约
 # 4 Mbps，软件 AES 在 400 MHz RISC-V 上约 10 MB/s，占不到一个核的 5%。
 CONFIG_MBEDTLS_HARDWARE_AES=n
+
+# ESP-SR 唤醒词检测：AFE 语音前端 + WakeNet9（"你好小智"）。
+# 模型编译进固件 → 运行时从 SPIFFS "model" 分区加载。
+CONFIG_AFE_INTERFACE_V1=y
+CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS=y

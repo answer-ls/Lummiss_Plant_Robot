@@ -22,11 +22,12 @@ static const char *TAG = "ANIM_BIN";
 #define ANIM_MAX_WIDTH             320U
 #define ANIM_MAX_HEIGHT            240U
 #define ANIM_BUFFER_SIZE           (ANIM_MAX_WIDTH * ANIM_MAX_HEIGHT * 2U)
+#define ANIM_BUFFER_COUNT          3U
 #define ANIM_SD_READ_CHUNK         (4U * 1024U)
 #define ANIM_MAX_FRAMES            1024U
 #define ANIM_PATH_MAX              128U
 #define ANIM_TASK_STACK            8192U
-#define ANIM_TASK_PRIORITY         3U
+#define ANIM_TASK_PRIORITY         7U
 #define ANIM_TASK_CORE             1U
 #define ANIM_UI_TIMER_MS           5U
 #define ANIM_WAIT_SLICE_MS         20U
@@ -58,22 +59,18 @@ _Static_assert(sizeof(anim_bin_frame_t) == 12, "LUM1 frame entry must be 12 byte
 typedef struct {
     uint64_t read_total_us;
     uint64_t read_max_us;
-    uint64_t switch_total_us;
-    uint64_t switch_max_us;
     uint32_t read_count;
-    uint32_t switch_count;
     uint32_t deadline_miss;
     int64_t log_start_us;
 } anim_stats_t;
 
 static SemaphoreHandle_t s_state_mutex;
-static SemaphoreHandle_t s_frame_ack;
 static TaskHandle_t s_player_task;
 static lv_obj_t *s_image;
 static lv_timer_t *s_ui_timer;
-static uint8_t *s_buffers[2];
+static uint8_t *s_buffers[ANIM_BUFFER_COUNT];
 static uint8_t *s_sd_read_buffer;
-static lv_img_dsc_t s_descriptors[2];
+static lv_img_dsc_t s_descriptors[ANIM_BUFFER_COUNT];
 
 static bool s_initialized;
 static bool s_play_request;
@@ -85,12 +82,16 @@ static esp_err_t s_last_error = ESP_OK;
 static uint16_t s_frame_index;
 static int s_active_buffer = -1;
 
-/* 只有播放器任务写 pending；只有 LVGL Timer 消费。状态互斥量保证 stop
- * 与切帧不能交错，LVGL 永远不会看到正在被 fread 覆盖的 Buffer。 */
+/* 只有播放器任务写 pending；只有 LVGL Timer 消费。三缓冲保证当前显示、
+ * 等待切换和 SD 预读各自独占一个 Buffer，generation 负责丢弃过期提交。 */
 static bool s_frame_pending;
 static int s_pending_buffer;
 static uint16_t s_pending_frame_index;
 static uint32_t s_pending_generation;
+static int64_t s_pending_since_us;
+static uint64_t s_switch_total_us;
+static uint64_t s_switch_max_us;
+static uint32_t s_switch_count;
 
 static bool generation_is_current(uint32_t generation)
 {
@@ -116,7 +117,7 @@ static void set_run_state(uint32_t generation, bool loading, bool playing,
 static void ui_frame_switch_timer(lv_timer_t *timer)
 {
     (void)timer;
-    bool acknowledge = false;
+    bool switched = false;
 
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     if (s_frame_pending) {
@@ -132,15 +133,64 @@ static void ui_frame_switch_timer(lv_timer_t *timer)
             s_frame_index = s_pending_frame_index;
             s_loading = false;
             s_playing = true;
+            const uint64_t elapsed_us =
+                (uint64_t)(esp_timer_get_time() - s_pending_since_us);
+            s_switch_total_us += elapsed_us;
+            s_switch_count++;
+            if (elapsed_us > s_switch_max_us) {
+                s_switch_max_us = elapsed_us;
+            }
         }
         s_frame_pending = false;
-        acknowledge = true;
+        switched = true;
     }
     xSemaphoreGive(s_state_mutex);
 
-    if (acknowledge) {
-        xSemaphoreGive(s_frame_ack);
+    if (switched && s_player_task != NULL) {
+        /* 只用于唤醒可能等待 pending 槽位的播放器，不再作为逐帧 ACK。 */
+        xTaskNotifyGive(s_player_task);
     }
+}
+
+static int writable_buffer_for_generation(uint32_t generation)
+{
+    int writable = -1;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    if (generation == s_generation) {
+        for (int i = 0; i < (int)ANIM_BUFFER_COUNT; i++) {
+            const bool is_pending = s_frame_pending && i == s_pending_buffer;
+            if (i != s_active_buffer && !is_pending) {
+                writable = i;
+                break;
+            }
+        }
+    }
+    xSemaphoreGive(s_state_mutex);
+    return writable;
+}
+
+static bool wait_for_publish_slot(uint32_t generation)
+{
+    while (generation_is_current(generation)) {
+        bool available;
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        available = !s_frame_pending;
+        xSemaphoreGive(s_state_mutex);
+        if (available) {
+            return true;
+        }
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(ANIM_WAIT_SLICE_MS));
+    }
+    return false;
+}
+
+static void reset_switch_stats(void)
+{
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_switch_total_us = 0;
+    s_switch_max_us = 0;
+    s_switch_count = 0;
+    xSemaphoreGive(s_state_mutex);
 }
 
 static esp_err_t validate_file(FILE *file, size_t file_size,
@@ -263,12 +313,8 @@ static esp_err_t read_frame(FILE *file, const anim_bin_frame_t *frame,
 
 static esp_err_t publish_frame(uint32_t generation, int buffer_index,
                                uint16_t frame_index, uint16_t width,
-                               uint16_t height, uint32_t frame_size,
-                               anim_stats_t *stats)
+                               uint16_t height, uint32_t frame_size)
 {
-    while (xSemaphoreTake(s_frame_ack, 0) == pdTRUE) {
-    }
-
     s_descriptors[buffer_index].header.always_zero = 0;
     s_descriptors[buffer_index].header.w = width;
     s_descriptors[buffer_index].header.h = height;
@@ -276,35 +322,18 @@ static esp_err_t publish_frame(uint32_t generation, int buffer_index,
     s_descriptors[buffer_index].data_size = frame_size;
     s_descriptors[buffer_index].data = s_buffers[buffer_index];
 
-    const int64_t start_us = esp_timer_get_time();
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-    if (generation != s_generation) {
+    if (generation != s_generation || s_frame_pending) {
         xSemaphoreGive(s_state_mutex);
         return ESP_ERR_INVALID_STATE;
     }
     s_pending_buffer = buffer_index;
     s_pending_frame_index = frame_index;
     s_pending_generation = generation;
+    s_pending_since_us = esp_timer_get_time();
     s_frame_pending = true;
     xSemaphoreGive(s_state_mutex);
-
-    while (generation_is_current(generation)) {
-        if (xSemaphoreTake(s_frame_ack,
-                           pdMS_TO_TICKS(ANIM_WAIT_SLICE_MS)) == pdTRUE) {
-            if (!generation_is_current(generation)) {
-                return ESP_ERR_INVALID_STATE;
-            }
-            const uint64_t elapsed_us =
-                (uint64_t)(esp_timer_get_time() - start_us);
-            stats->switch_total_us += elapsed_us;
-            stats->switch_count++;
-            if (elapsed_us > stats->switch_max_us) {
-                stats->switch_max_us = elapsed_us;
-            }
-            return ESP_OK;
-        }
-    }
-    return ESP_ERR_INVALID_STATE;
+    return ESP_OK;
 }
 
 #ifndef CONFIG_LUMMISS_ANIM_FIRST_FRAME_ONLY
@@ -336,23 +365,32 @@ static void log_stats(const anim_stats_t *stats, uint16_t frame_index, bool forc
         return;
     }
 
+    uint64_t switch_total_us;
+    uint64_t switch_max_us;
+    uint32_t switch_count;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    switch_total_us = s_switch_total_us;
+    switch_max_us = s_switch_max_us;
+    switch_count = s_switch_count;
+    xSemaphoreGive(s_state_mutex);
+
     const double fps = elapsed_us > 0
-                           ? (double)stats->switch_count * 1000000.0 /
+                           ? (double)switch_count * 1000000.0 /
                                  (double)elapsed_us
                            : 0.0;
     const double read_avg_ms = stats->read_count > 0
                                    ? (double)stats->read_total_us /
                                          (double)stats->read_count / 1000.0
                                    : 0.0;
-    const double switch_avg_ms = stats->switch_count > 0
-                                     ? (double)stats->switch_total_us /
-                                           (double)stats->switch_count / 1000.0
+    const double switch_avg_ms = switch_count > 0
+                                     ? (double)switch_total_us /
+                                           (double)switch_count / 1000.0
                                      : 0.0;
     ESP_LOGI(TAG,
              "FPS=%.1f frame=%u SD avg/max=%.2f/%.2f ms switch avg/max=%.2f/%.2f ms "
              "deadline_miss=%" PRIu32 " PSRAM=%u KB internal=%u KB",
              fps, frame_index, read_avg_ms, (double)stats->read_max_us / 1000.0,
-             switch_avg_ms, (double)stats->switch_max_us / 1000.0,
+             switch_avg_ms, (double)switch_max_us / 1000.0,
              stats->deadline_miss,
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U),
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024U));
@@ -391,23 +429,25 @@ static esp_err_t play_file(const char *path, uint32_t generation)
     anim_stats_t stats = {
         .log_start_us = esp_timer_get_time(),
     };
+    reset_switch_stats();
     uint16_t frame_index = 0;
-    int active_buffer;
-
-    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-    active_buffer = s_active_buffer == 0 ? 1 : 0;
-    xSemaphoreGive(s_state_mutex);
+    int active_buffer = writable_buffer_for_generation(generation);
+    if (active_buffer < 0) {
+        heap_caps_free(frames);
+        fclose(file);
+        return ESP_ERR_INVALID_STATE;
+    }
 
     result = read_frame(file, &frames[frame_index],
                         s_buffers[active_buffer], &stats);
     if (result == ESP_OK) {
         result = publish_frame(generation, active_buffer, frame_index,
                                header.width, header.height,
-                               frames[frame_index].size, &stats);
+                               frames[frame_index].size);
     }
     if (result == ESP_OK) {
-        ESP_LOGI(TAG, "首帧已显示：frame=%u buffer=%c",
-                 frame_index, active_buffer == 0 ? 'A' : 'B');
+        ESP_LOGI(TAG, "首帧已提交：frame=%u buffer=%c",
+                 frame_index, 'A' + active_buffer);
     }
 
 #ifdef CONFIG_LUMMISS_ANIM_FIRST_FRAME_ONLY
@@ -436,11 +476,23 @@ static esp_err_t play_file(const char *path, uint32_t generation)
             }
         }
 
-        /* active_buffer 仍由 LVGL 使用，只能把下一帧读入另一块。 */
-        const int next_buffer = active_buffer == 0 ? 1 : 0;
+        /* 三缓冲分别承载当前显示、等待切换和下一帧预读。播放器只选择
+         * active/pending 之外的块，因此 publish 后可立即开始下一次 SD 读取。 */
+        const int next_buffer = writable_buffer_for_generation(generation);
+        if (next_buffer < 0) {
+            result = ESP_ERR_INVALID_STATE;
+            break;
+        }
         result = read_frame(file, &frames[next_frame],
                             s_buffers[next_buffer], &stats);
         if (result != ESP_OK) {
+            break;
+        }
+
+        /* 正常情况下 UI 会在 SD 读取期间完成上一次切换。只有 LVGL 被阻塞
+         * 超过整段读取时间时才在这里等待，避免覆盖尚未消费的 pending。 */
+        if (!wait_for_publish_slot(generation)) {
+            result = ESP_ERR_INVALID_STATE;
             break;
         }
 
@@ -455,26 +507,36 @@ static esp_err_t play_file(const char *path, uint32_t generation)
 
         result = publish_frame(generation, next_buffer, next_frame,
                                header.width, header.height,
-                               frames[next_frame].size, &stats);
+                               frames[next_frame].size);
         if (result != ESP_OK) {
             break;
         }
-        active_buffer = next_buffer;
         frame_index = next_frame;
         displayed_at_us = esp_timer_get_time();
         log_stats(&stats, frame_index, false);
         if (esp_timer_get_time() - stats.log_start_us >= ANIM_STATS_PERIOD_US) {
             memset(&stats, 0, sizeof(stats));
             stats.log_start_us = esp_timer_get_time();
+            reset_switch_stats();
         }
     }
 
     /* 每个轮播槽约 5 秒，stop 可能恰好先于周期日志；退出前补打一条本段统计。 */
-    if (stats.switch_count > 0 &&
-        esp_timer_get_time() - stats.log_start_us > 1000000LL) {
+    if (esp_timer_get_time() - stats.log_start_us > 1000000LL) {
         log_stats(&stats, frame_index, true);
     }
 #endif
+
+    /* 读取或校验失败时取消仍未被 UI 消费的提交，避免错误返回首页后，
+     * LVGL Timer 又把旧动画帧切回来。 */
+    if (result != ESP_OK) {
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        if (generation == s_generation && s_frame_pending &&
+            s_pending_generation == generation) {
+            s_frame_pending = false;
+        }
+        xSemaphoreGive(s_state_mutex);
+    }
 
     heap_caps_free(frames);
     fclose(file);
@@ -534,8 +596,7 @@ esp_err_t anim_bin_player_init(lv_obj_t *parent)
     }
 
     s_state_mutex = xSemaphoreCreateMutex();
-    s_frame_ack = xSemaphoreCreateBinary();
-    if (s_state_mutex == NULL || s_frame_ack == NULL) {
+    if (s_state_mutex == NULL) {
         goto no_memory;
     }
 
@@ -546,7 +607,7 @@ esp_err_t anim_bin_player_init(lv_obj_t *parent)
         goto no_memory;
     }
 
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < (int)ANIM_BUFFER_COUNT; i++) {
         s_buffers[i] = heap_caps_malloc(
             ANIM_BUFFER_SIZE,
             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -575,10 +636,12 @@ esp_err_t anim_bin_player_init(lv_obj_t *parent)
 
     s_initialized = true;
     ESP_LOGI(TAG,
-             "播放器已初始化：双 Buffer A/B，各 %u bytes，PSRAM 常驻 %u KB，"
-             "SD 内部读缓存 %u KB",
-             ANIM_BUFFER_SIZE, (2U * ANIM_BUFFER_SIZE) / 1024U,
-             ANIM_SD_READ_CHUNK / 1024U);
+             "播放器已初始化：三 Buffer A/B/C，各 %u bytes，PSRAM 常驻 %u KB，"
+             "SD 内部读缓存 %u KB，任务 CPU%u/P%u",
+             ANIM_BUFFER_SIZE,
+             (ANIM_BUFFER_COUNT * ANIM_BUFFER_SIZE) / 1024U,
+             ANIM_SD_READ_CHUNK / 1024U,
+             ANIM_TASK_CORE, ANIM_TASK_PRIORITY);
     return ESP_OK;
 
 no_memory:
@@ -590,7 +653,7 @@ no_memory:
         lv_obj_del(s_image);
         s_image = NULL;
     }
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < (int)ANIM_BUFFER_COUNT; i++) {
         if (s_buffers[i] != NULL) {
             heap_caps_free(s_buffers[i]);
             s_buffers[i] = NULL;
@@ -599,10 +662,6 @@ no_memory:
     if (s_sd_read_buffer != NULL) {
         heap_caps_free(s_sd_read_buffer);
         s_sd_read_buffer = NULL;
-    }
-    if (s_frame_ack != NULL) {
-        vSemaphoreDelete(s_frame_ack);
-        s_frame_ack = NULL;
     }
     if (s_state_mutex != NULL) {
         vSemaphoreDelete(s_state_mutex);
@@ -631,7 +690,6 @@ esp_err_t anim_bin_player_play(const char *path)
     s_frame_pending = false;
     xSemaphoreGive(s_state_mutex);
 
-    xSemaphoreGive(s_frame_ack);
     xTaskNotifyGive(s_player_task);
     return ESP_OK;
 }
@@ -650,7 +708,6 @@ void anim_bin_player_stop(void)
     s_frame_pending = false;
     xSemaphoreGive(s_state_mutex);
 
-    xSemaphoreGive(s_frame_ack);
     xTaskNotifyGive(s_player_task);
 }
 

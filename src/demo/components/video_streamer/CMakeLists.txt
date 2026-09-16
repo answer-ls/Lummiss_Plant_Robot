@@ -7,7 +7,8 @@ idf_component_register(
         esp_hw_support
         esp_timer
         esp_h264
-        network)
+        network
+        json)
 
 # YUV422 转 YUV420 是当前流水线中耗时最大的逐像素循环。仅对本组件启用
 # 性能优化，保留工程其余组件的调试构建和断言设置。

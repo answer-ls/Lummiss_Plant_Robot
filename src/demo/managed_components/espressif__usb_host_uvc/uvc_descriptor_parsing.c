@@ -12,9 +12,9 @@
 #include "usb/uvc_host.h"
 #include "uvc_check_priv.h"
 
-/* 对照测试：当前摄像头 alt=2 的 effective_MPS=2436，刚好覆盖其
- * dwMaxPayloadTransferSize。设为 0 恢复自动选择最大可用 alternate。 */
-#define UVC_TEST_FORCE_ISOC_ALT 0
+/* 新摄像头对照测试：固定选择 alt=1，使有效 MPS=3072 与
+ * UVC Probe/Commit 协商出的最大负载保持一致。改为 0 可恢复自动选择。 */
+#define UVC_TEST_FORCE_ISOC_ALT 1
 #include "uvc_descriptors_priv.h"
 
 #define FLOAT_EQUAL(a, b) (fabsf(a - b) < 0.0001f) // For comparing float values with acceptable difference (epsilon value)

@@ -1,6 +1,6 @@
 # Lummiss 盆栽陪伴机器人项目交接说明
 
-更新时间：2026-09-15
+更新时间：2026-09-16
 
 ## 1. 当前结论
 
@@ -13,6 +13,8 @@
 - 2026-09-11 已确认：当前 P4 v1.3 + ESP-IDF 5.5.5 不能可靠使用 PPA/DMA2D 做 YUV422→YUV420；工程保留能力探测并回退 CPU。CPU 转换改为 8 个 2 行宏块一段，块间调度让出并插入 20 µs 短空隙，当前转换耗时约 15.0～15.4 ms。该改动未使短测 UVC 丢帧明显下降，剩余瓶颈仍是 H.264/PSRAM 与 USB ISOC 的长期争用或调度。
 - **2026-09-15 视频上传目标变更**：视频不再指向局域网 PC 的 `ws://<PC>:8001/ws`。该路径已断——代码里没有硬编码地址，`main.c` 只从 OTA 结果取 `websocket_url`，且 `ota_client.c` 现在会拒绝非 `wss://` 的返回值；而 PC 端 8001 服务与 8000 预览页仍在，但已经没有设备会连它。**当前视频与小智语音推的是同一条连接**：`wss://www.lummiss.com/server/lummiss/v1/`，用 OTA 下发的动态 Token 加 `Device-Id`/`Client-Id` 头鉴权。仓库内 `README.md` 与 `CAMERA_UPLOAD_TEST.md` 仍是旧 PC 地址的描述，尚未更新。
 - **2026-09-15 音频与小智**：新增 `components/xiaozhi_audio`（板载 ES8311 采集/播放 + Opus 编解码 + 小智协议）。语音链路**已端到端打通**（上行 Opus → 服务端 ASR → LLM → TTS → 下行 Opus 播放），且**摄像头推流时同样可用**——同日稍早那份"与视频共存时失效"的 A/B 结论**已被推翻**（更正见附录 A.7）。当前第一优先级问题改为**内部 DMA 池被挤碎**、ESP-Hosted 收包路径取不到缓冲就 assert 重启，见第 10 节第 1 条与附录 A.9。
+- **2026-09-16 UVC 新摄像头固定冷启动诊断**：针对 HBVCAM（VID `058F`、PID `3822`）增加两个编译期固定测试档：`640×480 MJPEG@30` 和 `1280×720 MJPEG@30`。纯 UVC 档位一次运行只请求一个分辨率，失败后不轮转格式，必须重新构建并冷启动/重新枚举摄像头。保持 `alt=1`、`effective_MPS=3072`、`8×16 KB URB`、6 packets/transfer 和 26 字节 Probe/Commit 不变。
+- **2026-09-16 UVC 组帧根因定位**：640×480 日志中 SOI/EOI、FID、EOF 均存在，但 `frame_len` 在约 2136 字节后停止。原因是 `uvc_isoc.c` 对 `actual_num_bytes==0` 的普通零长度 ISOC 包统计后错误设置 `skip_current_frame`；frame buffer 没有释放，后续同 FID/PTS payload 因 skip 标志无法继续追加。现已改为零长度包只计数并忽略，并加入 `empty_inside_active_frame`、`frame_abort_by_empty`、`header_only_inside_active_frame`、`frame_abort_by_header_only` 及事件中的 `active=before→after` 诊断。该修复已构建通过，尚待开发板重新烧录后的 640×480 冷启动实测确认。
 - UI 状态机、传感器、触摸、LED、电机、专注模式、电源管理和整机联调均未进入实现阶段。
 
 开发流程基线为根目录的 `盆栽陪伴机器人_开发文档.md`。本文只记录当前事实和下一步，不替代该设计文档。
@@ -48,6 +50,7 @@ src/esp_draw_bit     厂商示例副本，只作参考
 | WiFi Host 组件 | `espressif/esp_hosted` 2.7.4 |
 | 远程 WiFi API | `espressif/esp_wifi_remote` 1.3.0 |
 | BLE/WiFi 配网组件 | `espressif/network_provisioning` 1.2.4 |
+| 唤醒词/语音前端 | `espressif/esp-sr` ~2.3.0（AFE + Hi-Max 唤醒模型） |
 | 默认串口 | COM17 |
 
 工程根目录必须保持英文路径。旧中文路径曾导致 Python/Kconfig 的 GBK 解码错误和 Ninja 乱码路径错误。
@@ -71,8 +74,10 @@ src/esp_draw_bit     厂商示例副本，只作参考
 | `components/sd_card/sd_card.c/.h` | SDMMC Slot 0 挂载，含片上 LDO ch.4 供电和重试 |
 | `components/video_streamer/video_streamer.c/.h` | MJPEG 队列、硬件 JPEG 解码、CPU 分块 YUV422→YUV420、H.264 编码；**并持有唯一的 Agent WebSocket**（视频二进制帧、小智文本/Opus 都走它），对小智暴露 `video_streamer_set_agent_callbacks()` / `..._agent_send_text()` / `..._agent_send_audio()` |
 | `components/xiaozhi_audio/xiaozhi_audio.c/.h` | ES8311 采集/播放、Opus 编解码、小智协议（hello/listen/tts/stt/ping/pong）；不自己建连接，全部经 video_streamer 的 Agent WebSocket |
+| `components/xiaozhi_audio/wake_word.c/.h` | AFE 唤醒词检测（Hi-Max 模型，16 kHz 单声道），从 SPIFFS "model" 分区加载，在 `xiaozhi_audio_start()`（主任务上下文）初始化 |
 | `components/ota_client/ota_client.c/.h` | 取 OTA 结果里的 `websocket_url` + 动态 Token，校验必须是 `wss://` 且 Token 非空；串口只打长度不打正文 |
 | `components/video_streamer/dma2d_yuv.c/.h` | DMA2D 硬件 YUV422→YUV420（**本板 v1.3 不可用**，仅 codec-only 档位以外永不生效） |
+| `partitions.csv` | 分区表：nvs 24K + phy_init 4K + factory 8M + **model 1M（SPIFFS，存放 ESP-SR 唤醒词模型）** + storage 6M |
 | `tools/pc_camera_server.py` | PC 端 H.264 接收、保存、持久 PyAV 解码和 MJPEG 网页预览 |
 | `tools/capture_camera_serial.py` | 采集串口日志到文件，供实机对照测试复盘 |
 | `tools/summarize_camera_serial.py` | 汇总串口日志：跳过启动前 15 秒，报窗口均值和累计数增量 |
@@ -80,7 +85,7 @@ src/esp_draw_bit     厂商示例副本，只作参考
 | `tools/gif_resize_for_sd.py` | 把表情 GIF 缩放到屏幕尺寸并写入 TF 卡目录 |
 | `tools/gif2c.py` | 把 GIF 转成 C 数组（**当前产物 `main/gif_assets.c` 已删除**，改走 TF 卡运行时解码） |
 
-当前统一构建目录为 `build_main_verified`。旧的 `build_screen_verified`、`build_camera_verified` 和 `build_c6_274` 只是历史验证产物，已于 2026-09-12 删除，不再对应当前入口。
+当前统一构建目录为 `build`，使用 `sdkconfig.bletest`。该配置已关闭强制 BLE 配网并启用开发板实际使用的 ESP-Hosted SDIO。根目录 `sdkconfig` 仍是历史 SPI/强制 BLE 配置，不要用于当前构建。
 
 **2026-09-12 清理**：删除无调用者的 `components/mjpeg_streamer/`（2026-09-10 直通预览的遗留，全树零引用）和未编译进固件的 `main/gif_assets.c/.h`（22k 行生成资源，已被 TF 卡运行时解码取代）。测试档位宏从 `camera_driver.h` + `main.c` 两处 6 个手写布尔宏收敛到 `main/test_profile.h` 一处。
 
@@ -95,9 +100,9 @@ src/esp_draw_bit     厂商示例副本，只作参考
 | 阶段 2：屏幕 | 部分完成 | ST7789 驱动、LVGL 8.4、320×240 动态时间首页、IP 定位、网络校时、天气 API、镜像修正、8 组表情资源保留、源码构建通过 | 真机颜色/方向/API/稳定性验收；LISTEN/THINK/REPLY/SLEEP/FAULT 页面；页面切换接口；电池管理完成后接入电量 |
 | 阶段 3：UI 状态机 | 未开始 | 当前只有静态时间首页 | Event Bus、状态请求、优先级、覆盖、恢复、超时和异常 |
 | 阶段 4：传感器/触摸/LED | 未开始 | 无 | 土壤、光照、温湿度、左右触摸、呼吸灯 |
-| 阶段 5：音频 | 部分完成 | `components/xiaozhi_audio`：板载 ES8311 I2S 采集与播放、Opus 编解码、16 kHz 单声道 60 ms 分帧、上行/下行实时通路已实机工作 | AEC、全双工、产品化增益/音量、长时间稳定性 |
+| 阶段 5：音频 | 部分完成 | `components/xiaozhi_audio`：板载 ES8311 I2S 采集与播放、Opus 编解码、16 kHz 单声道 60 ms 分帧、上行/下行实时通路已实机工作；**唤醒词检测已集成**（ESP-SR AFE + Hi-Max 模型，代码已就绪，待实机复测） | AEC、全双工、产品化增益/音量、长时间稳定性 |
 | 阶段 6：Wi-Fi | 部分完成 | P4-C6 ESP-Hosted/SDIO、独立 Network Manager、固定凭据、DHCP 实机成功、2 秒自动重连 | NVS 凭据、BLE 配网、HTTP 通用封装 |
-| 阶段 7：小智 | 部分完成 | 客户端 hello、`listen` 启停、`tts`/`stt` 下行文本、二进制 Opus 下行、`ping`/`pong` 已实现；端到端语音链路实机打通 | **与视频共用一条 WebSocket 时失效**；`abort` 与鉴权失败后的清 Token/重 OTA 未接；UI 状态映射、MCP |
+| 阶段 7：小智 | 部分完成 | 客户端 hello、`listen` 启停、`tts`/`stt` 下行文本、二进制 Opus 下行、`ping`/`pong` 已实现；端到端语音链路实机打通；**唤醒词检测已接入**（ESP-SR AFE，WebSocket 连接后自动启用，检测到唤醒词后停止 MIC 上行并触发聊天，回答结束后恢复监听） | `abort` 与鉴权失败后的清 Token/重 OTA 未接；UI 状态映射、MCP |
 | 阶段 8：摄像头 | 部分完成 | USB Host/UVC 枚举；800×600 MJPEG；JPEG 完整性门控；硬件 JPEG 解码；CPU 分块 YUV 转换；双任务 H.264 编码与 WebSocket 链路；16 字节帧头自描述分辨率；下行命令 ping/status；断线自动重连；PC 保存/持久解码/MJPEG 预览；首帧超时后的完整 USB Host/UVC 重建 | 10 分钟以上稳定性；浏览器实时画面长期验收；C6 固件版本对齐；正式 Camera API；运行期改分辨率 |
 | 阶段 9：旋转底座 | 未开始 | 无 | 电机、编码器、回零、角度、启停和堵转保护 |
 | 阶段 10：专注模式 | 未开始 | 无 | 全部功能 |
@@ -167,6 +172,59 @@ bootloader.bin：0x5310，Bootloader 分区剩余 13%
 烧录后正常现象应为：屏幕先显示时间和天气占位符；WiFi 联网后串口依次输出“网络时间同步成功”“自动定位成功”和“天气更新”，页面自动替换为当前日期、星期、时间、天气和温度，不显示电量。文字应正常朝向且不再左右镜像。
 
 ## 7. 摄像头当前验证结论
+
+### 2026-09-16 HBVCAM 640×480/1280×720 固定冷启动诊断
+
+这次测试使用新摄像头 HBVCAM（Windows 设备名 `HBVCAM CAMERA`，VID `058F`、PID
+`3822`）。电脑端已确认它可以输出 `MJPEG 640×480@30`。测试固件当前默认在
+`src/demo/main/test_profile.h` 中选择：
+
+```c
+#define CAMERA_UVC_COLD_TEST_MODE CAMERA_UVC_COLD_TEST_640X480
+```
+
+切换到 `CAMERA_UVC_COLD_TEST_1280X720` 后必须重新构建，并让开发板和摄像头重新上电/枚举。
+纯 UVC 测试不会在同一次运行里从一个分辨率切换到另一个分辨率。当前测试仍保持
+`alt=1`、`effective_MPS=3072`、`8×16 KB URB`、每个 URB 6 个 ISOC 包和 26 字节
+Probe/Commit。
+
+已采集的 640×480 日志显示：
+
+```text
+PTS change/same = 174/33818
+SOI/EOI = 175/174
+FID start = 175
+EOF=1、ERR=0、EOI 存在
+```
+
+这些数据证明摄像头在持续产生 JPEG 数据，问题不是普通 SOI/EOI 缺失。异常表现为一帧开始后
+`frame_len` 依次到达 `620、1208、1796、2136`，之后虽然仍收到非空 payload，长度不再增加。
+对应 packet 序号中出现疑似空 ISOC 包（例如 `39970`）。
+
+根因是旧的 `actual_num_bytes < sizeof(uvc_payload_header_t)` 分支把普通零长度包也标记为
+`skip_current_frame=true`。该操作不会释放 frame buffer，却会阻止之后所有同 FID/PTS 数据追加，
+最终造成“buffer 仍在、长度停住、EOF/EOI 也无法交帧”。1280×720 的数据更集中，空包大多落在帧
+间，因此此前仍能观察到部分 EOF 完成帧。
+
+当前修复和诊断：
+
+- `actual_num_bytes==0` 只增加 `empty_packet`，若发生在活动帧内再增加
+  `empty_inside_active_frame`，不修改 frame、FID 或 skip 状态。
+- 仅含 UVC header 的包继续处理 FID/EOF/ERR，并统计 `header_only_inside_active_frame`。
+- 增加 `frame_abort_by_empty`、`frame_abort_by_header_only`，用于确认空包是否意外令活动帧失活。
+- 关键事件 ring 保留最近 128 条，事件输出增加 `active=before->after`，不在 ISOC 回调中逐包打印。
+- 保留 PTS change/same、SOI/EOI、FID/EOF/EOI 完成原因、丢弃原因、当前/最大帧长和 buffer 容量统计。
+- SET_INTERFACE/GET_INTERFACE 完成后开始记录到首个非空包、首个 SOI、首个完整帧的延迟。
+
+本修复已在 `build` 构建通过，但尚未替代实机验证。下一次 640×480 冷启动应重点确认：
+
+```text
+frame_len 在空包后继续增长
+empty_inside_active > 0 时 abort_by_empty = 0
+header_only_inside_active 可有数值，但 abort_by_header_only = 0
+finish EOF/FID/EOI 出现有效计数
+UVC 本次启动成功
+```
 
 硬件为 LRCPG720p USB 摄像头，连接 ESP32-P4 高速 USB Host 口。已有完整日志证明：
 
@@ -292,12 +350,12 @@ E:\Lummiss_Plant_Robot\开发板示例\JC1060P470C_I_W_Y\8-Burn operation\Burn f
 ```powershell
 Set-Location E:\Lummiss_Plant_Robot\src\demo
 cmd /c _build_main.bat
-idf.py -B build_main_verified -p COM17 flash monitor
+idf.py -B build -p COM17 flash monitor
 ```
 
 `_build_main.bat` 可在普通终端激活本机 ESP-IDF 5.5.5 并完成联合构建。由于本机安装器把 Python 约束文件放在特殊位置，脚本设置了 `IDF_PYTHON_CHECK_CONSTRAINTS=no`；实际 Python 依赖检查仍在激活阶段显示为 OK。
 
-VS Code 当前默认使用 `build_main_verified`，生成器必须为 Ninja。若出现 `NMake Makefiles`，需要确认工作区打开的是 `src/demo` 并重新加载 VS Code 设置。
+VS Code 当前默认使用 `build`、`sdkconfig.bletest` 和 Ninja。若任务仍出现 `build_main_verified` 或 `build_bletest7`，需要确认工作区打开的是 `src/demo` 并执行 `Developer: Reload Window`。
 
 ## 10. 现在最需要解决的问题
 

@@ -22,7 +22,7 @@ static const char *TAG = "DISPLAY";
 #define LCD_PANEL_V_RES         320
 #define LCD_H_RES               320
 #define LCD_V_RES               240
-#define LCD_DRAW_LINES          40
+#define LCD_DRAW_LINES          20
 #define LCD_PIXEL_CLOCK_HZ      (40 * 1000 * 1000)
 
 /* 用户确认的 4 线 SPI 接线。背光 BL 接 3V3，程序不能调节亮度。 */

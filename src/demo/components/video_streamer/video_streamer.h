@@ -55,8 +55,8 @@ typedef struct {
  *     那只是更早一次短跑没撞上。降分辨率买不到帧完整性，得去查 EoF 检测与 URB 参数。
  *
  * 另外摄像头（LRCPG720p）实测声明最高只有 1280×960，**没有 1920×1080**。 */
-#define VIDEO_STREAM_WIDTH   800
-#define VIDEO_STREAM_HEIGHT  600
+#define VIDEO_STREAM_WIDTH   640
+#define VIDEO_STREAM_HEIGHT  480
 /* 单个 MJPEG 压缩帧的上限。这个值同时是 UVC 帧缓冲大小、视频输入环槽大小，
  * 以及 camera_driver 里"过大帧"的丢弃门限，三处必须保持一致。
  *
@@ -101,6 +101,11 @@ void video_streamer_set_agent_callbacks(
     const video_streamer_agent_callbacks_t *callbacks);
 esp_err_t video_streamer_agent_send_text(const char *text);
 esp_err_t video_streamer_agent_send_audio(const uint8_t *data, size_t len);
+/* 唤醒前音频需要按顺序完整进入发送队列，再发送 listen/detect。 */
+esp_err_t video_streamer_agent_send_audio_wait(const uint8_t *data,
+                                               size_t len,
+                                               uint32_t timeout_ms);
+esp_err_t video_streamer_agent_wait_audio_drain(uint32_t timeout_ms);
 
 /* 当输入来自独立 MJPEG 复制池时，允许把该缓冲所有权交给编解码任务，
  * 避免 handoff 任务再次复制。release_cb 会在 JPEG 解码完成或输入被丢弃

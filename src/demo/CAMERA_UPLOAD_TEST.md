@@ -32,8 +32,8 @@ Set-Location E:\Lummiss_Plant_Robot\src\demo
 再构建、烧录和监视：
 
 ```powershell
-idf.py -B build_main_verified build
-idf.py -B build_main_verified -p COM17 flash monitor
+idf.py -B build build
+idf.py -B build -p COM17 flash monitor
 ```
 
 服务器状态和预览地址为 `http://127.0.0.1:8000/`。首次运行启动脚本会自动安装 PyAV/OpenCV/websockets。`GET /preview.mjpg` 是浏览器持续预览流；视频帧走 **WebSocket `ws://<PC>:8001/ws`**，`GET /h264`（HTTP POST）作为回退通道保留。

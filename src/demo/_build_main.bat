@@ -7,5 +7,5 @@ set IDF_PYTHON_CHECK_CONSTRAINTS=no
 call "%IDF_PATH%\export.bat"
 if errorlevel 1 exit /b 1
 cd /d E:\Lummiss_Plant_Robot\src\demo
-idf.py -B build_main_verified build
+idf.py -B build build
 exit /b %errorlevel%

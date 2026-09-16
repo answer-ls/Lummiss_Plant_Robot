@@ -13,4 +13,12 @@ bool xiaozhi_audio_is_connected(void);
 bool xiaozhi_audio_is_listening(void);
 bool xiaozhi_audio_is_speaking(void);
 
+/* 查询唤醒词检测状态。 */
+bool xiaozhi_audio_is_wake_detected(void);
+const char *xiaozhi_audio_get_wake_word(void);
+
+/* MCP 音量工具使用的本地音量控制接口，范围为 0~100。 */
+esp_err_t xiaozhi_audio_set_volume(int volume);
+int xiaozhi_audio_get_volume(void);
+
 #endif /* LUMMISS_XIAOZHI_AUDIO_H */

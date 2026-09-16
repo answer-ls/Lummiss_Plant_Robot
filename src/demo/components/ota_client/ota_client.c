@@ -174,6 +174,16 @@ esp_err_t ota_client_check(ota_result_t *result)
     /* OTA 响应包含 WebSocket 动态 Token，串口只能记录长度，不能输出正文。 */
     ESP_LOGI(TAG, "OTA 响应已接收（%d 字节）", (int)ota_buffer_len);
 
+    /* 只诊断响应结构是否包含关键对象，不输出 URL、Token 或其他敏感内容。 */
+    ESP_LOGI(TAG,
+             "OTA 响应结构：server_time=%s firmware=%s websocket=%s "
+             "activation=%s error=%s",
+             ota_json_field_exists(ota_buffer, "server_time") ? "存在" : "缺少",
+             ota_json_field_exists(ota_buffer, "firmware") ? "存在" : "缺少",
+             ota_json_field_exists(ota_buffer, "websocket") ? "存在" : "缺少",
+             ota_json_field_exists(ota_buffer, "activation") ? "存在" : "缺少",
+             ota_json_field_exists(ota_buffer, "error") ? "存在" : "缺少");
+
     if (ota_json_field_exists(ota_buffer, "error")) {
         char err_msg[256] = {0};
         if (ota_json_get_string(ota_buffer, "error",

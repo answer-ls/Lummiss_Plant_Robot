@@ -28,8 +28,13 @@
 #include "freertos/task.h"
 
 #include "video_streamer.h"
+#include "wake_word.h"
 
 static const char *TAG = "XIAOZHI_AUDIO";
+
+/* UI 组件由 main 注册为同一固件的一部分；弱符号避免音频组件反向依赖 main。 */
+extern void expression_manager_post_state(const char *state) __attribute__((weak));
+extern void expression_manager_post_emotion(const char *emotion) __attribute__((weak));
 
 /* 这些引脚来自厂商 guition-jc1060p470-y 小智示例。 */
 #define XIAOZHI_I2C_PORT              I2C_NUM_1
@@ -49,6 +54,8 @@ static const char *TAG = "XIAOZHI_AUDIO";
 #define XIAOZHI_FRAME_DURATION_MS     60
 #define XIAOZHI_CODEC_INPUT_GAIN_DB   30.0f
 #define XIAOZHI_CODEC_OUTPUT_VOLUME   60
+
+static volatile int s_output_volume = XIAOZHI_CODEC_OUTPUT_VOLUME;
 /* 深度按"下行会被突发注入多少包"定，不是按播放节奏定。
  *
  * 未开启 ESP_WS_CLIENT_SEPARATE_TX_LOCK 时，收发共用 client->lock：上传一帧
@@ -80,6 +87,7 @@ static const char *TAG = "XIAOZHI_AUDIO";
 #define XIAOZHI_DECODE_STACK_BYTES    20480
 #define XIAOZHI_OUTPUT_STACK_BYTES    6144
 #define XIAOZHI_SERVICE_STACK_BYTES   7168
+#define XIAOZHI_WAKE_PROCESS_STACK_BYTES 40960
 #define XIAOZHI_REPORT_MS             5000
 
 /* I2S 输出留在 CPU0，并提高到视频上传任务之上，优先及时补充 DMA；Opus 解码
@@ -92,12 +100,18 @@ static const char *TAG = "XIAOZHI_AUDIO";
 #define XIAOZHI_OUTPUT_CORE            0
 #define XIAOZHI_OUTPUT_PRIORITY       10
 #define XIAOZHI_SERVICE_PRIORITY       5
+#define XIAOZHI_WAKE_PROCESS_CORE      1
+#define XIAOZHI_WAKE_PROCESS_PRIORITY  8
+
+#define XIAOZHI_WAKE_AUDIO_QUEUE_TIMEOUT_MS  500
+#define XIAOZHI_WAKE_AUDIO_DRAIN_TIMEOUT_MS 5000
 
 #define XIAOZHI_EVENT_CHAT_CONNECTED  BIT0
 #define XIAOZHI_EVENT_DISCONNECTED    BIT1
 #define XIAOZHI_EVENT_CHANNEL_ACTIVE  BIT2
 #define XIAOZHI_EVENT_UPLINK_ENABLED  BIT3
 #define XIAOZHI_EVENT_SPEAKING        BIT4
+#define XIAOZHI_EVENT_WAKE_ACTIVE     BIT5
 
 typedef struct {
     uint16_t size;
@@ -145,7 +159,9 @@ static TaskHandle_t s_service_task;
 static TaskHandle_t s_capture_task;
 static TaskHandle_t s_decode_task;
 static TaskHandle_t s_output_task;
+static TaskHandle_t s_wake_process_task;
 static bool s_started;
+static bool s_wake_word_ready;
 
 static uint32_t s_capture_frames;
 static uint32_t s_capture_bytes;
@@ -240,11 +256,155 @@ static bool playback_pipeline_empty(void)
             uxQueueMessagesWaiting(s_pcm_ready_queue) == 0);
 }
 
+/* 官方示例的自动对话模式：回答播放完成后继续监听，不要求再次说唤醒词。 */
+static void resume_listening_after_playback(void)
+{
+    if (!s_wake_word_ready ||
+        (xEventGroupGetBits(s_events) & XIAOZHI_EVENT_CHANNEL_ACTIVE) == 0 ||
+        (xEventGroupGetBits(s_events) & XIAOZHI_EVENT_SPEAKING) != 0 ||
+        !playback_pipeline_empty() ||
+        (xEventGroupGetBits(s_events) & XIAOZHI_EVENT_UPLINK_ENABLED) != 0) {
+        return;
+    }
+
+    char listen_start[192];
+    snprintf(listen_start, sizeof(listen_start),
+             "{\"session_id\":\"%s\",\"type\":\"listen\","
+             "\"state\":\"start\",\"mode\":\"auto\"}",
+             s_session_id);
+    if (video_streamer_agent_send_text(listen_start) == ESP_OK) {
+        xEventGroupSetBits(s_events, XIAOZHI_EVENT_UPLINK_ENABLED);
+        ESP_LOGI(TAG, "回答播放完成，恢复连续对话监听");
+    } else {
+        ESP_LOGW(TAG, "恢复连续对话监听失败，重新等待唤醒词");
+        wake_word_start();
+        xEventGroupSetBits(s_events, XIAOZHI_EVENT_WAKE_ACTIVE);
+    }
+}
+
 static void restore_uplink_after_playback(void)
 {
-    if ((xEventGroupGetBits(s_events) & XIAOZHI_EVENT_SPEAKING) == 0 &&
-        playback_pipeline_empty()) {
+    resume_listening_after_playback();
+}
+
+/* 与开发板示例一致：唤醒时先发送 AFE 保存的前置音频，再发送 detect/start。
+ * 使用当前 Opus 编码器即可；此时实时上行尚未开启，不会与采集任务并发编码。 */
+static void send_wake_preroll(void)
+{
+    const size_t available = wake_word_copy_preroll(NULL, 0);
+    const size_t frame_samples =
+        (size_t)s_audio.encoder_input_size / sizeof(int16_t);
+    if (available < frame_samples || frame_samples == 0) {
+        ESP_LOGW(TAG, "唤醒前音频不足，跳过前置音频发送");
+        return;
+    }
+
+    int16_t *pcm = heap_caps_malloc(available * sizeof(int16_t),
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (pcm == NULL) {
+        ESP_LOGW(TAG, "唤醒前音频复制缓冲分配失败，继续建立对话");
+        return;
+    }
+    const size_t samples = wake_word_copy_preroll(pcm, available);
+    esp_opus_enc_reset(s_audio.opus_encoder);
+
+    size_t sent_packets = 0;
+    for (size_t offset = 0; offset + frame_samples <= samples;
+         offset += frame_samples) {
+        esp_audio_enc_in_frame_t input = {
+            .buffer = (uint8_t *)(pcm + offset),
+            .len = (uint32_t)s_audio.encoder_input_size,
+        };
+        esp_audio_enc_out_frame_t output = {
+            .buffer = s_audio.capture_opus,
+            .len = (uint32_t)s_audio.encoder_output_size,
+        };
+        esp_audio_err_t error = esp_opus_enc_process(
+            s_audio.opus_encoder, &input, &output);
+        if (error != ESP_AUDIO_ERR_OK || output.encoded_bytes == 0 ||
+            video_streamer_agent_send_audio_wait(
+                s_audio.capture_opus, output.encoded_bytes,
+                XIAOZHI_WAKE_AUDIO_QUEUE_TIMEOUT_MS) != ESP_OK) {
+            ESP_LOGW(TAG, "唤醒前音频发送中断，已发送 %u 包",
+                     (unsigned)sent_packets);
+            break;
+        }
+        sent_packets++;
+    }
+    heap_caps_free(pcm);
+
+    esp_err_t drain_error = video_streamer_agent_wait_audio_drain(
+        XIAOZHI_WAKE_AUDIO_DRAIN_TIMEOUT_MS);
+    if (drain_error != ESP_OK) {
+        ESP_LOGW(TAG, "等待唤醒前音频发完超时: %s",
+                 esp_err_to_name(drain_error));
+    }
+    ESP_LOGI(TAG, "唤醒前音频已处理：%u 包，约 %u ms",
+             (unsigned)sent_packets,
+             (unsigned)(sent_packets * XIAOZHI_FRAME_DURATION_MS));
+}
+
+static void process_detected_wake_word(const char *wake_word)
+{
+    if (s_events == NULL) {
+        return;
+    }
+    if ((xEventGroupGetBits(s_events) & XIAOZHI_EVENT_CHANNEL_ACTIVE) == 0) {
+        xEventGroupClearBits(s_events, XIAOZHI_EVENT_WAKE_ACTIVE);
+        ESP_LOGW(TAG, "收到唤醒词但语音通道未激活，等待连接后重新检测: %s",
+                 wake_word);
+        return;
+    }
+    xEventGroupClearBits(s_events, XIAOZHI_EVENT_WAKE_ACTIVE);
+    ESP_LOGI(TAG, "唤醒词已触发: %s", wake_word);
+    if (expression_manager_post_state != NULL) {
+        expression_manager_post_state("listen");
+    }
+
+    send_wake_preroll();
+
+    char listen_detect[256];
+    char listen_start[192];
+    snprintf(listen_detect, sizeof(listen_detect),
+             "{\"session_id\":\"%s\",\"type\":\"listen\","
+             "\"state\":\"detect\",\"text\":\"%s\"}",
+             s_session_id, wake_word);
+    snprintf(listen_start, sizeof(listen_start),
+             "{\"session_id\":\"%s\",\"type\":\"listen\","
+             "\"state\":\"start\",\"mode\":\"auto\"}",
+             s_session_id);
+
+    if (video_streamer_agent_send_text(listen_detect) == ESP_OK &&
+        video_streamer_agent_send_text(listen_start) == ESP_OK) {
         xEventGroupSetBits(s_events, XIAOZHI_EVENT_UPLINK_ENABLED);
+        ESP_LOGI(TAG, "麦克风上行已开启");
+    } else {
+        ESP_LOGE(TAG, "发送唤醒事件失败，恢复等待唤醒词");
+        if ((xEventGroupGetBits(s_events) &
+             XIAOZHI_EVENT_CHANNEL_ACTIVE) != 0) {
+            wake_word_start();
+            xEventGroupSetBits(s_events, XIAOZHI_EVENT_WAKE_ACTIVE);
+        }
+    }
+}
+
+/* Opus/SILK 编码需要大栈。检测回调运行在只有 4 KB 栈的 AFE 任务中，
+ * 因此回调只能通知本任务，不能直接编码唤醒前音频。 */
+static void wake_process_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        process_detected_wake_word(wake_word_get_last());
+    }
+}
+
+static void wake_word_detected_cb(const char *wake_word, void *user_data)
+{
+    (void)user_data;
+    ESP_LOGI(TAG, "唤醒词事件已提交: %s", wake_word);
+    if (s_wake_process_task != NULL) {
+        xTaskNotifyGive(s_wake_process_task);
     }
 }
 
@@ -259,6 +419,10 @@ static void stop_worker_tasks(void)
     if (s_decode_task != NULL) {
         vTaskDeleteWithCaps(s_decode_task);
         s_decode_task = NULL;
+    }
+    if (s_wake_process_task != NULL) {
+        vTaskDeleteWithCaps(s_wake_process_task);
+        s_wake_process_task = NULL;
     }
     if (s_output_task != NULL) {
         vTaskDeleteWithCaps(s_output_task);
@@ -444,6 +608,7 @@ static esp_err_t audio_hw_init(void)
                           s_audio.codec_device,
                           XIAOZHI_CODEC_OUTPUT_VOLUME) == ESP_CODEC_DEV_OK,
                       ESP_FAIL, fail, TAG, "设置扬声器音量失败");
+    s_output_volume = XIAOZHI_CODEC_OUTPUT_VOLUME;
 
     ESP_LOGI(TAG,
              "板载音频初始化完成：ES8311，I2S%d，24kHz/16bit/mono，MIC DIN=GPIO%d",
@@ -707,6 +872,11 @@ static void capture_task(void *arg)
             } else if (audio_error != ESP_AUDIO_ERR_OK) {
                 s_capture_errors++;
             }
+        } else if ((bits & XIAOZHI_EVENT_CHANNEL_ACTIVE) &&
+                   (bits & XIAOZHI_EVENT_WAKE_ACTIVE)) {
+            wake_word_feed((const int16_t *)pcm,
+                           (size_t)s_audio.encoder_input_size /
+                           sizeof(int16_t));
         }
         report_audio_stats(peak);
     }
@@ -921,8 +1091,10 @@ static void server_connection_callback(bool connected, void *ctx)
                              XIAOZHI_EVENT_CHAT_CONNECTED |
                              XIAOZHI_EVENT_CHANNEL_ACTIVE |
                              XIAOZHI_EVENT_UPLINK_ENABLED |
-                             XIAOZHI_EVENT_SPEAKING);
+                             XIAOZHI_EVENT_SPEAKING |
+                             XIAOZHI_EVENT_WAKE_ACTIVE);
         xEventGroupSetBits(s_events, XIAOZHI_EVENT_DISCONNECTED);
+        wake_word_stop();
         s_session_id[0] = '\0';
         if (s_playback_queue != NULL) {
             xQueueReset(s_playback_queue);
@@ -1013,15 +1185,23 @@ static void server_text_callback(const char *text, size_t len, void *ctx)
             ESP_LOGE(TAG, "服务端 Hello 缺少有效 session_id");
             return;
         }
-        static const char listen_start[] =
-            "{\"type\":\"listen\",\"state\":\"start\",\"mode\":\"auto\"}";
-        if (video_streamer_agent_send_text(listen_start) == ESP_OK) {
-            xEventGroupSetBits(s_events,
-                               XIAOZHI_EVENT_CHANNEL_ACTIVE |
-                               XIAOZHI_EVENT_UPLINK_ENABLED);
+
+        xEventGroupSetBits(s_events, XIAOZHI_EVENT_CHANNEL_ACTIVE);
+
+        if (s_wake_word_ready) {
+            /* 不直接开启上行，先启动唤醒词检测。等用户说出唤醒词后再 send listen。 */
+            wake_word_stop();
+            wake_word_start();
+            xEventGroupSetBits(s_events, XIAOZHI_EVENT_WAKE_ACTIVE);
             ESP_LOGI(TAG,
-                     "服务端 Hello 已确认，session_id=%s，麦克风开始 16 kHz Opus 上行",
+                     "服务端 Hello 已确认，session_id=%s，等待唤醒词（你好小智）",
                      s_session_id);
+        } else {
+            /* 与示例保持一致：模型不可用时保持静默，禁止把环境声音直接上传。 */
+            xEventGroupClearBits(s_events, XIAOZHI_EVENT_UPLINK_ENABLED |
+                                           XIAOZHI_EVENT_WAKE_ACTIVE);
+            ESP_LOGE(TAG,
+                     "服务端 Hello 已确认，但唤醒词不可用，麦克风上行保持关闭");
         }
         return;
     }
@@ -1032,19 +1212,46 @@ static void server_text_callback(const char *text, size_t len, void *ctx)
         }
         if (strcmp(state, "start") == 0) {
             reset_speech_timing_stats();
-            xEventGroupClearBits(s_events, XIAOZHI_EVENT_UPLINK_ENABLED);
+            xEventGroupClearBits(s_events, XIAOZHI_EVENT_UPLINK_ENABLED |
+                                           XIAOZHI_EVENT_WAKE_ACTIVE);
             xEventGroupSetBits(s_events, XIAOZHI_EVENT_SPEAKING);
+            wake_word_stop();
             ESP_LOGI(TAG, "小智开始回答");
         } else if (strcmp(state, "stop") == 0) {
             xEventGroupClearBits(s_events, XIAOZHI_EVENT_SPEAKING);
-            if (playback_pipeline_empty()) {
-                xEventGroupSetBits(s_events, XIAOZHI_EVENT_UPLINK_ENABLED);
-                ESP_LOGI(TAG, "小智回答结束，恢复麦克风上行");
-            } else {
-                ESP_LOGI(TAG, "服务端回答结束，等待扬声器播放完剩余音频");
+            if (expression_manager_post_state != NULL) {
+                expression_manager_post_state("tts_stop");
+            }
+            if (s_wake_word_ready && playback_pipeline_empty()) {
+                resume_listening_after_playback();
+            } else if (s_wake_word_ready) {
+                ESP_LOGI(TAG, "服务端回答结束，等待扬声器播放完剩余音频后恢复连续对话");
             }
         } else if (strcmp(state, "sentence_start") == 0) {
             ESP_LOGI(TAG, "小智回答文本：%.*s", (int)len, text);
+        }
+    } else if (strcmp(message_type, "listen") == 0) {
+        char state[24] = {0};
+        if (json_string_value(text, "state", state, sizeof(state)) &&
+            strcmp(state, "stop") == 0) {
+            if (expression_manager_post_state != NULL) {
+                expression_manager_post_state("thinking");
+            }
+            xEventGroupClearBits(s_events, XIAOZHI_EVENT_UPLINK_ENABLED);
+            if ((xEventGroupGetBits(s_events) &
+                 XIAOZHI_EVENT_SPEAKING) == 0 && s_wake_word_ready) {
+                wake_word_stop();
+                wake_word_start();
+                xEventGroupSetBits(s_events, XIAOZHI_EVENT_WAKE_ACTIVE);
+                ESP_LOGI(TAG, "服务端结束连续监听，等待唤醒词");
+            }
+        }
+    } else if (strcmp(message_type, "llm") == 0) {
+        char emotion[20] = {0};
+        if (json_string_value(text, "emotion", emotion, sizeof(emotion)) &&
+            expression_manager_post_emotion != NULL) {
+            expression_manager_post_emotion(emotion);
+            ESP_LOGI(TAG, "收到情绪事件：%s", emotion);
         }
     } else if (strcmp(message_type, "stt") == 0) {
         ESP_LOGI(TAG, "语音识别结果：%.*s", (int)len, text);
@@ -1070,6 +1277,8 @@ static void abort_audio_service(void)
     }
     heap_caps_free(s_playback_queue_storage);
     s_playback_queue_storage = NULL;
+    wake_word_deinit();
+    s_wake_word_ready = false;
     audio_hw_cleanup();
     if (s_events != NULL) {
         vEventGroupDelete(s_events);
@@ -1140,6 +1349,14 @@ static void service_task(void *arg)
         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (task_result == pdPASS) {
         task_result = xTaskCreatePinnedToCoreWithCaps(
+            wake_process_task, "wake_process",
+            XIAOZHI_WAKE_PROCESS_STACK_BYTES, NULL,
+            XIAOZHI_WAKE_PROCESS_PRIORITY, &s_wake_process_task,
+            XIAOZHI_WAKE_PROCESS_CORE,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    if (task_result == pdPASS) {
+        task_result = xTaskCreatePinnedToCoreWithCaps(
             decode_task, "xiaozhi_dec", XIAOZHI_DECODE_STACK_BYTES, NULL,
             XIAOZHI_DECODE_PRIORITY, &s_decode_task, XIAOZHI_DECODE_CORE,
             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -1158,10 +1375,11 @@ static void service_task(void *arg)
 
     ESP_LOGI(TAG,
              "小智音频流水线已就绪：MIC=CPU%d/P%d，DEC=CPU%d/P%d，"
-             "SPK=CPU%d/P%d，PCM=%u帧",
+             "SPK=CPU%d/P%d，WAKE=CPU%d/P%d，PCM=%u帧",
              XIAOZHI_CAPTURE_CORE, XIAOZHI_CAPTURE_PRIORITY,
              XIAOZHI_DECODE_CORE, XIAOZHI_DECODE_PRIORITY,
              XIAOZHI_OUTPUT_CORE, XIAOZHI_OUTPUT_PRIORITY,
+             XIAOZHI_WAKE_PROCESS_CORE, XIAOZHI_WAKE_PROCESS_PRIORITY,
              XIAOZHI_PCM_QUEUE_DEPTH);
 
     /* 初始化已完成；收发由 MIC、SPK 和 WebSocket 任务负责，无需保留空转任务。 */
@@ -1187,6 +1405,17 @@ esp_err_t xiaozhi_audio_start(void)
         .ctx = NULL,
     };
     video_streamer_set_agent_callbacks(&callbacks);
+
+    /* 在主任务上下文中初始化唤醒词引擎——包含 Flash mmap，需要较大栈。
+     * service_task 只有 7KB 栈，不够支撑 spi_flash_mmap 的缓存操作。      */
+    s_wake_word_ready = false;
+    if (wake_word_init(1) == ESP_OK) {
+        wake_word_set_callback(wake_word_detected_cb, NULL);
+        s_wake_word_ready = true;
+        ESP_LOGI(TAG, "唤醒词引擎已就绪，等待 WebSocket 连接后启用");
+    } else {
+        ESP_LOGE(TAG, "唤醒词引擎初始化失败，语音上行将保持关闭");
+    }
 
     s_started = true;
     BaseType_t result = xTaskCreatePinnedToCoreWithCaps(
@@ -1224,4 +1453,36 @@ bool xiaozhi_audio_is_speaking(void)
 {
     return s_events != NULL &&
            (xEventGroupGetBits(s_events) & XIAOZHI_EVENT_SPEAKING) != 0;
+}
+
+bool xiaozhi_audio_is_wake_detected(void)
+{
+    return wake_word_is_detected();
+}
+
+const char *xiaozhi_audio_get_wake_word(void)
+{
+    return wake_word_get_last();
+}
+
+esp_err_t xiaozhi_audio_set_volume(int volume)
+{
+    if (volume < 0 || volume > 100) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_audio.codec_device == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (esp_codec_dev_set_out_vol(s_audio.codec_device, volume) !=
+        ESP_CODEC_DEV_OK) {
+        return ESP_FAIL;
+    }
+    s_output_volume = volume;
+    ESP_LOGI(TAG, "扬声器音量已设置为 %d", volume);
+    return ESP_OK;
+}
+
+int xiaozhi_audio_get_volume(void)
+{
+    return s_output_volume;
 }

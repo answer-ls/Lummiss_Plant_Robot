@@ -14,11 +14,16 @@
 - WiFi 断开后每 2 秒自动发起重连；连接状态和 IP 信息只由 Network Manager 对外提供。
 - Video Streamer 从完整 MJPEG 帧中处理 800×600@20 FPS 上限，经 P4 硬件 JPEG 直出 YUV422、CPU 分块色度抽样/重排和 H.264 硬件编码，再由独立上传任务通过 WebSocket 二进制帧发送（每帧前置 16 字节自描述头携带分辨率与帧率）。当前编码参数为 800×600、4 Mbps、GOP 20；实测编码约 15～20 FPS。
 - **上传目标已改为云端**：地址与动态 Token 来自 OTA 结果，当前为 `wss://www.lummiss.com/server/lummiss/v1/`，用 `Device-Id` / `Client-Id` / `Authorization: Bearer <token>` 三个头鉴权；`ota_client` 现在会拒绝非 `wss://` 的返回值。**代码里已无局域网地址**，PC 端 `tools/pc_camera_server.py`（8000 预览页 / 8001 WS）仍在但已无设备连接，本文件下方的旧描述属于历史。
-- 新增 `components/xiaozhi_audio`：板载 ES8311 麦克风/扬声器 + Opus 编解码 + 小智协议（hello/listen/tts/stt/ping/pong）。**它不自己建连接**，与视频共用 `video_streamer` 持有的同一条 Agent WebSocket。
+- 新增 `components/xiaozhi_audio`：板载 ES8311 麦克风/扬声器 + Opus 编解码 + 小智协议（hello/listen/tts/stt/ping/pong）+ **AFE 唤醒词检测**（"Hi, Lummiss" 唤醒词，使用 ESP-SR Hi-Max 模型，从 SPIFFS "model" 分区加载）。唤醒词检测在 WebSocket 连接后自动启用，检测到后回调触发聊天上行，回答结束后自动恢复监听。**它不自己建连接**，与视频共用 `video_streamer` 持有的同一条 Agent WebSocket。
 
 ## 2026-09-15 最新验证状态
 
-**视频 + 语音已同时跑在云端那条 WSS 上，语音链路本身能通，但两者共存时语音失效。**
+**视频 + 语音已同时跑在云端那条 WSS 上，语音链路本身能通；唤醒词引擎已就绪。**
+
+唤醒词引擎基于 ESP-SR AFE + Hi-Max 模型（`espressif/esp-sr: ~2.3.0`），从 1 MB SPIFFS
+"model" 分区加载。初始化在 `xiaozhi_audio_start()`（主任务上下文）中完成——不能在 `service_task`
+（7KB 栈）中调用，因为 `esp_srmodel_init` → `spi_flash_mmap` 需要临时禁用另一核的缓存，
+7KB 栈不够。唤醒词检测到后停止 MIC 上行并触发聊天，回答结束后自动恢复监听。
 
 语音链路端到端打通的证据（**摄像头断开**时）：
 `小智开始回答` → `小智回答文本：{"type":"tts","state":"sentence_start",...}` →
@@ -51,6 +56,31 @@ Opus packet"，而我们把每帧十几 KB 的 H.264 也发在同一条连接上
 （P4 上 AES 恒走 DMA 描述符路径、没有 Kconfig 可关，只有整个关掉硬件 AES 才能摘掉它），
 **待复测**，判据是串口里不再出现 `esp-aes:`。这条**不是**上面 A/B 的根因——摄像头断开那一场
 也有同样的报错而语音是好的。推导过程见附录 A.8。
+
+## 2026-09-16 HBVCAM UVC 固定冷启动测试
+
+新摄像头 `HBVCAM CAMERA`（VID `058F`、PID `3822`）已在电脑端确认支持 MJPEG。
+纯 UVC 诊断固件在 `main/test_profile.h` 中使用编译期固定模式：
+
+```c
+#define CAMERA_UVC_COLD_TEST_MODE CAMERA_UVC_COLD_TEST_640X480
+```
+
+另一个可选档位是 `CAMERA_UVC_COLD_TEST_1280X720`。每次切换分辨率都要重新构建并冷启动/重新枚举，
+同一次运行不会自动轮转格式。USB 参数保持 `alt=1`、`effective_MPS=3072`、`8×16 KB URB`、
+6 packets/transfer 和 26 字节 Probe/Commit。
+
+640×480 的两轮日志已证明 SOI、EOI、FID 和 EOF 都存在；此前 `frame_len` 停在约 2136 字节的原因是
+普通 `actual_num_bytes==0` ISOC 包被错误地设置成 `skip_current_frame`。现已修复为只统计并忽略，
+并增加空包/活动帧中止、header-only、PTS、组帧原因和 128 条关键事件 ring 诊断。
+
+构建成功后，640×480 实机复测应确认空包之后 `frame_len` 继续增加，并观察：
+
+```text
+[UVC_EMPTY] ... abort_by_empty=0 ... abort_by_header_only=0
+[UVC_BOUNDARY] ... finish EOF/FID/EOI 有效计数
+UVC 本次启动成功
+```
 
 ## 2026-09-12 验证状态（历史）
 
@@ -132,7 +162,8 @@ components/video_streamer/
 
 components/xiaozhi_audio/
 ├── xiaozhi_audio.c/.h       ES8311 采集/播放、Opus 编解码和小智协议
-└── CMakeLists.txt           esp_audio_codec、esp_codec_dev 依赖
+├── wake_word.c/.h           AFE 唤醒词检测（Hi-Max 模型），16 kHz 单声道输入
+└── CMakeLists.txt           esp_audio_codec、esp_codec_dev、esp-sr 依赖
 
 components/ota_client/
 ├── ota_client.c/.h          取 OTA 结果里的 WSS 地址与动态 Token（串口只打长度不打正文）
@@ -160,6 +191,16 @@ main/
 | `camera_task` | 7 | 8192 字节 | 运行 USB Host/UVC 摄像头驱动 |
 
 UVC 组件还会创建 USB 事件任务和驱动后台任务。所有显式 LVGL 初始化都由 UI Task 发起，摄像头任务不直接操作 LVGL。
+
+`components/xiaozhi_audio` 内部创建以下任务（由 `xiaozhi_audio_start()` 触发）：
+
+| 任务 | 核心 | 优先级 | 栈大小 | 职责 |
+| --- | ---: | ---: | ---: | --- |
+| `xiaozhi_service` | CPU0 | 5 | 7168 字节 | 网络事件、WS 状态同步、Opus 编码与上行 |
+| `xiaozhi_mic` | CPU0 | 6 | 5120 字节 | ES8311 I2S 接收、PCM 缓冲、周期性统计 |
+| `xiaozhi_spk` | CPU0 | 6 | 4096 字节 | ES8311 I2S 发送 |
+| `xiaozhi_decode` | CPU1 | 9 | 10240 字节 | 下行 Opus 解码 |
+| `wake_detect` | CPU1 | 3 | 5120 字节 | AFE 唤醒词检测（Hi-Max 模型，16 kHz） |
 
 `app_main()` 对网络只调用 `network_manager_init()` 和 `network_manager_start()`；WiFi 系统事件、DHCP 状态、BLE 配网和重连逻辑均封装在 `components/network` 与 `components/provisioning` 中。固件不再包含固定 SSID 或密码，WiFi 凭据由 App 经 BLE 下发并保存在板载 C6 的 Flash。App 对接协议见 `BLE_WIFI_PROVISIONING.md`。
 
@@ -216,11 +257,11 @@ cmd /c _build_main.bat
 在已经激活 ESP-IDF 5.5.5 的终端中：
 
 ```powershell
-idf.py -B build_main_verified build
-idf.py -B build_main_verified -p COM17 flash monitor
+idf.py -B build build
+idf.py -B build -p COM17 flash monitor
 ```
 
-VS Code 工作区也已默认使用 `build_main_verified` 和 Ninja。
+VS Code 工作区已默认使用 `build`、`sdkconfig.bletest` 和 Ninja。该配置为正常联网模式：已有 Wi-Fi 凭据时不会强制启动 BLE 配网。
 
 2026-09-11 CPU 分块转换版本的联合构建结果：
 
@@ -242,6 +283,7 @@ bootloader.bin：0x5310
 7. 完整联网档位下，`VIDEO_STREAM` 每 5 秒汇总一次，实际编码通常约 15 FPS；当前 CPU 分块版本仍需重点观察 UVC 丢帧、H.264 耗时、发送失败和网页预览丢帧，不能预期仅靠分块达到 20 FPS。
 8. OTA 完成后串口出现 `OTA 响应已接收（N 字节）`（**只打长度，不打正文**——正文含动态 Token），随后 `WS 已连接`。视频与小智共用这一条连接。
 9. `CAMERA_TEST_FULL`（档位 0）会启动小智：串口出现 `小智` 相关日志和 `MIC packets` / `SPK frames` 周期统计。说话时 `mic peak` 应到一万以上；服务端回话时 `SPK frames` 增长且 `drop=0`。**当前摄像头开着时语音会失效**（服务端回兜底话术），详见上方 2026-09-15 状态。
+10. 唤醒词引擎就绪时串口输出 `唤醒词引擎已就绪，等待 WebSocket 连接后启用`；WebSocket 连接后自动启动检测。若初始化失败则输出 `唤醒词引擎初始化失败，将退化为无唤醒词模式`，此时 MIC 上行在连接建立后立即开始。
 
 密码错误或路由器不可达时，串口会反复出现 `WiFi 已断开`、原因码和 2 秒后重连。若在这些日志之前就出现 Hosted/SDIO 初始化失败，应先检查板载 C6 固件；厂商提供的参考固件位于 `开发板示例/JC1060P470C_I_W_Y/8-Burn operation/Burn files/JC-C6-slave_v2.3.2.bin`。
 

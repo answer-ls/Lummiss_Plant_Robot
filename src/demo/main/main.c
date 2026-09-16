@@ -9,10 +9,10 @@
 #include "camera_driver.h"
 #include "device_identity.h"
 #include "display_driver.h"
+#include "expression_manager.h"
 #include "home_info.h"
 #include "network_manager.h"
 #include "ota_client.h"
-#include "screen_carousel.h"
 #include "test_profile.h"
 #include "video_streamer.h"
 #include "xiaozhi_audio.h"
@@ -30,12 +30,13 @@ static void ui_task(void *arg)
     (void)arg;
     ESP_LOGI(TAG, "UI Task 启动（CPU%d）", xPortGetCoreID());
     display_driver_start();
-
 #if TP_HAS(SD)
-    /* 屏幕轮播：天气首页 5 秒 → TF 卡上每个 GIF 各 5 秒 → 回到首页，循环。
-     * 必须放在 display_driver_start() 之后：轮播把已建好的天气首页当作
-     * 循环的第一环，也依赖这里初始化好的 LVGL。 */
-    screen_carousel_start();
+    if (expression_manager_init() != ESP_OK) {
+        ESP_LOGE(TAG, "Expression Manager 初始化失败，保持 HOME 页面");
+    }
+    /* 当前采用事件驱动表情，SD 卡仅由 Expression Manager 按事件读取；
+     * 不启动旧的 screen_carousel 自动轮播任务或定时器。 */
+    ESP_LOGI(TAG, "已禁用表情自动轮播，设备保持 HOME 页面");
 #else
     ESP_LOGI(TAG, "测试档位=%d（%s）：已暂停 GIF/SD 卡轮播",
              CAMERA_TEST_PROFILE, test_profile_name());

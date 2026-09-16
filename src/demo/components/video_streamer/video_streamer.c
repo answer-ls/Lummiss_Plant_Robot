@@ -6,6 +6,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "cJSON.h"
+
 #include "driver/jpeg_decode.h"
 #include "esp_h264_alloc.h"
 #include "esp_h264_enc_single.h"
@@ -14,6 +16,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -26,6 +29,106 @@
 static const char *TAG = "VIDEO_STREAM";
 
 static video_streamer_config_t s_ws_config;
+#define VIDEO_WS_SEND_TIMEOUT_MS 2000
+
+/* 由 xiaozhi_audio 提供的 MCP 音量接口。使用弱符号避免视频组件反向依赖音频组件。 */
+extern esp_err_t xiaozhi_audio_set_volume(int volume) __attribute__((weak));
+extern int xiaozhi_audio_get_volume(void) __attribute__((weak));
+extern void expression_manager_post_emotion(const char *emotion) __attribute__((weak));
+
+static void video_ws_handle_mcp(esp_websocket_client_handle_t client,
+                                const char *command)
+{
+    cJSON *root = cJSON_Parse(command);
+    cJSON *payload = root ? cJSON_GetObjectItem(root, "payload") : NULL;
+    cJSON *id = payload ? cJSON_GetObjectItem(payload, "id") : NULL;
+    cJSON *method = payload ? cJSON_GetObjectItem(payload, "method") : NULL;
+    char reply[2048];
+    int request_id = cJSON_IsNumber(id) ? id->valueint : 0;
+
+    if (!cJSON_IsObject(payload) || !cJSON_IsString(method)) {
+        cJSON_Delete(root);
+        return;
+    }
+
+    if (strcmp(method->valuestring, "initialize") == 0) {
+        snprintf(reply, sizeof(reply),
+                 "{\"type\":\"mcp\",\"payload\":{"
+                 "\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{"
+                 "\"protocolVersion\":\"2024-11-05\",\"capabilities\":{}}}}",
+                 request_id);
+    } else if (strcmp(method->valuestring, "tools/list") == 0) {
+        snprintf(reply, sizeof(reply),
+                 "{\"type\":\"mcp\",\"payload\":{"
+                 "\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{"
+                 "\"tools\":["
+                 "{\"name\":\"self.get_device_status\",\"description\":\"查询设备状态\",\"inputSchema\":{\"type\":\"object\"}},"
+                 "{\"name\":\"self.audio_speaker.set_volume\",\"description\":\"设置扬声器音量\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"volume\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":100}},\"required\":[\"volume\"]}}"
+                 ",{\"name\":\"self.screen.set_emotion\",\"description\":\"设置屏幕表情\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"emotion\":{\"type\":\"string\"}},\"required\":[\"emotion\"]}}"
+                 ",{\"name\":\"self.reboot\",\"description\":\"重启设备\",\"inputSchema\":{\"type\":\"object\"}}"
+                 "]}}}", request_id);
+    } else if (strcmp(method->valuestring, "tools/call") == 0) {
+        cJSON *params = cJSON_GetObjectItem(payload, "params");
+        cJSON *name = params ? cJSON_GetObjectItem(params, "name") : NULL;
+        cJSON *args = params ? cJSON_GetObjectItem(params, "arguments") : NULL;
+        if (cJSON_IsString(name) && strcmp(name->valuestring,
+                                           "self.audio_speaker.set_volume") == 0 &&
+            xiaozhi_audio_set_volume != NULL) {
+            cJSON *volume = args ? cJSON_GetObjectItem(args, "volume") : NULL;
+            esp_err_t err = cJSON_IsNumber(volume) ?
+                xiaozhi_audio_set_volume(volume->valueint) : ESP_ERR_INVALID_ARG;
+            snprintf(reply, sizeof(reply),
+                     "{\"type\":\"mcp\",\"payload\":{"
+                     "\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{"
+                     "\"content\":[{\"type\":\"text\",\"text\":\"%s\"}]}}}",
+                     request_id, err == ESP_OK ? "true" : "false");
+        } else if (cJSON_IsString(name) &&
+                   (strcmp(name->valuestring, "self.screen.set_emotion") == 0 ||
+                    strcmp(name->valuestring, "set_emotion") == 0)) {
+            cJSON *emotion = args ? cJSON_GetObjectItem(args, "emotion") : NULL;
+            if (cJSON_IsString(emotion) && expression_manager_post_emotion != NULL) {
+                expression_manager_post_emotion(emotion->valuestring);
+            }
+            snprintf(reply, sizeof(reply),
+                     "{\"type\":\"mcp\",\"payload\":{"
+                     "\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{"
+                     "\"content\":[{\"type\":\"text\",\"text\":\"true\"}]}}}",
+                     request_id);
+        } else if (cJSON_IsString(name) && strcmp(name->valuestring,
+                                                  "self.get_device_status") == 0) {
+            snprintf(reply, sizeof(reply),
+                     "{\"type\":\"mcp\",\"payload\":{"
+                     "\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{"
+                     "\"content\":[{\"type\":\"text\",\"text\":\"{\\\"volume\\\":%d,\\\"video_enabled\\\":%s}\"}]}}}",
+                     request_id, xiaozhi_audio_get_volume ? xiaozhi_audio_get_volume() : 0,
+                     video_streamer_is_enabled() ? "true" : "false");
+        } else if (cJSON_IsString(name) && strcmp(name->valuestring,
+                                                  "self.reboot") == 0) {
+            snprintf(reply, sizeof(reply),
+                     "{\"type\":\"mcp\",\"payload\":{"
+                     "\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{"
+                     "\"content\":[{\"type\":\"text\",\"text\":\"true\"}]}}}",
+                     request_id);
+            esp_websocket_client_send_text(client, reply, (int)strlen(reply),
+                                           pdMS_TO_TICKS(VIDEO_WS_SEND_TIMEOUT_MS));
+            cJSON_Delete(root);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            esp_restart();
+            return;
+        } else {
+            snprintf(reply, sizeof(reply),
+                     "{\"type\":\"mcp\",\"payload\":{"
+                     "\"jsonrpc\":\"2.0\",\"id\":%d,\"error\":{\"code\":-32601,\"message\":\"未知工具\"}}}",
+                     request_id);
+        }
+    } else {
+        cJSON_Delete(root);
+        return;
+    }
+    esp_websocket_client_send_text(client, reply, (int)strlen(reply),
+                                   pdMS_TO_TICKS(VIDEO_WS_SEND_TIMEOUT_MS));
+    cJSON_Delete(root);
+}
 
 /* WebSocket 地址和动态 Token 必须来自项目 OTA，正式固件不保留明文 WS fallback。 */
 /* 分辨率统一取 video_streamer.h 的公共常量，与摄像头侧"可编码帧"门控一致。 */
@@ -148,7 +251,6 @@ static video_streamer_config_t s_ws_config;
  * （TCP_SNDLOWAT = TCP_SND_BUF/2 = 32767 字节），2026-09-12 的完整档位日志里
  * 因此出现连续 5 次"连上不到 1 秒又断"，累计 56 秒黑屏。放宽到 2 秒的代价是
  * 阻塞期间占住输出槽，但断线代价是重连 2 秒起，取小的那个。 */
-#define VIDEO_WS_SEND_TIMEOUT_MS      2000
 #define VIDEO_WS_AUDIO_SEND_TIMEOUT_MS 200
 /* 没有视频帧时，上传任务按此周期检查音频队列；低于 60 ms 音频包周期。 */
 #define VIDEO_UPLOAD_POLL_MS          10
@@ -256,9 +358,11 @@ typedef struct {
     uint32_t send_failed;
     uint64_t encoded_bytes;
     uint64_t jpeg_decode_us;
+    uint32_t jpeg_max_us;       /* 报告周期内 JPEG 单帧最长耗时（重置式） */
     uint64_t input_queue_us;
     uint64_t validation_us;
     uint64_t yuv_repack_us;
+    uint32_t yuv_max_us;        /* 报告周期内 YUV 单帧最长耗时（重置式） */
     uint64_t h264_encode_us;
     uint32_t h264_max_us;     /* 报告周期内 H.264 单帧最长耗时（重置式） */
     uint64_t output_queue_us;
@@ -287,6 +391,8 @@ static bool s_stream_enabled = true;
  * H.264 编码和输出槽继续为一个已经不可写的 socket 消耗资源。 */
 static volatile bool s_ws_connected;
 static volatile bool s_yuv_busy;
+/* 包含队列内和正在发送的音频包，用于保证唤醒前音频先于 detect 文本发完。 */
+static volatile uint32_t s_agent_audio_pending;
 static int64_t s_next_ws_send_us;
 static esp_websocket_client_handle_t s_ws_client;
 static video_streamer_agent_callbacks_t s_agent_callbacks;
@@ -679,6 +785,11 @@ bool video_streamer_is_enabled(void)
 static void video_ws_handle_command(esp_websocket_client_handle_t client,
                                     const char *command)
 {
+    /* MCP 使用与示例一致的 type=mcp + JSON-RPC payload 封装。 */
+    if (strstr(command, "\"type\":\"mcp\"") != NULL) {
+        video_ws_handle_mcp(client, command);
+        return;
+    }
     char cmd[16];
     char reply[256];
 
@@ -768,8 +879,8 @@ static void video_ws_event_handler(void *handler_args,
             snprintf(hello, sizeof(hello),
                      "{\"type\":\"hello\",\"version\":1,"
                      "\"transport\":\"websocket\","
-                     "\"features\":{\"mcp\":false,\"aec\":false,"
-                     "\"emoji\":false},"
+                     "\"features\":{\"mcp\":true,\"aec\":false,"
+                     "\"emoji\":true},"
                      "\"capability_manifest\":{"
                      "\"variantCode\":\"DESKTOP_PET_V1\","
                      "\"manifestVersion\":1,"
@@ -899,18 +1010,15 @@ static void video_stream_report(int64_t now_us)
     /* 报告周期内的最大耗时：读出后清零，只统计当前窗口。 */
     s_stats.ws_max_us = 0;
     s_stats.h264_max_us = 0;
+    s_stats.jpeg_max_us = 0;
+    s_stats.yuv_max_us = 0;
     portEXIT_CRITICAL(&s_lock);
 
     const double seconds = (now_us - last_report_us) / 1000000.0;
     const uint32_t encoded_delta = current.encoded - previous.encoded;
-    /* decoded_delta / yuv_delta 只被下面 System B 的隔离档位日志用到。两个宏都是 0
-     * 时它们声明了却没人读，会被 -Wunused-variable 点名。所以跟着各自的 #if 出现。 */
-#if VIDEO_STREAM_JPEG_ONLY_TEST || VIDEO_STREAM_YUV_ONLY_TEST
     const uint32_t decoded_delta = current.jpeg_decoded - previous.jpeg_decoded;
-#endif
-#if VIDEO_STREAM_YUV_ONLY_TEST
     const uint32_t yuv_delta = current.yuv_converted - previous.yuv_converted;
-#endif
+    /* JPEG/YUV 各自使用独立样本数计算平均耗时，完整基线和隔离档位都可直接对照。 */
     const uint32_t sent_delta = current.sent - previous.sent;
     const uint64_t bytes_delta = current.encoded_bytes - previous.encoded_bytes;
     const uint64_t decode_us_delta = current.jpeg_decode_us - previous.jpeg_decode_us;
@@ -931,6 +1039,8 @@ static void video_stream_report(int64_t now_us)
         encoded_delta;
 #endif
     const double sample_count = processed_delta > 0 ? processed_delta : 1;
+    const double jpeg_sample_count = decoded_delta > 0 ? decoded_delta : 1;
+    const double yuv_sample_count = yuv_delta > 0 ? yuv_delta : 1;
     const UBaseType_t input_used = s_input_queue != NULL ? uxQueueMessagesWaiting(s_input_queue) : 0;
     const UBaseType_t input_capacity = s_input_queue != NULL ?
                                        uxQueueSpacesAvailable(s_input_queue) + input_used : 0;
@@ -953,13 +1063,15 @@ static void video_stream_report(int64_t now_us)
              bytes_delta * 8.0 / seconds / 1000.0);
 #endif
     ESP_LOGI(TAG,
-             "[VIDEO] avg ms input_wait=%.2f validate=%.2f JPEG_DEC=%.2f "
-             "YUV_CONV=%.2f H264_ENC=%.2f max_H264=%.2f output_wait=%.2f "
+             "[VIDEO] avg/max ms input_wait=%.2f validate=%.2f JPEG_DEC=%.2f/%.2f "
+             "YUV_CONV=%.2f/%.2f H264_ENC=%.2f max_H264=%.2f output_wait=%.2f "
              "SEND=%.2f max_SEND=%.2f",
              input_queue_us_delta / sample_count / 1000.0,
              validation_us_delta / sample_count / 1000.0,
-             decode_us_delta / sample_count / 1000.0,
-             repack_us_delta / sample_count / 1000.0,
+             decode_us_delta / jpeg_sample_count / 1000.0,
+             current.jpeg_max_us / 1000.0,
+             repack_us_delta / yuv_sample_count / 1000.0,
+             current.yuv_max_us / 1000.0,
              encode_us_delta / sample_count / 1000.0,
              current.h264_max_us / 1000.0,
              upload_received_delta > 0 ? output_queue_us_delta / upload_received_delta / 1000.0 : 0.0,
@@ -1170,12 +1282,15 @@ static void video_upload_task(void *arg)
             /* 断连时照样出队：留着的话重连后会把一段过期的语音补发上去，
              * 服务端拿到的新 session 里出现幻听。 */
             if (!ws_ready) {
+                __atomic_sub_fetch(&s_agent_audio_pending, 1,
+                                   __ATOMIC_SEQ_CST);
                 continue;
             }
             int sent = esp_websocket_client_send_bin(
                 ws_client, (const char *)audio_packet.data,
                 audio_packet.size,
                 pdMS_TO_TICKS(VIDEO_WS_AUDIO_SEND_TIMEOUT_MS));
+            __atomic_sub_fetch(&s_agent_audio_pending, 1, __ATOMIC_SEQ_CST);
             if (sent != audio_packet.size) {
                 video_stream_log_error_limited("Opus 音频发送失败", ESP_FAIL);
                 break;
@@ -1497,6 +1612,9 @@ static void video_codec_task(void *arg)
         portENTER_CRITICAL(&s_lock);
         s_stats.jpeg_decoded++;
         s_stats.jpeg_decode_us += decode_elapsed_us;
+        if ((uint64_t)decode_elapsed_us > s_stats.jpeg_max_us) {
+            s_stats.jpeg_max_us = (uint32_t)decode_elapsed_us;
+        }
         portEXIT_CRITICAL(&s_lock);
 
 #if VIDEO_STREAM_JPEG_ONLY_TEST
@@ -1552,6 +1670,9 @@ static void video_codec_task(void *arg)
         portENTER_CRITICAL(&s_lock);
         s_stats.yuv_converted++;
         s_stats.yuv_repack_us += repack_elapsed_us;
+        if ((uint64_t)repack_elapsed_us > s_stats.yuv_max_us) {
+            s_stats.yuv_max_us = (uint32_t)repack_elapsed_us;
+        }
         portEXIT_CRITICAL(&s_lock);
 #endif
 
@@ -1559,6 +1680,9 @@ static void video_codec_task(void *arg)
         portENTER_CRITICAL(&s_lock);
         s_stats.yuv_converted++;
         s_stats.yuv_repack_us += repack_elapsed_us;
+        if ((uint64_t)repack_elapsed_us > s_stats.yuv_max_us) {
+            s_stats.yuv_max_us = (uint32_t)repack_elapsed_us;
+        }
         portEXIT_CRITICAL(&s_lock);
         /* YUV-only 对照：转换完成后立即结束本帧，不进入 H.264。 */
         continue;
@@ -1720,9 +1844,55 @@ esp_err_t video_streamer_agent_send_audio(const uint8_t *data, size_t len)
         .size = (uint16_t)len,
     };
     memcpy(packet.data, data, len);
-    return xQueueSend(s_agent_audio_queue, &packet, 0) == pdTRUE
-               ? ESP_OK
-               : ESP_ERR_TIMEOUT;
+    __atomic_add_fetch(&s_agent_audio_pending, 1, __ATOMIC_SEQ_CST);
+    if (xQueueSend(s_agent_audio_queue, &packet, 0) == pdTRUE) {
+        return ESP_OK;
+    }
+    __atomic_sub_fetch(&s_agent_audio_pending, 1, __ATOMIC_SEQ_CST);
+    return ESP_ERR_TIMEOUT;
+}
+
+esp_err_t video_streamer_agent_send_audio_wait(const uint8_t *data,
+                                               size_t len,
+                                               uint32_t timeout_ms)
+{
+    if (data == NULL || len == 0 || len > VIDEO_WS_AUDIO_PACKET_MAX) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_agent_audio_queue == NULL ||
+        !__atomic_load_n(&s_ws_connected, __ATOMIC_SEQ_CST)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    video_agent_audio_packet_t packet = {
+        .size = (uint16_t)len,
+    };
+    memcpy(packet.data, data, len);
+    __atomic_add_fetch(&s_agent_audio_pending, 1, __ATOMIC_SEQ_CST);
+    if (xQueueSend(s_agent_audio_queue, &packet,
+                   pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
+        return ESP_OK;
+    }
+    __atomic_sub_fetch(&s_agent_audio_pending, 1, __ATOMIC_SEQ_CST);
+    return ESP_ERR_TIMEOUT;
+}
+
+esp_err_t video_streamer_agent_wait_audio_drain(uint32_t timeout_ms)
+{
+    if (s_agent_audio_queue == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const TickType_t started = xTaskGetTickCount();
+    const TickType_t timeout = pdMS_TO_TICKS(timeout_ms);
+    while (__atomic_load_n(&s_agent_audio_pending, __ATOMIC_SEQ_CST) != 0) {
+        if (!__atomic_load_n(&s_ws_connected, __ATOMIC_SEQ_CST)) {
+            return ESP_ERR_INVALID_STATE;
+        }
+        if ((xTaskGetTickCount() - started) >= timeout) {
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    return ESP_OK;
 }
 
 esp_err_t video_streamer_init(const video_streamer_config_t *config)
