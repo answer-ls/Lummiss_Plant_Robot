@@ -1,6 +1,6 @@
 # Lummiss 盆栽陪伴机器人项目交接说明
 
-更新时间：2026-09-16
+更新时间：2026-09-17
 
 ## 1. 当前结论
 
@@ -9,12 +9,14 @@
 - 阶段 1 已建立正式基础入口：`main.c` 使用 FreeRTOS 创建 UI Task 和 Camera Task，Network Manager 已负责 NVS 基础初始化。
 - 阶段 2 已完成 ST7789、LVGL 8.4 和动态时间首页代码及构建。首页使用网络校时、IP 自动定位与 Open-Meteo 天气 API，显示日期、星期、天气、温度和大号时间；电量留到电池管理阶段。镜像参数已修正，动态数据和屏幕效果仍待实机验证。
 - 阶段 6 的 BLE + WiFi 配网链路已经实机通过：ESP32-P4 经 ESP-Hosted/SDIO 使用板载 ESP32-C6 的 BLE Controller 和 WiFi。首次启动以 `LUMMISS_XXXXXX` 广播，App 通过官方 Unified Provisioning Security 2 下发凭据；成功后停止广播并启动业务。已有凭据时直接联网，断线自动重连。
-- 阶段 8 当前链路为 `800×600 MJPEG(YUV422) → P4 硬件 JPEG 直出 YUV422 → CPU 分块抽样/重排 O_UYY_E_VYY → H.264 硬件编码`；网络上传代码仍保留，但当前烧录的对照档位关闭 WebSocket。首帧超时会完整停止并确认 USB transfer 回调退出，再执行 USB Host/UVC 重建；本轮首帧重建后约 249 ms 成功。实测完整档位下 UVC 完整帧约 20～30 FPS、丢帧 19%～29%（2026-09-12 由同一次运行内的 A/B 定位为**编解码链路自身的 PSRAM 流量**，见第 7 节），H.264 实际约 15～20 FPS，**800×600@20 FPS 目标尚未达成**。RGB565 全帧 BT.601 软件换算已删除，编解码与网络上传已拆成两个 FreeRTOS 任务。
+- 阶段 8 的历史完整链路基线为 `800×600 MJPEG(YUV422) → P4 硬件 JPEG → CPU YUV 转换 → H.264`，曾测得 UVC drop 19%～29%、H.264 约 15～20 FPS。2026-09-17 使用 HBVCAM 完成了新的 profile 5 分辨率对照：640×480 短时窗口约 30 FPS 且未见丢帧，1280×720 约 14～16.7 FPS 并有 UVC/JPEG 异常，细节见下方记录。当前 PC 预览宏已关闭；640×480 尚待长时间稳定性验收。profile 8 的 YUV 算法 A/B 是独立测试，不能与完整链路结果混为一谈。
 - 2026-09-11 已确认：当前 P4 v1.3 + ESP-IDF 5.5.5 不能可靠使用 PPA/DMA2D 做 YUV422→YUV420；工程保留能力探测并回退 CPU。CPU 转换改为 8 个 2 行宏块一段，块间调度让出并插入 20 µs 短空隙，当前转换耗时约 15.0～15.4 ms。该改动未使短测 UVC 丢帧明显下降，剩余瓶颈仍是 H.264/PSRAM 与 USB ISOC 的长期争用或调度。
-- **2026-09-15 视频上传目标变更**：视频不再指向局域网 PC 的 `ws://<PC>:8001/ws`。该路径已断——代码里没有硬编码地址，`main.c` 只从 OTA 结果取 `websocket_url`，且 `ota_client.c` 现在会拒绝非 `wss://` 的返回值；而 PC 端 8001 服务与 8000 预览页仍在，但已经没有设备会连它。**当前视频与小智语音推的是同一条连接**：`wss://www.lummiss.com/server/lummiss/v1/`，用 OTA 下发的动态 Token 加 `Device-Id`/`Client-Id` 头鉴权。仓库内 `README.md` 与 `CAMERA_UPLOAD_TEST.md` 仍是旧 PC 地址的描述，尚未更新。
+- **2026-09-15 视频上传目标变更**：正式链路使用 OTA 下发的 `wss://` WebSocket 地址和动态 Token、`Device-Id`/`Client-Id` 头；小智音频与视频共用该连接。2026-09-17 为浏览器预览测试临时启用了 PC `ws://192.168.1.14:8001/ws` 覆盖，测试结束后已将 `VIDEO_STREAM_PC_PREVIEW_ENABLED` 设回 `0`。当前构建不再主动覆盖 OTA 地址；若 OTA 响应缺少 `websocket.url`，云端视频连接不会因此自动恢复。仓库内 `README.md` 与 `CAMERA_UPLOAD_TEST.md` 仍有旧 PC 地址描述。
 - **2026-09-15 音频与小智**：新增 `components/xiaozhi_audio`（板载 ES8311 采集/播放 + Opus 编解码 + 小智协议）。语音链路**已端到端打通**（上行 Opus → 服务端 ASR → LLM → TTS → 下行 Opus 播放），且**摄像头推流时同样可用**——同日稍早那份"与视频共存时失效"的 A/B 结论**已被推翻**（更正见附录 A.7）。当前第一优先级问题改为**内部 DMA 池被挤碎**、ESP-Hosted 收包路径取不到缓冲就 assert 重启，见第 10 节第 1 条与附录 A.9。
 - **2026-09-16 UVC 新摄像头固定冷启动诊断**：针对 HBVCAM（VID `058F`、PID `3822`）增加两个编译期固定测试档：`640×480 MJPEG@30` 和 `1280×720 MJPEG@30`。纯 UVC 档位一次运行只请求一个分辨率，失败后不轮转格式，必须重新构建并冷启动/重新枚举摄像头。保持 `alt=1`、`effective_MPS=3072`、`8×16 KB URB`、6 packets/transfer 和 26 字节 Probe/Commit 不变。
+- **2026-09-17 HBVCAM 完整预览分辨率对照测试**：profile 5 开启 UVC、JPEG 解码、YUV 转换、H.264、WiFi/WebSocket 和 UI/SD；分别对 `1280×720 MJPEG@30` 与 `640×480 MJPEG@30` 独立构建/启动。`1280×720` 观察到 UVC complete 约 `23.4～27.0 FPS`、drop `11.8%～25.9%`、handoff rejected `33～46`/统计窗，H.264/发送约 `14～16.7 FPS`；YUV 平均约 `30.8～31.3 ms`，出现 JPEG 解码错误 259、缺 EOI 无效帧和输出丢帧。`640×480` 的日志窗口观察到 UVC complete `29.8～30.0 FPS`、drop `0%`、handoff rejected `0`，稳态 H.264/发送约 `30.2 FPS`；JPEG/YUV/H.264 平均约 `4.46/10.57/5.41 ms`，统计窗内无无效帧、队列丢弃或发送失败。结论：当前浏览器预览优先使用 `640×480`；640×480 这轮只记录了短时稳态窗口，尚非长时间稳定性验收。测试时本地 PC 地址覆盖使 WebSocket 成功连接；OTA 响应自身缺少 `websocket.url`。测试后已关闭本地 PC 覆盖地址（`VIDEO_STREAM_PC_PREVIEW_ENABLED=0`）；H.264/上传代码仍保留，OTA 若提供有效 WebSocket 配置仍可使用云端地址。COM17 的 ClearCommError/重连没有伴随固件 panic 记录。
 - **2026-09-16 UVC 组帧根因定位**：640×480 日志中 SOI/EOI、FID、EOF 均存在，但 `frame_len` 在约 2136 字节后停止。原因是 `uvc_isoc.c` 对 `actual_num_bytes==0` 的普通零长度 ISOC 包统计后错误设置 `skip_current_frame`；frame buffer 没有释放，后续同 FID/PTS payload 因 skip 标志无法继续追加。现已改为零长度包只计数并忽略，并加入 `empty_inside_active_frame`、`frame_abort_by_empty`、`header_only_inside_active_frame`、`frame_abort_by_header_only` 及事件中的 `active=before→after` 诊断。该修复已构建通过，尚待开发板重新烧录后的 640×480 冷启动实测确认。
+- **2026-09-17 YUV 转换独立 A/B**：在 640×480 MJPEG@30、profile 8（UVC + JPEG 硬解 + YUV 转换）下，分别独立运行 ref（约 69 秒）和 sample_even（约 102 秒）；H.264、WiFi/WebSocket、UI/LVGL、SD 均关闭，DMA2D 不支持并回退 CPU。排除首个部分统计窗口后，sample_even 的 YUV 平均耗时 8.72 ms，ref 为 10.31 ms，约快 15.4%；两轮 UVC complete 均约 30.03 FPS、drop 均为 0%，handoff rejected 均为 0，rate_limit 均约 50.6 次/5 秒。该结果只说明隔离链路下转换更快且未观察到 UVC 回归；H.264 开启时的 PSRAM/USB 争用和浏览器端帧率仍未验证。sample_even 保持 Y 不变、U/V 直接取偶数行，颜色精度尚未评估。当前源码 `video_streamer.h` 的 `VIDEO_YUV_CONVERSION_TEST_MODE` 设为 `REF`，复测 sample_even 时需切换为 `VIDEO_YUV_CONVERSION_MODE_SAMPLE_EVEN`。
 - UI 状态机、传感器、触摸、LED、电机、专注模式、电源管理和整机联调均未进入实现阶段。
 
 开发流程基线为根目录的 `盆栽陪伴机器人_开发文档.md`。本文只记录当前事实和下一步，不替代该设计文档。
@@ -172,6 +174,37 @@ bootloader.bin：0x5310，Bootloader 分区剩余 13%
 烧录后正常现象应为：屏幕先显示时间和天气占位符；WiFi 联网后串口依次输出“网络时间同步成功”“自动定位成功”和“天气更新”，页面自动替换为当前日期、星期、时间、天气和温度，不显示电量。文字应正常朝向且不再左右镜像。
 
 ## 7. 摄像头当前验证结论
+
+### 2026-09-17 YUV 转换 ref / sample_even 独立对照
+
+两轮日志使用相同测试链路和摄像头模式，但分别以不同转换算法独立运行；没有在同一帧上双跑或做 `memcmp`：
+
+```text
+640×480 MJPEG@30
+UVC → JPEG 硬件解码 → CPU YUV422→YUV420
+profile 8；H.264 / WiFi / WebSocket / UI / SD 关闭
+DMA2D/PPA 返回 ESP_ERR_NOT_SUPPORTED，使用 CPU 转换
+sample_even 约 102 秒；ref 约 69 秒
+```
+
+丢弃首个启动期部分统计窗口后，稳态结果如下。`min/max` 为各 5 秒窗口中记录到的最小/最大转换耗时范围；FPS 与 drop 为稳态窗口统计：
+
+| 指标 | ref | sample_even | 对比 |
+| --- | ---: | ---: | ---: |
+| YUV 平均耗时 | 10.31 ms | 8.72 ms | sample_even 快约 15.4% |
+| YUV 窗口 min 范围 | 10.08～10.13 ms | 8.50～8.54 ms | sample_even 更低 |
+| YUV 窗口 max 范围 | 10.33～10.40 ms | 8.74～8.81 ms | sample_even 更低 |
+| UVC complete | 平均 30.03 FPS，范围 29.8～30.2 | 平均 30.03 FPS，范围 29.8～30.2 | 基本相同 |
+| UVC drop | 0% | 0% | 未观察到回归 |
+| handoff rejected | 0 | 0 | 相同 |
+| rate_limit | 平均 50.58 次/5 秒，范围 49～52 | 平均 50.68 次/5 秒，范围 49～52 | 相同；处理门控仍为 20 FPS |
+| JPEG/YUV 处理帧率 | 约 19.96 FPS | 约 19.94 FPS | 接近 20 FPS 上限 |
+
+回调耗时平均值约为 ref 0.313 ms、sample_even 0.287 ms，最大值分别约 0.46 ms、0.42 ms；这是回调执行耗时，不应与 `callback_gap_max` 混为一谈。
+
+**结论边界：** sample_even 在隔离配置下比 ref 快约 15.4%，且两轮 UVC 均无丢帧；但 2026-09-17 完整链路分辨率对照使用的是 ref 路径，因此 sample_even 在 H.264/WebSocket 开启时的收益仍未知。若继续评估该算法，需在 640×480 完整链路下与 ref 做独立同条件对照；当前应先完成 640×480 长时间稳定性观察。
+
+当前工作区 `src/demo/components/video_streamer/video_streamer.h` 把 `VIDEO_YUV_CONVERSION_TEST_MODE` 设为 `VIDEO_YUV_CONVERSION_MODE_REF`；重跑 sample_even 需显式改为 `VIDEO_YUV_CONVERSION_MODE_SAMPLE_EVEN`，并保持其余测试配置一致。
 
 ### 2026-09-16 HBVCAM 640×480/1280×720 固定冷启动诊断
 
@@ -424,9 +457,9 @@ VS Code 当前默认使用 `build`、`sdkconfig.bletest` 和 Ninja。若任务�
 
 以下为此前记录，编号不变：
 
-1. **UVC 丢帧拖垮了编码帧率，20 FPS 目标未达成。** 丢帧来源已由同一次运行内的 A/B 定位为**编解码链路自身的 PSRAM 流量**：关掉链路丢帧 2.1%，打开 23.8%，而 WiFi/LVGL/GIF 轮播/回调 memcpy 在两者中都在跑（见第 7 节）。URB 必须落 PSRAM 是**另一个**问题——它防的是开机重启循环（144 KiB 挤不进 146 KiB 内部 DMA 池触发组件 double-free），与稳态丢帧无关。**当前完整档位实测：UVC complete 20~30 FPS、丢帧 19%~29%、H.264 15~20 FPS。** 下一步是降低编解码链路的 PSRAM 压力（YUV 重排 15.3 ms 是三项里最大的一项），**不要再做档位二分**。
+1. **640×480 完整链路需要长时间验收。** 2026-09-17 profile 5 短时统计显示 H.264/WebSocket 约 30 FPS、UVC drop 0%；1280×720 则约 14～16.7 FPS 且有帧损坏。先以 640×480 连续观察至少 10 分钟，再判断稳定性。profile 8 的 sample_even/ref A/B 不能直接推断完整链路的效果。
 2. **WebSocket 断线会恶化成 56 秒黑屏。** 2026-09-12 日志里 `transport_poll_write(0)` 触发一次后，重连上去不到 1 秒又断，连续 5 次，累计 56 秒无画面。成因是 `VIDEO_WS_SEND_TIMEOUT_MS` 过短（原 100 ms），被 `esp_websocket_client` 判为致命错误直接 abort；同时重连间隔是 8000 ms，比它自己注释里写的 2 秒长 4 倍。已改为写超时 2000 ms（与 `network_timeout_ms` 拆成两个宏）、重连 2000 ms，**待实机复测**。详见附录 A.6。
-3. **800×600 网页预览待最终验收。** 完整联网档位（`CAMERA_TEST_FULL=0`）已在实机跑通、WebSocket 正常连接、`sent == encoded` 且 `send_fail=0`；但设备侧只有 15~20 FPS，预览会卡在这个帧率上。需等第 1 条的 PSRAM 压力结论出来、帧率提上去之后再做正式验收；验收前应先确认第 2 条的断线问题已复测通过，否则预览会周期性中断。
+3. **640×480 浏览器预览待长测验收。** 完整 profile 5 短时窗口里 `sent` 与 `encoded` 均约 30 FPS、`send_fail=0`；还需连续运行至少 10 分钟，观察断线、预览卡顿及 UVC/JPEG 错误。PC 预览覆盖宏当前关闭，重新测试 PC 预览时需显式开启 `VIDEO_STREAM_PC_PREVIEW_ENABLED` 并重新构建烧录。
 4. **短期设备链路已通过，长期稳定性未测。** 热复位完整重建、JPEG 完整性门控、双任务编解码/上传和 CPU 分块转换均已实机工作；需连续运行至少 10 分钟，再逐步扩展到长时间测试。
 5. **动态首页待真机结论。** 构建通过不能证明镜像修正、中文字体、IP 自动定位和两个 HTTPS API 在设备网络上均正常，需要烧录后的照片及 `HOME_INFO` 日志。
 6. **阶段 0 尚未冻结。** 除屏幕、USB 和 P4-C6 SDIO 外，关键器件型号与 GPIO 未定，会阻塞阶段 4、5、9、11。
@@ -460,7 +493,7 @@ VS Code 当前默认使用 `build`、`sdkconfig.bletest` 和 Ninja。若任务�
 
 以下为此前顺序，仍然有效：
 
-1. **降低编解码链路的 PSRAM 流量**——这是唯一还在动的变量（见第 7 节 A/B）。按耗时排序，YUV 重排 15.3 ms 是三项里最大的一项，先评估 P4 v1.3 上 DMA2D/PPA 不可用时的替代路径；其次看 JPEG 解码 6.7 ms 的 PSRAM 读写量。**不要再做档位二分**：`callback_gap_max` 在丢帧 23.8% 和 2.1% 两种状态下都是 9 ms，对档位不敏感，拿它当判据只会得到噪声。若要继续分离变量，用已验证有效的手段——直接开/关整条编解码链路（WebSocket 断线就是这个效果），而不是切档位。
+1. **验证 YUV sample_even 在完整链路中的效果**：profile 8 的独立 A/B 显示其转换平均耗时由 10.31 ms 降至 8.72 ms（快约 15.4%），但这轮关闭了 H.264 和网络。恢复完整链路后，在相同摄像头模式下观察 UVC drop、H.264 FPS、WebSocket send FPS 及音频/LVGL情况；`callback_gap_max` 单独不能作为丢帧判据。P4 v1.3 的 DMA2D/PPA 仍不可用，当前维持 CPU 路径。
 2. **复测 WebSocket 断线修复**（附录 A.6）：烧录后长时间跑，确认不再出现"连上不到 1 秒又断"的循环。判据是 `transport_ws: Error transport_poll_write(0)` 不再出现；若仍出现，说明 2000 ms 写超时还不够，下一步要给 socket 加 `SO_SNDTIMEO`（写超时只约束那次 select，不约束随后的 `send()`）。
 3. **完整档位（`CAMERA_TEST_FULL=0`）现已跑通**：启动 `src/demo/_start_camera_server.bat`，打开 `http://127.0.0.1:8000/`，确认接收速率（`sent == encoded`，`send_fail=0`）和网页预览丢帧。当前瓶颈在设备侧 UVC 丢帧，不在上传。
 4. 只有在 CPU 分块转换前后完成同条件对照后，才继续调整 tile 大小或短空隙；当前不能把 UVC 丢帧下降归因于该优化。传输层已于 2026-09-10 由 HTTP 长连接替换为 WebSocket，并建立了下行命令通道（`/cmd?cmd=ping|status`）。

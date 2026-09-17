@@ -33,7 +33,7 @@
 #define CAMERA_TEST_UVC_JPEG_ONLY          7
 #define CAMERA_TEST_UVC_YUV_ONLY           8
 
-/* ← 改这一行切换档位 */
+/* ← 改这一行切换档位；当前启用 WiFi + H.264 视频链路供 PC 预览 */
 #define CAMERA_TEST_PROFILE                CAMERA_TEST_FULL
 
 /* 完整系统基线开启 H.264 视频编码和 WebSocket 视频上传；

@@ -40,7 +40,7 @@ static const char *TAG = "CAMERA";
 #if CAMERA_TEST_PROFILE == CAMERA_TEST_UVC_ONLY
 #define CAMERA_REQUESTED_FPS        30.0f
 #else
-#define CAMERA_REQUESTED_FPS        20.0f
+#define CAMERA_REQUESTED_FPS        30.0f
 #endif
 /* UVC 丢帧根因已定位（2026-09-12）：URB 数据缓冲落 PSRAM 会与 H.264/JPEG 争
  * PSRAM 仲裁，ISOC 回调最长被推迟 8 ms，期间等时包被跳过整帧丢弃。

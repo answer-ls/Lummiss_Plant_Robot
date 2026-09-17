@@ -7,10 +7,23 @@
 
 #include "esp_err.h"
 
-/* 对照测试模式：三者最多启用一个。正式联网预览时全部改为 0。 */
+/* 对照测试模式：三者最多启用一个。当前关闭隔离测试，启用 H.264/WebSocket。 */
 #define VIDEO_STREAM_CODEC_ONLY_TEST 0
 #define VIDEO_STREAM_JPEG_ONLY_TEST 0
 #define VIDEO_STREAM_YUV_ONLY_TEST 0
+
+/* YUV-only 测试时，每次构建只选择一种转换，分别独立采集基线。 */
+#define VIDEO_YUV_CONVERSION_MODE_REF         0U
+#define VIDEO_YUV_CONVERSION_MODE_SAMPLE_EVEN 1U
+#define VIDEO_YUV_CONVERSION_TEST_MODE        VIDEO_YUV_CONVERSION_MODE_REF
+
+/* 本地 PC 预览已关闭；开启时会覆盖 OTA 返回的云端 WSS 地址。 */
+#define VIDEO_STREAM_PC_PREVIEW_ENABLED 0
+#define VIDEO_STREAM_PC_PREVIEW_URL "ws://192.168.1.14:8001/ws"
+
+#if VIDEO_YUV_CONVERSION_TEST_MODE > VIDEO_YUV_CONVERSION_MODE_SAMPLE_EVEN
+#error "Invalid VIDEO_YUV_CONVERSION_TEST_MODE"
+#endif
 
 #define VIDEO_STREAM_WS_URL_MAX_LEN    256
 #define VIDEO_STREAM_WS_TOKEN_MAX_LEN  512

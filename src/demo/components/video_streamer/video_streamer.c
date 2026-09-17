@@ -1,4 +1,4 @@
-﻿#include "video_streamer.h"
+#include "video_streamer.h"
 #include "dma2d_yuv.h"
 
 #include <inttypes.h>
@@ -130,79 +130,43 @@ static void video_ws_handle_mcp(esp_websocket_client_handle_t client,
     cJSON_Delete(root);
 }
 
-/* WebSocket 地址和动态 Token 必须来自项目 OTA，正式固件不保留明文 WS fallback。 */
-/* 分辨率统一取 video_streamer.h 的公共常量，与摄像头侧"可编码帧"门控一致。 */
+/* 分辨率统一取 video_streamer.h 的公共常量。 */
 #define VIDEO_WIDTH                   VIDEO_STREAM_WIDTH
 #define VIDEO_HEIGHT                  VIDEO_STREAM_HEIGHT
-/* 帧率**上限**，不是目标值：GOP 与 PTS 除数跟随该宏，避免改帧率时漏改。
- * 实际帧率由编解码链耗时决定，通常低于本值——2026-09-12 完整档位实测只有
- * 15～20 fps，瓶颈是 UVC 丢帧（2.6%～32%），不是编解码耗时。
- *
- * 这个宏还有第二个作用，而且更隐蔽：它同时是编码器速率控制的分母
- * （每帧预算 = VIDEO_BITRATE / 本值，详见 VIDEO_BITRATE 处的说明）。
- * 所以它不能随便写大——写成 30 而实际只跑 20，每帧比特预算就被摊薄三分之一，
- * 画质直接变糊。**改这里前先确认它与实测帧率接近。** */
-#define VIDEO_ENCODE_FPS              20
+/* 帧率上限，同时作为编码器速率控制的分母（每帧预算 = VIDEO_BITRATE / 本值）。
+ * GOP 与 PTS 除数也跟随此宏；实际帧率受编解码链耗时限制，通常略低于此值。 */
+#define VIDEO_ENCODE_FPS              30
 #define VIDEO_GOP                     VIDEO_ENCODE_FPS
-/* 目标码率。真正决定画质和线上流量的不是这个值本身，而是**每帧比特预算**：
- *
- *     每帧预算 = VIDEO_BITRATE / VIDEO_ENCODE_FPS        ← 编码器速率控制用的口径
- *     线上实际 kbps = 每帧预算 × 实际帧率                  ← 实际帧率通常低于宏值
- *     每像素比特 bpp = 每帧预算 / (宽 × 高)                ← 主观清晰度的直接来源
- *
- * 当前宏值下每帧预算 = 4000000 / 20 = 200 kbit，800×600 合 0.42 bpp。
- *
- * 下面这组实测是 VIDEO_ENCODE_FPS 还写着 30 的时候测的，换了分母之后数字都要
- * 重算，只保留作为"预算会被打满但不会精确打满"的证据：
- * 720p@15.8fps 是 134.4 kbit（当时预算 133.3 kbit，已饱和，说明 QP 压到了
- * qp_min）；800×600@23～26fps 在 83～140 kbit 之间浮动、均值约 118 kbit
- * （略低于预算，因为 QP 还没探到下限）。
- * 两种情况都**不是**被 qp_min 卡住——那是我一度写错的说法。
- *
- * 所以：VIDEO_ENCODE_FPS 一旦与实际帧率不符，线上码率和 bpp 都会跟着跑偏。
- * 调这个宏前先想清楚要动的是"每帧多少比特"，不是"每秒多少比特"。 */
+/* 目标码率 4 Mbps。实际画质取决于每帧比特预算（= BITRATE / ENCODE_FPS），
+ * 当前 640×480@20fps 下约 0.65 bpp。QP 范围 20-40 防止极端压缩。 */
 #define VIDEO_BITRATE                 4000000
 #define VIDEO_QP_MIN                  20
 #define VIDEO_QP_MAX                  40
 /* 摄像头侧 MJPEG 输入环槽数（提交时 memcpy 进槽）。 */
 #define VIDEO_SLOT_COUNT              3
-/* H.264 编码输出（码流）槽数：编码任务写满一个槽就交给发送任务，发送完成归还。
- * 深度要够 WS **单帧耗时峰值**除以帧间隔，否则一次停顿就丢帧：
- * 800×600@25fps（帧间隔 40ms）下 WS 均值 18～28ms 尚可，峰值却到 269.8ms，
- * 4 槽只吸收得了约 160ms —— 于是"输出槽满"从 0 涨到 25（约 1.2%）。
- * 当前收紧到 4 槽，最多吸收约 160ms 的发送抖动；超过这个窗口时，编码任务
- * 会在编码前丢弃输入帧，避免产生无法连续解码的孤立 H.264 P 帧。
- * 注意这只吸收抖动，不消除峰值本身 —— 峰值若持续存在要查码率占用和链路。 */
+/* H.264 编码输出槽数：编码任务写满一个槽交给发送任务，发送完成后归还。
+ * 深度需足以吸收 WebSocket 发送峰值的抖动，避免输出槽满丢帧。 */
 #define VIDEO_OUT_SLOT_COUNT          4
 /* 摄像头 MJPEG 实测为 YUV422 采样；JPEG 硬件直接输出 U Y0 V Y1，16bpp。 */
 #define VIDEO_YUV422_SIZE             (VIDEO_WIDTH * VIDEO_HEIGHT * 2)
 /* H.264 硬件输入固定为 O_UYY_E_VYY 交错 YUV420，1.5 字节/像素。 */
 #define VIDEO_H264_INPUT_SIZE         (VIDEO_WIDTH * VIDEO_HEIGHT * 3 / 2)
-/* 压缩码流不需要按原始 YUV 帧大小分配。编码器每帧会使整个输出容量
- * 的缓存失效，过大的容量会延长缓存同步临界区。128 KB 保持 128 字节
- * 对齐，并为当前 4 Mbps/20 FPS 留出突发余量；溢出仍由编码器报错处理。 */
+/* 压缩码流缓冲大小。128 KB 保持 cache line 对齐，为 4 Mbps 码率留出余量。
+ * 编码器输出溢出由编码器内部报错处理。 */
 #define VIDEO_H264_OUTPUT_SIZE        (128U * 1024U)
 
 /* 每帧 H.264 码流前置的 16 字节自描述头（小端）：
  *   [0..3]  magic 'L','M','V','1'    [4..5]  width       [6..7]  height
  *   [8..9]  fps                      [10]    frame_type  [11]    reserved
  *   [12..15] sequence
- * frame_type 即 esp_h264_frame_type_t 原值：0=IDR、1=I、2=P。
- * PC 端把 0/1 当作可随机接入的帧（用于预览重同步），不要改动这个映射。
- * 分辨率随每一帧携带，而不是在连接建立时一次性协商，PC 端据此自适应几何参数 ——
- * 将来改分辨率只需要改一处常量，协议和 PC 端都不用动。
- * 编码器直接写进槽内偏移 +16 处，发送时在同一块缓冲头部原地填头，全程零拷贝。 */
+ * frame_type: 0=IDR、1=I、2=P。PC 端据此自适应分辨率，无需连接时协商。
+ * 编码器写进槽内偏移 +128 处，帧头在其前 +112 处，发送时原地补齐，零拷贝。 */
 #define VIDEO_WS_FRAME_HEADER_SIZE    16
 #define VIDEO_WS_FRAME_MAGIC          0x31564D4CU  /* 'L','M','V','1' 小端 */
 
-/* H.264 硬件编码器每编完一帧都要对输出缓冲做一次 cache 失效
- * （esp_h264_enc_dual_hw.c:168 → esp_h264_cache.c:17）。该调用用的是
- * DIR_M2C 且**不带** UNALIGNED 标志，要求起始地址与长度都按 cache line
- * （128 字节）对齐：不满足时每帧刷一条 esp_cache_msync 报错，更要命的是
- * 失效根本没生效——CPU 读硬件 DMA 刚写好的码流时读到的是旧缓存内容。
- * 所以编码输出放在槽内 +128 处（地址与 720000 长度都保持对齐），
- * 16 字节帧头紧贴其前放在 +112，PC 端收到的仍是「帧头 + 紧邻码流」。
- * 切勿把编码缓冲改回 +16 之类的非 128 对齐偏移。 */
+/* H.264 硬件编码器对输出缓冲做 cache 失效（DIR_M2C，不含 UNALIGNED 标志），
+ * 要求起始地址与长度均按 128 字节 cache line 对齐。编码输出放在槽内 +128 处，
+ * 帧头紧贴其前在 +112 处。切勿改回非 128 对齐的偏移。 */
 #define VIDEO_WS_ALIGN                128U
 #define VIDEO_WS_FRAME_HEADER_OFFSET  (VIDEO_WS_ALIGN - VIDEO_WS_FRAME_HEADER_SIZE)  /* 112 */
 #define VIDEO_H264_SLOT_SIZE          (VIDEO_WS_ALIGN + VIDEO_H264_OUTPUT_SIZE)
@@ -222,73 +186,28 @@ static void video_ws_handle_mcp(esp_websocket_client_handle_t client,
 #define VIDEO_WS_TASK_STACK           6144
 #define VIDEO_WS_TASK_PRIORITY        5
 #define VIDEO_WS_TASK_CORE            0
-/* WebSocket 收发缓冲大小。这个值直接决定上行一帧被切成几个 WebSocket 分片，
- * 而分片数决定每帧要付多少次运输层操作——这是上行耗时的真正来源。
- *
- * 每发一片，_ws_write()（IDF tcp_transport/transport_ws.c）都要做：
- *   1 次 esp_transport_poll_write + 2 次 esp_transport_write（帧头 + 载荷）
- *   + 2 遍逐字节 XOR（RFC6455 客户端掩码：发前异或、发后异或回来）
- * 每一次 write 都要经 ESP-Hosted 走 SDIO RPC 到 C6。
- *
- * 按 4096 算，实测单帧约 10.8KB 要切 3 片 = 3 poll + 6 write = 9 次 socket 操作；
- * 32KB 只需 1 片 = 1 poll + 2 write = 3 次。实测 WS 单帧 20～35ms、峰值 150ms
- * 主要就是这个开销（10.8KB 走 WiFi 本身用不了这么久）。
- * 注意：memcpy 与 XOR 的总字节数不随分片数变化，唯一变量是操作次数。
- *
- * 选值公式：单帧字节数 = 码率 ÷ 8 ÷ 帧率，与分辨率无关。
- * 32KB 在 20fps 下覆盖到约 5.2 Mbps（4Mbps 时单帧 25KB，1 片发完）。
- * 开了 CONFIG_ESP_WS_CLIENT_ENABLE_DYNAMIC_BUFFER 才会每帧重分配，
- * 当前没开，所以这是启动时一次性 malloc(buffer_size) 的 tx + rx 共 2 份常驻。 */
+/* WebSocket 收发缓冲 32KB：单帧 H.264 码流（~25KB @ 4Mbps）1 片发完，
+ * 避免分片导致的多次 SDIO RPC 开销。未开 DYNAMIC_BUFFER，启动时一次性分配。 */
 #define VIDEO_WS_BUFFER_SIZE          32768
 /* 断线后 2 秒重试，比组件默认的 10 秒恢复更快。 */
 #define VIDEO_WS_RECONNECT_MS         2000
-/* 单帧发送超时，也是决定这条连接生死的那个超时。esp_websocket_client 把它
- * 换算成 transport_ws 里**一次** select 可写等待，等不到就返回 ≤0，被
- * esp_websocket_client.c 判为致命错误直接 abort 连接，再等 VIDEO_WS_RECONNECT_MS
- * 才重连——所以这个值必须大于"最坏情况下等一个写窗口"的时间。
- *
- * 100 ms 实测不够：单帧 30 KB 以上时 "poll 说可写" 不再保证装得下一帧
- * （TCP_SNDLOWAT = TCP_SND_BUF/2 = 32767 字节），2026-09-12 的完整档位日志里
- * 因此出现连续 5 次"连上不到 1 秒又断"，累计 56 秒黑屏。放宽到 2 秒的代价是
- * 阻塞期间占住输出槽，但断线代价是重连 2 秒起，取小的那个。 */
+/* 单帧发送超时。esp_websocket_client 将此值用于 transport_ws 的 select 可写等待，
+ * 超时即判定连接失败并 abort。2 秒足够覆盖 TCP 背压最坏情况，代价是阻塞期间占住输出槽。 */
 #define VIDEO_WS_AUDIO_SEND_TIMEOUT_MS 200
 /* 没有视频帧时，上传任务按此周期检查音频队列；低于 60 ms 音频包周期。 */
 #define VIDEO_UPLOAD_POLL_MS          10
 /* 每轮最多排空的音频包数。上限存在的意义只是防止极端情况下一直有音频到达而
  * 饿死视频；正常 16.7 包/秒远低于这个速率。 */
 #define VIDEO_UPLOAD_AUDIO_DRAIN_MAX  8
-/* 建连超时。名字看着像"轮询超时"，但 esp_websocket_client.c:1204 把它原样传给
- * esp_transport_connect(host, port, network_timeout_ms)，TLS 路径下即
- * esp_tls_cfg_t.timeout_ms——**整个 TLS 握手的超时预算**。
- *
- * 另有三处用途：读轮询（:1085）、PING/PONG/CLOSE（:1142/:1306/:1359）。
- * 数据帧发送不走它：send_with_opcode 用的是调用方传进来的 timeout（:740），
- * 那才是 VIDEO_WS_SEND_TIMEOUT_MS。所以这两个宏仍然要分开，只是不能把建连
- * 那一侧压得太短。
- *
- * 100 是错的：公网到 www.lummiss.com 的 TLS 握手偶尔能挤进 100 ms（于是首次
- * 连接侥幸成功），但大多数时候超时，报
- *   esp-tls: Failed to open new connection in specified timeout
- *   transport_error=ESP_ERR_ESP_TLS_CONNECTION_TIMEOUT
- * 且**每次重连都失败**——现象就是连上一次之后再也连不上，OTA 明明还是通的
- * （一次性 HTTPS 请求不吃这个超时）。恢复组件默认的 10 秒。 */
+/* TLS 握手超时。公网 TLS 握手可能耗时数秒，过短会导致重连循环。 */
 #define VIDEO_WS_NETWORK_TIMEOUT_MS   10000
-/* 发送起始速率的闸门。跟随 VIDEO_ENCODE_FPS 而不是写死数字：上游 20 fps 的
- * 提交门控已经限过流，这里再拿一个过时的 25 去放行只会让两处口径对不上。 */
+/* 发送速率闸门，跟随 VIDEO_ENCODE_FPS，与上游提交门控保持一致。 */
 #define VIDEO_WS_SEND_INTERVAL_US     (1000000LL / VIDEO_ENCODE_FPS)
 /* 下行命令的累积缓冲：服务器下发的 JSON 命令很短。 */
 #define VIDEO_WS_COMMAND_MAX          1024
 #define VIDEO_WS_AUDIO_PACKET_MAX     1400
-/* 音频队列深度按「视频发送阻塞多久」定，不是按音频包周期定。
- *
- * 发送是单任务串行的：一帧 H.264 撞上 TCP 背压时会占住这个任务最多
- * VIDEO_WS_SEND_TIMEOUT_MS（2 秒，见上面的注释），这段时间里 Opus 包只能堆在
- * 队列里。原值 4 = 只有 240 ms 余量，一次 2 秒阻塞就丢 ~29 包（16.7 包/秒），
- * 上行留下 2 秒空洞——服务端的 VAD/ASR 看到的是一段断掉的语音，而这恰好发生在
- * 视频把链路压满的时候，跟「摄像头开着语音就失效」的 A/B 现象方向一致。
- * 16 = 约 1 秒余量，条目在 PSRAM（每条约 1.4 KB 上限），代价可忽略。
- * 队列满时 xQueueSend 返回失败，xiaozhi_audio 会计进 s_capture_errors
- * 而不是 MIC packets，所以溢出是看得见的。 */
+/* 音频队列深度按视频发送阻塞时长设定。16 包 ≈ 1 秒余量，防止视频帧 TCP 背压
+ * 导致音频上行空洞。条目在 PSRAM 中，溢出由 xiaozhi_audio 侧统计可见。 */
 #define VIDEO_WS_AUDIO_QUEUE_DEPTH    16
 #define VIDEO_REPORT_INTERVAL_US      (5 * 1000 * 1000LL)
 /* 门控按 VIDEO_ENCODE_FPS 的帧周期推进；允许提前 5 ms 接帧，
@@ -419,8 +338,7 @@ static void video_drop_pending_output(void)
     }
 }
 
-/* 限制发送调用的启动频率。它不改变当前低于 25fps 的编码速率，只防止网络
- * 短暂恢复后多个待发槽连续冲击 ESP-Hosted 的 SDIO/WiFi TX 缓冲池。 */
+/* 发送速率闸门：防止网络恢复后多个待发槽连续冲击 SDIO/WiFi TX 缓冲池。 */
 static void video_upload_pace(void)
 {
     const int64_t now_us = esp_timer_get_time();
@@ -457,7 +375,7 @@ static void video_input_slot_release(video_input_slot_t *slot)
     portEXIT_CRITICAL(&s_lock);
 }
 
-/* 网络或服务器异常时最多每 5 秒输出一次详情，避免 20 FPS 的失败日志刷屏。 */
+/* 网络或服务器异常时每秒最多输出一次详情，避免失败日志刷屏。 */
 static void video_stream_log_error_limited(const char *message, int error)
 {
     static int64_t last_log_us;
@@ -468,15 +386,9 @@ static void video_stream_log_error_limited(const char *message, int error)
     }
 }
 
-/* WEBSOCKET_EVENT_ERROR 的 error_handle 是 esp_websocket_error_codes_t：前三个
- * 字段是"与 esp_tls_last_error 兼容的部分"，只在 esp-tls 层面失败时才被填；
- * 后面的 error_type / esp_ws_handshake_status_code / esp_transport_sock_errno
- * 是 esp-websocket 与 tcp_transport 的扩展，走 TLS 连接失败这条路时**不会赋值**。
- *
- * 这里原先读的恰好是最后的 esp_transport_sock_errno，于是打出
- * "WebSocket 出错：1341551172" ——那不是错误码，是未初始化内存里残留的 PSRAM
- * 地址，把真正的 ESP_ERR_ESP_TLS_CONNECTION_TIMEOUT 藏掉了。改报前三个字段。
- * 仍按 5 秒限频：断线重连期间这个事件每 2 秒来一次。 */
+/* WEBSOCKET_EVENT_ERROR 的错误详情提取。error_handle 的前三个字段仅在 esp-tls
+ * 层面失败时有值；后面的 error_type 等扩展字段在 TLS 路径下可能未赋值。
+ * 必须读取有效的 esp_tls_last_esp_err 而非未初始化的扩展字段。 */
 static void video_stream_log_ws_error(const esp_websocket_event_data_t *data)
 {
     static int64_t last_log_us;
@@ -499,18 +411,11 @@ static void video_stream_log_ws_error(const esp_websocket_event_data_t *data)
 }
 
 /*
- * JPEG 硬件解码器对输入格式比普通软件解码器严格：只确认 SOI/EOI 齐全仍可能把
- * 丢包后的半截 JPEG 送进去，随后就是 "data units 数量与软件配置的分辨率不符"、
- * unsupported marker，以及连带的 dma2d_force_end 报错。
+ * JPEG 结构完整性校验：遍历 Marker 链路确认 SOF/SOS/SOI/EOI 齐全，且分辨率与
+ * 目标值一致。不解码像素数据，帧尾允许填充字节。
  *
- * 这段校验原先写在 UVC 帧回调里，现在搬到本任务：扫描整帧是 O(帧长) 的工作，
- * 而帧回调运行在 USB 等时传输的上下文里，每多占一毫秒，transfer 就晚一毫秒
- * 重新入队——等时传输没有重传，那段时间的包就是白丢的。搬过来之后 USB 回调
- * 只剩常数时间的工作，硬件解码器受到的防护强度不变。
- *
- * 只走一遍 Marker 结构，不解码像素数据；帧尾允许存在填充字节。
- *
- * 返回失败原因而不是布尔值，原因枚举见 video_jpeg_validate_result_t。 */
+ * 校验逻辑从 UVC 帧回调搬到了编解码任务中，避免耗时扫描阻塞 USB 等时传输的
+ * transfer 重新入队，同时保持对硬件解码器的同等防护强度。 */
 static video_jpeg_validate_result_t video_jpeg_structurally_valid(const uint8_t *data,
                                                                   size_t data_len)
 {
@@ -621,15 +526,10 @@ static size_t video_jpeg_find_eoi(const uint8_t *data, size_t data_len)
     return 0;
 }
 
-/* ESP32-P4 v1.x 的 H.264 硬件输入格式为交错 YUV420（O_UYY_E_VYY）。
- * 如果相机 JPEG 本身就是 YUV420，JPEG 解码器可以直接输出同一布局，
- * 走零拷贝；YUV422 首选 DMA2D CSC，下面的 CPU 函数只作故障回退。
- * 这里保留 IRAM + 手工展开实现；不能在 PSRAM 数据路径中使用逐次
- * memcpy 打包，否则编译结果会退化为大量小块复制。
- *
- * 转换按 8 个 2 行宏块分段。每段只连续读写约 45 KB（800x600），
- * 段间主动让出一次调度并插入很短的总线空隙，避免 CPU 长时间占住
- * PSRAM 访问窗口，给 USB Host/ISOC DMA 留出仲裁机会。 */
+/* YUV422 → 交错 YUV420（O_UYY_E_VYY），ESP32-P4 H.264 硬件输入格式。
+ * DMA2D 硬件为首选路径，CPU 路径仅作故障回退。IRAM + 手工展开避免
+ * PSRAM 数据路径中的小块 memcpy 退化。按 8 行对分段，段间主动让出调度
+ * 给 USB Host ISOC DMA 留出仲裁机会。 */
 #define VIDEO_YUV_TILE_ROW_PAIRS      8U
 #define VIDEO_YUV_TILE_GAP_US         20U
 static void IRAM_ATTR yuv422_to_h264_yuv420(const uint8_t *restrict src,
@@ -1077,10 +977,8 @@ static void video_stream_report(int64_t now_us)
              upload_received_delta > 0 ? output_queue_us_delta / upload_received_delta / 1000.0 : 0.0,
              send_attempts_delta > 0 ? send_us_delta / send_attempts_delta / 1000.0 : 0.0,
              current.ws_max_us / 1000.0);
-    /* rate_limit 必须和几个 drop 计数器并排出现：它是 20 fps 提交门控主动跳过的
-     * 帧数，不计入 drop_input/drop_output/invalid/send_fail 中的任何一个。少了
-     * 它，"UVC complete − invalid" 和 "encoded" 之间会凭空少掉几帧/秒，看起来
-     * 像是丢帧但查不出处。 */
+    /* rate_limit 是帧率门控主动跳过的帧数，不计入 drop/input/invalid/send_fail。
+     * 少了它，UVC 输入到编码输出之间会出现无法归因的帧数缺口。 */
     ESP_LOGI(TAG,
              "[VIDEO] Queue MJPEG=%u/%u YUV=%u/1 H264=%u/%u "
              "drop_input=%" PRIu32 " drop_output=%" PRIu32 " rate_limit=%" PRIu32
@@ -1090,19 +988,10 @@ static void video_stream_report(int64_t now_us)
              current.dropped, current.slot_dropped, current.rate_limited,
              current.input_invalid, current.send_failed);
 
-    /* 三个内存池分开打。之前只打 PSRAM_free，而 PSRAM 一直有 23 MB 空闲——看不出
-     * 问题：实机报的是 `esp-aes: Failed to allocate memory for len buffer`，那是
-     * mbedtls 硬件 AES-GCM 从 MALLOC_CAP_DMA 里要 **16 字节**描述符都要不到
-     * （esp_aes_dma_core.c:355 AES_DMA_ALLOC_CAPS = DMA|8BIT，:841 的
-     * aes_dma_calloc(4, sizeof(uint32_t))），池子满了而不是要得太大。
-     *
-     * 这个池子就是开机日志 "Reserving pool of 146K of internal memory for
-     * DMA/internal allocations" 的那 146 KiB（CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=
-     * 150000）。同时养着 JPEG 解码器，正好对得上后半段 JPEG_DEC 从 15 ms 涨到 662 ms。
-     *
-     * free 和 largest 要一起看：free 高而 largest 小是碎片化，两个都低才是真耗尽。
-     * INT 列是内部 RAM 总量（DMA 是它的子集），用来区分"内部 RAM 整体紧张"和
-     * "只有 DMA 那一档被吃光"。 */
+    /* DMA/Internal/PSRAM 三个内存池分开查看。
+     * DMA 池大小由 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL 决定（~150 KB），
+     * 同时承载 JPEG 解码器、mbedtls AES-GCM 描述符等。free 与 largest 一起看：
+     * free 高而 largest 小是碎片化，两者都低才是真耗尽。 */
     ESP_LOGI(TAG,
              "[VIDEO] MEM DMA=%u/%u KB INT=%u/%u KB PSRAM=%u/%u KB",
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_DMA) / 1024U),
@@ -1112,8 +1001,8 @@ static void video_stream_report(int64_t now_us)
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U),
              (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024U));
 
-    /* invalid 的原因拆分，按窗口增量打印且只列非零项。这是唯一能把"整帧丢失"
-     * 和"帧内损坏"分开的地方：camera_driver 的 SOI/EOI 计数看不到后者。 */
+    /* invalid 原因按窗口增量输出，只列非零项。可区分"整帧丢失"与"帧内损坏"，
+     * 比 UVC 层的 SOI/EOI 统计更细粒度。 */
     char invalid_detail[160];
     size_t invalid_detail_len = 0;
     invalid_detail[0] = '\0';
@@ -1185,17 +1074,25 @@ static esp_err_t video_encoder_create(esp_h264_enc_handle_t *encoder)
 }
 
 /* 网络发送任务（钉核 0，优先 9）：
- * 只做 H.264 码流上传与失败恢复，不参与任何编解码。
- * 正常连接时按顺序发送；断线时快速丢弃过期输出槽，避免恢复后把旧 P 帧
- * 排队发送。PC 端会等待下一个 IDR 重新同步。 */
+ * 仅负责 H.264 码流上传与失败恢复。正常连接时按序发送；断线时快速丢弃
+ * 过期输出槽，避免恢复后堆积旧 P 帧导致 PC 端无法同步。 */
 static void video_upload_task(void *arg)
 {
     (void)arg;
 
-    if (strncmp(s_ws_config.ws_url, "wss://", 6) != 0 ||
-        s_ws_config.token[0] == '\0' ||
-        s_ws_config.device_id[0] == '\0' ||
-        s_ws_config.client_id[0] == '\0') {
+#if VIDEO_STREAM_PC_PREVIEW_ENABLED
+    const bool use_pc_preview =
+        strcmp(s_ws_config.ws_url, VIDEO_STREAM_PC_PREVIEW_URL) == 0;
+#else
+    const bool use_pc_preview = false;
+#endif
+    const bool use_wss = strncmp(s_ws_config.ws_url, "wss://", 6) == 0;
+
+    if ((!use_wss && !use_pc_preview) ||
+        (!use_pc_preview &&
+         (s_ws_config.token[0] == '\0' ||
+          s_ws_config.device_id[0] == '\0' ||
+          s_ws_config.client_id[0] == '\0'))) {
         ESP_LOGE(TAG, "缺少 OTA WSS 地址、Token 或设备身份，视频不建立 WebSocket");
         video_streamer_set_enabled(false);
         for (;;) {
@@ -1222,25 +1119,28 @@ static void video_upload_task(void *arg)
         .network_timeout_ms = VIDEO_WS_NETWORK_TIMEOUT_MS,
     };
 
-    ws_config.transport = WEBSOCKET_TRANSPORT_OVER_SSL;
-    ws_config.cert_pem = NULL;
-    ws_config.crt_bundle_attach = esp_crt_bundle_attach;
+    ws_config.transport = use_pc_preview ? WEBSOCKET_TRANSPORT_OVER_TCP
+                                         : WEBSOCKET_TRANSPORT_OVER_SSL;
+    if (!use_pc_preview) {
+        ws_config.cert_pem = NULL;
+        ws_config.crt_bundle_attach = esp_crt_bundle_attach;
+    }
 
     /* 构建自定义请求头：Device-Id、Client-Id、Authorization。 */
     char ws_headers[1024] = {0};
     int header_off = 0;
 
-    if (s_ws_config.device_id[0] != '\0') {
+    if (!use_pc_preview && s_ws_config.device_id[0] != '\0') {
         header_off += snprintf(ws_headers + header_off,
                                sizeof(ws_headers) - header_off,
                                "Device-Id: %s\r\n", s_ws_config.device_id);
     }
-    if (s_ws_config.client_id[0] != '\0') {
+    if (!use_pc_preview && s_ws_config.client_id[0] != '\0') {
         header_off += snprintf(ws_headers + header_off,
                                sizeof(ws_headers) - header_off,
                                "Client-Id: %s\r\n", s_ws_config.client_id);
     }
-    if (s_ws_config.token[0] != '\0') {
+    if (!use_pc_preview && s_ws_config.token[0] != '\0') {
         header_off += snprintf(ws_headers + header_off,
                                sizeof(ws_headers) - header_off,
                                "Authorization: Bearer %s\r\n",
@@ -1369,9 +1269,6 @@ static void video_upload_task(void *arg)
     }
 }
 
-/* 编解码任务（钉核 1，优先 8）：
- * JPEG 解码 → YUV 重排 → H.264 编码，完成后把输出槽索引交给上传任务，
- * 自身不等待网络，保证目标帧率下编码侧稳定供帧。 */
 static void video_codec_task(void *arg)
 {
     (void)arg;

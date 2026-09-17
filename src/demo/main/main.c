@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdint.h>
 
 #include "esp_log.h"
@@ -151,6 +152,15 @@ void app_main(void)
             ESP_LOGW(TAG, "WiFi 连接超时，跳过 OTA 检查");
         }
     }
+#endif
+
+#if TP_HAS(WIFI) && VIDEO_STREAM_PC_PREVIEW_ENABLED
+    /* 本地预览使用无鉴权 TCP WebSocket，覆盖 OTA 返回的云端 WSS 地址。 */
+    video_streamer_config_t pc_preview_cfg = {0};
+    snprintf(pc_preview_cfg.ws_url, sizeof(pc_preview_cfg.ws_url), "%s",
+             VIDEO_STREAM_PC_PREVIEW_URL);
+    video_streamer_set_config(&pc_preview_cfg);
+    ESP_LOGW(TAG, "本地 PC 视频预览已启用：%s", pc_preview_cfg.ws_url);
 #endif
 
 #if TP_HAS(XIAOZHI)
