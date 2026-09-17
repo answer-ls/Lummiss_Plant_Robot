@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_err.h"
 #include "esp_lcd_io_spi.h"
@@ -11,6 +12,7 @@
 #include "lvgl.h"
 
 #include "display_driver.h"
+#include "board_pins.h"
 #include "home_info.h"
 
 LV_FONT_DECLARE(lv_font_lummiss_weather_16);
@@ -25,12 +27,13 @@ static const char *TAG = "DISPLAY";
 #define LCD_DRAW_LINES          20
 #define LCD_PIXEL_CLOCK_HZ      (40 * 1000 * 1000)
 
-/* 用户确认的 4 线 SPI 接线。背光 BL 接 3V3，程序不能调节亮度。 */
-#define LCD_PIN_SCLK            20
-#define LCD_PIN_MOSI            32
-#define LCD_PIN_RST             3
-#define LCD_PIN_DC              2
-#define LCD_PIN_CS              1
+/* 屏幕 GPIO 统一从板级引脚表读取。 */
+#define LCD_PIN_SCLK            BOARD_LCD_SCLK
+#define LCD_PIN_MOSI            BOARD_LCD_MOSI
+#define LCD_PIN_RST             BOARD_LCD_RST
+#define LCD_PIN_DC              BOARD_LCD_DC
+#define LCD_PIN_CS              BOARD_LCD_CS
+#define LCD_PIN_BL              BOARD_LCD_BL
 /* ESP-Hosted 的 SPI 全双工链路固定占用 SPI2_HOST（控制器 1）。
  * LCD 使用另一条总线，避免网络初始化后再次初始化 SPI2 时得到
  * ESP_ERR_INVALID_STATE。ESP32-P4 的 SPI3_HOST 可通过 GPIO Matrix 复用到
@@ -46,11 +49,22 @@ static lv_obj_t *s_weather_dot;
 static void lcd_initialize(esp_lcd_panel_io_handle_t *out_io,
                            esp_lcd_panel_handle_t *out_panel)
 {
+    const gpio_config_t backlight_config = {
+        .pin_bit_mask = 1ULL << LCD_PIN_BL,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&backlight_config));
+    ESP_ERROR_CHECK(gpio_set_level(LCD_PIN_BL, 1));
+
     ESP_LOGI(TAG, "初始化 GMT020-02-8P / ST7789：面板 %dx%d，横屏 %dx%d，SPI %d MHz",
              LCD_PANEL_H_RES, LCD_PANEL_V_RES, LCD_H_RES, LCD_V_RES,
              LCD_PIXEL_CLOCK_HZ / 1000000);
-    ESP_LOGI(TAG, "SCLK=%d MOSI=%d RST=%d DC=%d CS=%d",
-             LCD_PIN_SCLK, LCD_PIN_MOSI, LCD_PIN_RST, LCD_PIN_DC, LCD_PIN_CS);
+    ESP_LOGI(TAG, "SCLK=%d MOSI=%d RST=%d DC=%d CS=%d BL=%d",
+             LCD_PIN_SCLK, LCD_PIN_MOSI, LCD_PIN_RST, LCD_PIN_DC, LCD_PIN_CS,
+             LCD_PIN_BL);
 
     const size_t transfer_size = LCD_H_RES * LCD_DRAW_LINES * sizeof(lv_color_t);
     const spi_bus_config_t bus_config = {

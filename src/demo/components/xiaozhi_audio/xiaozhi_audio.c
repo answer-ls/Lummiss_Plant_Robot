@@ -29,6 +29,7 @@
 
 #include "video_streamer.h"
 #include "wake_word.h"
+#include "board_pins.h"
 
 static const char *TAG = "XIAOZHI_AUDIO";
 
@@ -36,17 +37,9 @@ static const char *TAG = "XIAOZHI_AUDIO";
 extern void expression_manager_post_state(const char *state) __attribute__((weak));
 extern void expression_manager_post_emotion(const char *emotion) __attribute__((weak));
 
-/* 这些引脚来自厂商 guition-jc1060p470-y 小智示例。 */
+/* I2C/I2S 板级引脚由 board_pins.h 按所选板型提供。 */
 #define XIAOZHI_I2C_PORT              I2C_NUM_1
-#define XIAOZHI_I2C_SDA               GPIO_NUM_7
-#define XIAOZHI_I2C_SCL               GPIO_NUM_8
 #define XIAOZHI_I2S_PORT              I2S_NUM_0
-#define XIAOZHI_I2S_MCLK              GPIO_NUM_13
-#define XIAOZHI_I2S_BCLK              GPIO_NUM_12
-#define XIAOZHI_I2S_WS                GPIO_NUM_10
-#define XIAOZHI_I2S_DOUT              GPIO_NUM_9
-#define XIAOZHI_I2S_DIN               GPIO_NUM_48
-#define XIAOZHI_PA_ENABLE             GPIO_NUM_11
 
 #define XIAOZHI_UPLINK_SAMPLE_RATE    16000
 #define XIAOZHI_DOWNLINK_SAMPLE_RATE  24000
@@ -493,8 +486,8 @@ static esp_err_t audio_hw_init(void)
     esp_err_t ret = ESP_OK;
     i2c_master_bus_config_t i2c_config = {
         .i2c_port = XIAOZHI_I2C_PORT,
-        .sda_io_num = XIAOZHI_I2C_SDA,
-        .scl_io_num = XIAOZHI_I2C_SCL,
+        .sda_io_num = BOARD_AUDIO_I2C_SDA,
+        .scl_io_num = BOARD_AUDIO_I2C_SCL,
         .clk_source = I2C_CLK_SRC_DEFAULT,
         .glitch_ignore_cnt = 7,
         .flags.enable_internal_pullup = true,
@@ -519,11 +512,11 @@ static esp_err_t audio_hw_init(void)
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
             I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
-            .mclk = XIAOZHI_I2S_MCLK,
-            .bclk = XIAOZHI_I2S_BCLK,
-            .ws = XIAOZHI_I2S_WS,
-            .dout = XIAOZHI_I2S_DOUT,
-            .din = XIAOZHI_I2S_DIN,
+            .mclk = BOARD_AUDIO_MCLK,
+            .bclk = BOARD_AUDIO_BCLK,
+            .ws = BOARD_AUDIO_WS,
+            .dout = BOARD_AUDIO_DOUT,
+            .din = BOARD_AUDIO_DIN,
             .invert_flags = {
                 .mclk_inv = false,
                 .bclk_inv = false,
@@ -565,7 +558,11 @@ static esp_err_t audio_hw_init(void)
         .ctrl_if = s_audio.ctrl_if,
         .gpio_if = s_audio.gpio_if,
         .codec_mode = ESP_CODEC_DEV_WORK_MODE_BOTH,
-        .pa_pin = XIAOZHI_PA_ENABLE,
+#if BOARD_HAS_PA_GPIO
+        .pa_pin = BOARD_AUDIO_PA_EN,
+#else
+        .pa_pin = -1,
+#endif
         .pa_reverted = false,
         .master_mode = false,
         .use_mclk = true,
@@ -612,7 +609,7 @@ static esp_err_t audio_hw_init(void)
 
     ESP_LOGI(TAG,
              "板载音频初始化完成：ES8311，I2S%d，24kHz/16bit/mono，MIC DIN=GPIO%d",
-             XIAOZHI_I2S_PORT, XIAOZHI_I2S_DIN);
+             XIAOZHI_I2S_PORT, BOARD_AUDIO_DIN);
     return ESP_OK;
 
 fail:
