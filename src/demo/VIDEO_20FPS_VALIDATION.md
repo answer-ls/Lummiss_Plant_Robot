@@ -170,3 +170,35 @@ python tools/summarize_camera_serial.py test_results/run.log
 - **给 `uvc_host.c` 重打幂等补丁**：`uvc_transfers_free()` 释放后置空 `xfers` 并归零
   `num_of_xfers`，让分配失败退回成一条错误日志而不是重启循环。
 - 连续至少 10 分钟的串口、服务器接收与预览验证。
+
+## 2026-09-17：640×480 YUV ref / sample_even 独立 A/B
+
+本轮只比较 YUV 转换算法，不与 ref 同帧双跑、不做 `memcmp`。两种算法在相同条件下分别独立运行：
+
+```text
+640×480 MJPEG@30，profile 8
+UVC → JPEG 硬件解码 → CPU YUV422→YUV420
+H.264 / WiFi / WebSocket / UI / SD 关闭
+DMA2D/PPA 不支持，CPU 回退生效
+sample_even 运行约 102 秒；ref 运行约 69 秒
+```
+
+统计排除了启动期第一个不完整窗口。均值是稳态 5 秒窗口均值的平均；min/max 是各窗口最小值与最大值组成的范围：
+
+| 指标 | ref | sample_even |
+| --- | ---: | ---: |
+| YUV 平均耗时 | 10.31 ms | 8.72 ms |
+| YUV 窗口 min 范围 | 10.08～10.13 ms | 8.50～8.54 ms |
+| YUV 窗口 max 范围 | 10.33～10.40 ms | 8.74～8.81 ms |
+| UVC complete | 平均 30.03 FPS，范围 29.8～30.2 | 平均 30.03 FPS，范围 29.8～30.2 |
+| UVC drop | 0% | 0% |
+| handoff rejected | 0 | 0 |
+| rate_limit | 平均 50.58/5 秒，范围 49～52 | 平均 50.68/5 秒，范围 49～52 |
+| JPEG/YUV 帧率 | 约 19.96 FPS | 约 19.94 FPS |
+| 回调耗时 avg/max | 0.313/0.46 ms | 0.287/0.42 ms |
+
+sample_even 的转换耗时约缩短 **15.4%**：`(10.31 - 8.72) / 10.31`。UVC complete、drop、handoff 和 rate_limit 两轮基本一致；`rate_limit` 约 50 次/5 秒符合处理端 20 FPS 门控接收 30 FPS 输入的预期。这里的回调耗时不是 `callback_gap_max`。
+
+**结论仅适用于这次隔离配置。** H.264 编码、网络发送及其 PSRAM 访问均未运行，因此尚不能判断完整链路的 UVC 丢帧、H.264 编码率、浏览器帧率、TTS 或 LVGL是否改善。sample_even 保持 Y 不变、U/V 直接取偶数行；其颜色精度和视觉差异尚未验证。测试分辨率为 640×480，与本文前述 800×600 完整链路数据不是同条件，不能直接用转换耗时横向比较。
+
+当前源码 `src/demo/components/video_streamer/video_streamer.h` 中 `VIDEO_YUV_CONVERSION_TEST_MODE` 为 `VIDEO_YUV_CONVERSION_MODE_REF`。需要复测 sample_even 时设为 `VIDEO_YUV_CONVERSION_MODE_SAMPLE_EVEN`，其余配置保持不变。下一步应在完整链路下进行同条件 ref/sample_even 对照，同时观察 UVC complete/drop、H.264 encode FPS、WebSocket send FPS、音频与 LVGL 表现，再决定是否保留 sample_even 为正式路径。

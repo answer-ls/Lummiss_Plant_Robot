@@ -28,6 +28,14 @@
 #include "freertos/task.h"
 
 #include "video_streamer.h"
+
+#if defined(CONFIG_CLOUD_PROTOCOL_V3)
+/* V3：音频控制面在 MQTT（hello/会话参数），传输面在 UDP。
+ * 旧协议下这两个头不参与编译。 */
+#include "cloud_mqtt.h"
+#include "cloud_udp.h"
+#include "ambient_led.h"
+#endif
 #include "wake_word.h"
 #include "board_pins.h"
 
@@ -168,6 +176,85 @@ static uint32_t s_playback_queue_overflow;
 static uint32_t s_playback_errors;
 static char s_session_id[80];
 
+#if defined(CONFIG_CLOUD_PROTOCOL_V3)
+/* ---- 语音会话状态机（V3）----
+ *
+ * 背景（2026-09-18 实机）：tts stop 后进入连续监听并一直占着 UDP 上行，
+ * 服务端空闲超时（实测约 120 s）会结束会话；此后设备既收不到 STT，
+ * 又因为 WAKE_ACTIVE 已被清掉而不再喂唤醒词引擎 —— 彻底无法再次唤醒。
+ *
+ * 状态与迁移：
+ *   WAKE_IDLE            WakeNet 喂音，上行关闭；唤醒 → LISTENING
+ *   LISTENING            上行开启，等 STT/TTS；tts start → SPEAKING
+ *   SPEAKING             上行关闭，播放回答；tts stop → CONTINUOUS_LISTENING
+ *   CONTINUOUS_LISTENING 上行开启（自动对话）；10 s 无 STT → WAKE_IDLE
+ *
+ * 会话生命周期：**一次唤醒 = 重新 hello = 新会话**（新 session_id + 新 UDP key）。
+ * 服务端空闲超时后旧会话作废，所以每次唤醒都重新协商，
+ * 而不是复用一个可能已经被服务端结束的旧会话。 */
+typedef enum {
+    VOICE_STATE_WAKE_IDLE = 0,
+    VOICE_STATE_LISTENING,
+    VOICE_STATE_SPEAKING,
+    VOICE_STATE_CONTINUOUS_LISTENING,
+} voice_state_t;
+
+#define VOICE_STATE_IDLE_TIMEOUT_MS 10000
+
+static voice_state_t s_voice_state = VOICE_STATE_WAKE_IDLE;
+/* 时间戳一律用 **32 位毫秒**：这两个变量由不同任务读写（s_last_stt_ms 由 MQTT
+ * 任务写、capture 任务读），而 RV32 上 64 位读写不是原子的，撕裂读会让看门狗
+ * 误判空闲时长。无符号减法天然处理 49 天回绕，精度对秒级判定足够。 */
+static uint32_t s_voice_state_entered_ms;
+static uint32_t s_last_stt_ms;   /* 最近一次 STT 到达时间（连续监听看门狗用） */
+
+static const char *voice_state_name(voice_state_t state)
+{
+    switch (state) {
+    case VOICE_STATE_WAKE_IDLE:             return "WAKE_IDLE";
+    case VOICE_STATE_LISTENING:             return "LISTENING";
+    case VOICE_STATE_SPEAKING:              return "SPEAKING";
+    case VOICE_STATE_CONTINUOUS_LISTENING:  return "CONTINUOUS_LISTENING";
+    default:                                return "UNKNOWN";
+    }
+}
+
+static void set_voice_state(voice_state_t next)
+{
+    if (s_voice_state == next) {
+        return;
+    }
+    const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    const uint32_t idle_ms = now_ms - s_voice_state_entered_ms;
+    s_voice_state = next;
+    s_voice_state_entered_ms = now_ms;
+    const EventBits_t bits = xEventGroupGetBits(s_events);
+    ESP_LOGI("VOICE_STATE", "%s wake_enabled=%d mic_uplink=%d idle_ms=%u",
+             voice_state_name(next),
+             (bits & XIAOZHI_EVENT_WAKE_ACTIVE) ? 1 : 0,
+             (bits & XIAOZHI_EVENT_UPLINK_ENABLED) ? 1 : 0,
+             (unsigned)idle_ms);
+
+    /* 语音状态只更新灯效控制层，RMT 刷新仍由 ambient_led 专用任务完成。 */
+    switch (next) {
+    case VOICE_STATE_LISTENING:
+    case VOICE_STATE_CONTINUOUS_LISTENING:
+        ambient_led_set_state(AMBIENT_LED_STATE_LISTENING);
+        break;
+    case VOICE_STATE_SPEAKING:
+        ambient_led_set_state(AMBIENT_LED_STATE_SPEAKING);
+        break;
+    case VOICE_STATE_WAKE_IDLE:
+    default:
+        ambient_led_set_state(AMBIENT_LED_STATE_WAKE_IDLE);
+        break;
+    }
+}
+
+/* 定义在 wake 处理区（process_detected_wake_word 之前） */
+static void enter_wake_idle(void);
+#endif /* CONFIG_CLOUD_PROTOCOL_V3 */
+
 /* 下行语音诊断只记录计数和耗时，不改变播放路径。这里使用临界区保护，
  * 因为 WebSocket 回调和扬声器任务可能运行在不同 CPU。 */
 typedef struct {
@@ -249,6 +336,19 @@ static bool playback_pipeline_empty(void)
             uxQueueMessagesWaiting(s_pcm_ready_queue) == 0);
 }
 
+/* 下行控制文本（listen / abort 等 JSON）的发送通道。
+ * V3 走 MQTT 的 publish_topic；旧协议走 Agent WebSocket 的 text 帧。
+ * 不做封装的话，V3 下这些调用全部落在已停用的 WebSocket 上，
+ * 表现为「唤醒词识别到了但服务端毫无反应」。 */
+static esp_err_t send_agent_text(const char *text)
+{
+#if defined(CONFIG_CLOUD_PROTOCOL_V3)
+    return cloud_mqtt_publish_text(text);
+#else
+    return video_streamer_agent_send_text(text);
+#endif
+}
+
 /* 官方示例的自动对话模式：回答播放完成后继续监听，不要求再次说唤醒词。 */
 static void resume_listening_after_playback(void)
 {
@@ -257,6 +357,17 @@ static void resume_listening_after_playback(void)
         (xEventGroupGetBits(s_events) & XIAOZHI_EVENT_SPEAKING) != 0 ||
         !playback_pipeline_empty() ||
         (xEventGroupGetBits(s_events) & XIAOZHI_EVENT_UPLINK_ENABLED) != 0) {
+#if defined(CONFIG_CLOUD_PROTOCOL_V3)
+        /* 通道已关（会话作废/迟到回执）时不能 Silent return —— 那会把状态机
+         * 卡死在 SPEAKING（WAKE_ACTIVE=0、看门狗只看 CONTINUOUS_LISTENING）。
+         * 回唤醒待机，让下一次唤醒重新 hello。 */
+        if (s_wake_word_ready &&
+            (xEventGroupGetBits(s_events) & XIAOZHI_EVENT_CHANNEL_ACTIVE) == 0 &&
+            (xEventGroupGetBits(s_events) & XIAOZHI_EVENT_SPEAKING) != 0) {
+            ESP_LOGW(TAG, "音频通道已关闭，无法恢复连续监听，退回唤醒待机");
+            enter_wake_idle();
+        }
+#endif
         return;
     }
 
@@ -265,9 +376,12 @@ static void resume_listening_after_playback(void)
              "{\"session_id\":\"%s\",\"type\":\"listen\","
              "\"state\":\"start\",\"mode\":\"auto\"}",
              s_session_id);
-    if (video_streamer_agent_send_text(listen_start) == ESP_OK) {
+    if (send_agent_text(listen_start) == ESP_OK) {
         xEventGroupSetBits(s_events, XIAOZHI_EVENT_UPLINK_ENABLED);
         ESP_LOGI(TAG, "回答播放完成，恢复连续对话监听");
+#if defined(CONFIG_CLOUD_PROTOCOL_V3)
+        set_voice_state(VOICE_STATE_CONTINUOUS_LISTENING);
+#endif
     } else {
         ESP_LOGW(TAG, "恢复连续对话监听失败，重新等待唤醒词");
         wake_word_start();
@@ -314,10 +428,22 @@ static void send_wake_preroll(void)
         };
         esp_audio_err_t error = esp_opus_enc_process(
             s_audio.opus_encoder, &input, &output);
+#if defined(CONFIG_CLOUD_PROTOCOL_V3)
+        /* V3：前置音频与实时上行走同一条 UDP 通道。
+         * 旧的 send_audio_wait 落在已停用的 WebSocket 上，永远失败 ——
+         * 实测表现为"唤醒前音频发送中断，已发送 0 包"。 */
+        esp_err_t send_ok = ESP_OK;
+        if (error == ESP_AUDIO_ERR_OK && output.encoded_bytes > 0) {
+            send_ok = cloud_udp_send_opus(s_audio.capture_opus,
+                                          output.encoded_bytes);
+        }
+#else
+        const esp_err_t send_ok = video_streamer_agent_send_audio_wait(
+            s_audio.capture_opus, output.encoded_bytes,
+            XIAOZHI_WAKE_AUDIO_QUEUE_TIMEOUT_MS);
+#endif
         if (error != ESP_AUDIO_ERR_OK || output.encoded_bytes == 0 ||
-            video_streamer_agent_send_audio_wait(
-                s_audio.capture_opus, output.encoded_bytes,
-                XIAOZHI_WAKE_AUDIO_QUEUE_TIMEOUT_MS) != ESP_OK) {
+            send_ok != ESP_OK) {
             ESP_LOGW(TAG, "唤醒前音频发送中断，已发送 %u 包",
                      (unsigned)sent_packets);
             break;
@@ -337,11 +463,109 @@ static void send_wake_preroll(void)
              (unsigned)(sent_packets * XIAOZHI_FRAME_DURATION_MS));
 }
 
+#if defined(CONFIG_CLOUD_PROTOCOL_V3)
+/* 前向声明：两个回调的执行体在本文件后部，V3 会话打开时要注册它们 */
+static void incoming_audio_callback(const uint8_t *data, size_t len, void *ctx);
+static void server_text_callback(const char *text, size_t len, void *ctx);
+
+/* 退回 WAKE_IDLE：停上行、停 UDP 通道（旧会话作废）、重启唤醒词喂音。幂等。 */
+static void enter_wake_idle(void)
+{
+    xEventGroupClearBits(s_events, XIAOZHI_EVENT_UPLINK_ENABLED |
+                                       XIAOZHI_EVENT_SPEAKING);
+    cloud_udp_stop();   /* 旧会话作废：socket 与 UDP key 一并释放，UDP TX 随之停止 */
+    xEventGroupClearBits(s_events, XIAOZHI_EVENT_CHANNEL_ACTIVE);
+    s_session_id[0] = '\0';
+    if (s_wake_word_ready) {
+        wake_word_stop();
+        wake_word_start();   /* 重置 preroll/检测状态并置 RUNNING，恢复喂音 */
+        xEventGroupSetBits(s_events, XIAOZHI_EVENT_WAKE_ACTIVE);
+    }
+    set_voice_state(VOICE_STATE_WAKE_IDLE);
+}
+
+/* 唤醒时重新协商会话：重新发布 hello v3 并等待新的 Server Hello
+ * （新 session_id + 新 UDP key），随后把 UDP 通道切换到新会话。
+ * 在 wake_process_task 里阻塞等待是安全的（该任务只处理唤醒事件）。
+ * 返回 true = 新会话与 UDP 通道就绪。 */
+static bool v3_open_session_for_wake(void)
+{
+    cloud_udp_stop();
+    xEventGroupClearBits(s_events, XIAOZHI_EVENT_CHANNEL_ACTIVE);
+    if (cloud_mqtt_reopen_session() != ESP_OK) {
+        ESP_LOGE(TAG, "重新发布 hello 失败");
+        return false;
+    }
+    /* 最多等 3 s：hello 经 MQTT 往返，实测几百毫秒。 */
+    for (int i = 0; i < 150; i++) {
+        if (cloud_mqtt_is_session_ready()) {
+            cloud_mqtt_session_t session;
+            if (!cloud_mqtt_get_session(&session)) {
+                return false;
+            }
+            cloud_udp_set_audio_callback(incoming_audio_callback, NULL);
+            cloud_mqtt_set_text_callback(server_text_callback, NULL);
+            if (cloud_udp_start(&session) != ESP_OK) {
+                ESP_LOGE(TAG, "UDP 音频通道启动失败");
+                return false;
+            }
+            snprintf(s_session_id, sizeof(s_session_id), "%s",
+                     session.session_id);
+            xEventGroupSetBits(s_events, XIAOZHI_EVENT_CHANNEL_ACTIVE);
+            ESP_LOGI(TAG, "新会话已就绪：%s", s_session_id);
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    ESP_LOGE(TAG, "等待 Server Hello 超时（3 s）");
+    return false;
+}
+#endif /* CONFIG_CLOUD_PROTOCOL_V3 */
+
 static void process_detected_wake_word(const char *wake_word)
 {
     if (s_events == NULL) {
         return;
     }
+#if defined(CONFIG_CLOUD_PROTOCOL_V3)
+    /* V3：一次唤醒 = 重新 hello = 全新会话。服务端空闲超时（实测 ~120 s）
+     * 会结束旧会话，旧 UDP key 发过去无人处理 —— 固件必须重新协商，
+     * 否则第二次唤醒后服务端再也不回话。 */
+    xEventGroupClearBits(s_events, XIAOZHI_EVENT_WAKE_ACTIVE);
+    ESP_LOGI(TAG, "唤醒词已触发: %s", wake_word);
+    if (expression_manager_post_state != NULL) {
+        expression_manager_post_state("listen");
+    }
+    if (!v3_open_session_for_wake()) {
+        ESP_LOGE(TAG, "重建 AI 会话失败，回到唤醒待机");
+        enter_wake_idle();
+        return;
+    }
+    set_voice_state(VOICE_STATE_LISTENING);
+    send_wake_preroll();
+    {
+        /* 局部块：避免与下方旧协议回滚路径的同名变量冲突 */
+        char listen_detect[256];
+        char listen_start[192];
+        snprintf(listen_detect, sizeof(listen_detect),
+                 "{\"session_id\":\"%s\",\"type\":\"listen\","
+                 "\"state\":\"detect\",\"text\":\"%s\"}",
+                 s_session_id, wake_word);
+        snprintf(listen_start, sizeof(listen_start),
+                 "{\"session_id\":\"%s\",\"type\":\"listen\","
+                 "\"state\":\"start\",\"mode\":\"auto\"}",
+                 s_session_id);
+        if (send_agent_text(listen_detect) == ESP_OK &&
+            send_agent_text(listen_start) == ESP_OK) {
+            xEventGroupSetBits(s_events, XIAOZHI_EVENT_UPLINK_ENABLED);
+            ESP_LOGI(TAG, "麦克风上行已开启");
+        } else {
+            ESP_LOGE(TAG, "发送唤醒事件失败，恢复等待唤醒词");
+            enter_wake_idle();
+        }
+    }
+    return;
+#endif
     if ((xEventGroupGetBits(s_events) & XIAOZHI_EVENT_CHANNEL_ACTIVE) == 0) {
         xEventGroupClearBits(s_events, XIAOZHI_EVENT_WAKE_ACTIVE);
         ESP_LOGW(TAG, "收到唤醒词但语音通道未激活，等待连接后重新检测: %s",
@@ -367,8 +591,8 @@ static void process_detected_wake_word(const char *wake_word)
              "\"state\":\"start\",\"mode\":\"auto\"}",
              s_session_id);
 
-    if (video_streamer_agent_send_text(listen_detect) == ESP_OK &&
-        video_streamer_agent_send_text(listen_start) == ESP_OK) {
+    if (send_agent_text(listen_detect) == ESP_OK &&
+        send_agent_text(listen_start) == ESP_OK) {
         xEventGroupSetBits(s_events, XIAOZHI_EVENT_UPLINK_ENABLED);
         ESP_LOGI(TAG, "麦克风上行已开启");
     } else {
@@ -726,6 +950,7 @@ static void report_audio_stats(uint32_t peak)
 {
     static TickType_t last_report_tick;
     static xiaozhi_playback_stats_t previous;
+    static wake_word_stats_t previous_afe;
     const TickType_t now = xTaskGetTickCount();
     if ((now - last_report_tick) < pdMS_TO_TICKS(XIAOZHI_REPORT_MS)) {
         return;
@@ -804,7 +1029,23 @@ static void report_audio_stats(uint32_t peak)
              current.starvation_count - previous.starvation_count,
              current.output_gap_us_max,
              current.output_late_count - previous.output_late_count);
+
+    wake_word_stats_t afe = {0};
+    wake_word_get_stats(&afe);
+    const EventBits_t voice_bits = xEventGroupGetBits(s_events);
+    ESP_LOGI(TAG,
+             "AFE_DIAG 5s: feed=%" PRIu32 " fetch=%" PRIu32
+             " null=%" PRIu32 " feed_fail=%" PRIu32
+             " wake_detect=%" PRIu32 " wake_active=%d uplink=%d",
+             afe.feed_count - previous_afe.feed_count,
+             afe.fetch_count - previous_afe.fetch_count,
+             afe.fetch_null_count - previous_afe.fetch_null_count,
+             afe.feed_fail - previous_afe.feed_fail,
+             afe.wake_detect_count - previous_afe.wake_detect_count,
+             (voice_bits & XIAOZHI_EVENT_WAKE_ACTIVE) != 0,
+             (voice_bits & XIAOZHI_EVENT_UPLINK_ENABLED) != 0);
     previous = current;
+    previous_afe = afe;
 }
 
 static void capture_task(void *arg)
@@ -818,6 +1059,28 @@ static void capture_task(void *arg)
                          XIAOZHI_UPLINK_SAMPLE_RATE;
 
     for (;;) {
+#if defined(CONFIG_CLOUD_PROTOCOL_V3)
+        /* 连续监听空闲看门狗：10 s 没有新的 STT 就退回唤醒待机。
+         * 服务端空闲超时（实测 ~120 s）会结束会话，此后继续上传无人处理，
+         * 且唤醒词引擎得不到喂音 —— 实机表现为第二次唤醒失灵。 */
+        if (s_voice_state == VOICE_STATE_CONTINUOUS_LISTENING) {
+            const uint32_t last_ms = s_last_stt_ms > s_voice_state_entered_ms
+                                         ? s_last_stt_ms
+                                         : s_voice_state_entered_ms;
+            const uint32_t idle_ms =
+                (uint32_t)(esp_timer_get_time() / 1000) - last_ms;
+            if (idle_ms >= VOICE_STATE_IDLE_TIMEOUT_MS) {
+                ESP_LOGW(TAG, "连续监听空闲 %u ms 无 STT，退回唤醒待机",
+                         (unsigned)idle_ms);
+                /* 客户端主动结束会话：告知服务端立即释放（对齐上游
+                 * CloseAudioChannel(true)），也让服务端停止处理我们后续的音频。
+                 * 注意：服务端自己的 goodbye 由 server_text_callback 处理，
+                 * 不会走到这条回发路径（防乒乓）。 */
+                cloud_mqtt_send_goodbye();
+                enter_wake_idle();
+            }
+        }
+#endif
         int codec_error = esp_codec_dev_read(
             s_audio.codec_device, raw, raw_size);
         if (codec_error != ESP_CODEC_DEV_OK) {
@@ -858,8 +1121,15 @@ static void capture_task(void *arg)
             esp_audio_err_t audio_error = esp_opus_enc_process(
                 s_audio.opus_encoder, &input_frame, &output_frame);
             if (audio_error == ESP_AUDIO_ERR_OK && output_frame.encoded_bytes > 0) {
+                /* 传输层分叉：V3 走 UDP（打包 + AES-128-CTR），旧协议走 WS 二进制。
+                 * Opus 编解码本身完全不变。 */
+#if defined(CONFIG_CLOUD_PROTOCOL_V3)
+                esp_err_t send_error = cloud_udp_send_opus(
+                    opus, output_frame.encoded_bytes);
+#else
                 esp_err_t send_error = video_streamer_agent_send_audio(
                     opus, output_frame.encoded_bytes);
+#endif
                 if (send_error == ESP_OK) {
                     s_capture_frames++;
                     s_capture_bytes += output_frame.encoded_bytes;
@@ -869,8 +1139,12 @@ static void capture_task(void *arg)
             } else if (audio_error != ESP_AUDIO_ERR_OK) {
                 s_capture_errors++;
             }
-        } else if ((bits & XIAOZHI_EVENT_CHANNEL_ACTIVE) &&
-                   (bits & XIAOZHI_EVENT_WAKE_ACTIVE)) {
+        } else if ((bits & XIAOZHI_EVENT_WAKE_ACTIVE) &&
+                   !(bits & XIAOZHI_EVENT_UPLINK_ENABLED)) {
+            /* 唤醒词喂音条件：WAKE_ACTIVE 且上行未开启。
+             * 注意**不含** CHANNEL_ACTIVE —— WAKE_IDLE 状态下 UDP 通道是关闭的
+             * （每次唤醒重新 hello 换新会话），喂音是纯本地 WakeNet 运算，
+             * 不需要网络。 */
             wake_word_feed((const int16_t *)pcm,
                            (size_t)s_audio.encoder_input_size /
                            sizeof(int16_t));
@@ -1165,6 +1439,37 @@ static void server_text_callback(const char *text, size_t len, void *ctx)
     if (!json_string_value(text, "type", message_type, sizeof(message_type))) {
         return;
     }
+#if defined(CONFIG_CLOUD_PROTOCOL_V3)
+    /* goodbye = 服务端结束会话（对照上游 mqtt_protocol.cc：收到后关音频通道、
+     * 不回发 goodbye 以防乒乓）。匹配当前会话（或未携带 session_id）时强制
+     * 回 WAKE_IDLE —— 这正是"服务端会话结束/超时"的显式信号；
+     * 重开流程中旧会话的迟到 goodbye 在 WAKE_IDLE 下被忽略。 */
+    if (strcmp(message_type, "goodbye") == 0) {
+        char gid[80] = {0};
+        json_string_value(text, "session_id", gid, sizeof(gid));
+        ESP_LOGI(TAG, "服务端 goodbye（session_id=%s）", gid[0] ? gid : "未携带");
+        if (s_voice_state != VOICE_STATE_WAKE_IDLE &&
+            (gid[0] == '\0' || strcmp(gid, s_session_id) == 0)) {
+            ESP_LOGW(TAG, "服务端结束当前会话，退回唤醒待机");
+            enter_wake_idle();
+        }
+        return;
+    }
+    /* 会话过滤：业务消息（stt/tts/llm/listen…）只属于当前会话。
+     * WAKE_IDLE（s_session_id 已清空 = 无活动会话）或旧会话的迟到消息一律
+     * 丢弃 —— 否则服务端处理完关闭前缓冲的音频后发来的迟到 STT/TTS 会把
+     * 状态机从 WAKE_IDLE 拽进 SPEAKING，设备卡死无法唤醒（2026-09-19 实机）。 */
+    if (s_voice_state == VOICE_STATE_WAKE_IDLE || s_session_id[0] == '\0') {
+        ESP_LOGW(TAG, "WAKE_IDLE 丢弃非当前会话消息（type=%s）", message_type);
+        return;
+    }
+    char msg_session[80] = {0};
+    if (json_string_value(text, "session_id", msg_session, sizeof(msg_session)) &&
+        strcmp(msg_session, s_session_id) != 0) {
+        ESP_LOGW(TAG, "丢弃非当前会话的消息（type=%s）", message_type);
+        return;
+    }
+#endif
     if (strcmp(message_type, "hello") == 0) {
         /* 服务端 Hello 已确认当前下行 24 kHz/mono/60 ms。 */
         const int sample_rate = json_int_value(text, "sample_rate", 0);
@@ -1213,6 +1518,9 @@ static void server_text_callback(const char *text, size_t len, void *ctx)
                                            XIAOZHI_EVENT_WAKE_ACTIVE);
             xEventGroupSetBits(s_events, XIAOZHI_EVENT_SPEAKING);
             wake_word_stop();
+#if defined(CONFIG_CLOUD_PROTOCOL_V3)
+            set_voice_state(VOICE_STATE_SPEAKING);
+#endif
             ESP_LOGI(TAG, "小智开始回答");
         } else if (strcmp(state, "stop") == 0) {
             xEventGroupClearBits(s_events, XIAOZHI_EVENT_SPEAKING);
@@ -1240,17 +1548,43 @@ static void server_text_callback(const char *text, size_t len, void *ctx)
                 wake_word_stop();
                 wake_word_start();
                 xEventGroupSetBits(s_events, XIAOZHI_EVENT_WAKE_ACTIVE);
+#if defined(CONFIG_CLOUD_PROTOCOL_V3)
+                /* 服务端主动结束连续监听（会话即将/已经结束）→ 回唤醒待机 */
+                set_voice_state(VOICE_STATE_WAKE_IDLE);
+#endif
                 ESP_LOGI(TAG, "服务端结束连续监听，等待唤醒词");
             }
         }
     } else if (strcmp(message_type, "llm") == 0) {
-        char emotion[20] = {0};
-        if (json_string_value(text, "emotion", emotion, sizeof(emotion)) &&
-            expression_manager_post_emotion != NULL) {
+        /* 小智官方下行格式：{"session_id":"xxx","type":"llm",
+         *                   "emotion":"happy","text":"😀"}
+         * emotion 决定屏幕表情；text 是与该情绪配套的文本（常常就是一个
+         * 表情符号），只用于日志，不参与业务判断。
+         *
+         * 两处约定：
+         *   1. 缺少 emotion 字段时回退 neutral，保证事件一定被投递，
+         *      不会出现「有回答但屏幕没反应」；
+         *   2. 仍然是投递到 Expression Manager 的事件队列，由 LVGL 定时器
+         *      在 UI 线程里真正切屏——WebSocket 回调里不碰任何 LVGL 对象。
+         *      词表外的取值也由 Expression Manager 统一回退 neutral。 */
+        char emotion[24] = {0};
+        char llm_text[128] = {0};
+        if (!json_string_value(text, "emotion", emotion, sizeof(emotion))) {
+            strncpy(emotion, "neutral", sizeof(emotion) - 1);
+        }
+        (void)json_string_value(text, "text", llm_text, sizeof(llm_text));
+
+        /* 这条日志用独立的 tag "XIAOZHI"：联调时直接 grep 这一行就能确认
+         * 服务端到底下发了什么情绪，不用在一堆 XIAOZHI_AUDIO 里翻。 */
+        ESP_LOGI("XIAOZHI", "LLM emotion=%s text=%s", emotion, llm_text);
+        if (expression_manager_post_emotion != NULL) {
             expression_manager_post_emotion(emotion);
-            ESP_LOGI(TAG, "收到情绪事件：%s", emotion);
         }
     } else if (strcmp(message_type, "stt") == 0) {
+#if defined(CONFIG_CLOUD_PROTOCOL_V3)
+        /* STT 到达 = 用户语音被有效处理，连续监听的空闲看门狗以此续期 */
+        s_last_stt_ms = (uint32_t)(esp_timer_get_time() / 1000);
+#endif
         ESP_LOGI(TAG, "语音识别结果：%.*s", (int)len, text);
     }
 }
@@ -1384,6 +1718,79 @@ static void service_task(void *arg)
     vTaskDeleteWithCaps(NULL);
 }
 
+/* ================= 表情链路离线自检（验证完把宏改回 0）=================
+ *
+ * 为什么要这个：官方服务器在握手后 ~280 ms 就发 CLOSE 关连接且不给原因，
+ * 下行里永远等不到 llm 消息 —— 「服务端回复 → 表情」这条路实机走不通。
+ *
+ * 那就把真正存疑的那一环单独隔离出来验：服务端下发的消息原文。
+ * 下面把官方格式的 llm JSON 直接喂进 server_text_callback —— 这和
+ * WEBSOCKET_EVENT_DATA 收到文本帧后调用的是**同一个函数**。所以
+ * JSON 解析、llm 分支、两行联调日志、事件投递、LVGL 定时器切屏全部
+ * 走真实代码，只有 TLS/TCP 没参与。
+ *
+ * 每步预期在串口出现两行，屏幕同时切脸（每张停 1800 ms，见
+ * expression_manager.c 的 play_file(entry->file, 1800)）：
+ *   XIAOZHI: LLM emotion=happy text=😀
+ *   EXPRESSION: emotion happy -> EXP_HAPPY
+ * 画面对照 src/demo/tools/gif 下的 8 张源图。
+ * 若出现「表情播放请求失败：/sdcard/expressions/exp_NN.bin」，那是 SD 卡
+ * 上没素材，不是这条链路的问题。
+ *
+ * ponytail: 写成文件内的宏而不是 Kconfig —— 改一行就能开关，
+ * 不必为它再跑一次 reconfigure（这个坑踩过了）。 */
+/* 状态日志与开关说明见下方注释块。当前=0：正式 Lummiss 模式不开机自检，
+ * 只在真实服务端下发 emotion 事件时切表情。 */
+#define EXPRESSION_SELFTEST 0
+
+#if EXPRESSION_SELFTEST
+
+/* 步进间隔必须大于表情停留时长（1800 ms），否则后一张脸会盖掉前一张，
+ * 肉眼分不出到底切没切。 */
+#define EXPRESSION_SELFTEST_STEP_MS 2400
+
+/* 顺序刻意让相邻两张脸的差异最大，便于发现"切错素材"。
+ * 最后一条用小智词表里**不存在**的词，用来验证
+ * 「未识别的 emotion 统一回退 neutral」这条约定。 */
+static const char *const k_expression_selftest[] = {
+    "{\"session_id\":\"selftest\",\"type\":\"llm\",\"emotion\":\"happy\",\"text\":\"😀\"}",
+    "{\"session_id\":\"selftest\",\"type\":\"llm\",\"emotion\":\"sad\",\"text\":\"😢\"}",
+    "{\"session_id\":\"selftest\",\"type\":\"llm\",\"emotion\":\"angry\",\"text\":\"😠\"}",
+    "{\"session_id\":\"selftest\",\"type\":\"llm\",\"emotion\":\"laughing\",\"text\":\"😄\"}",
+    "{\"session_id\":\"selftest\",\"type\":\"llm\",\"emotion\":\"surprised\",\"text\":\"😲\"}",
+    "{\"session_id\":\"selftest\",\"type\":\"llm\",\"emotion\":\"confused\",\"text\":\"😕\"}",
+    "{\"session_id\":\"selftest\",\"type\":\"llm\",\"emotion\":\"thinking\",\"text\":\"🤔\"}",
+    "{\"session_id\":\"selftest\",\"type\":\"llm\",\"emotion\":\"neutral\",\"text\":\"🙂\"}",
+    "{\"session_id\":\"selftest\",\"type\":\"llm\",\"emotion\":\"no_such_emotion\",\"text\":\"回退测试\"}",
+};
+
+static void expression_selftest_task(void *arg)
+{
+    (void)arg;
+    const size_t total = sizeof(k_expression_selftest) /
+                         sizeof(k_expression_selftest[0]);
+
+    /* 必须等 UI 任务把 expression_manager 建起来再投：本任务由 app_main 调用，
+     * 而 expression_manager_init() 在 ui_task 里。实测两者相隔约 80 ms
+     * （音频流水线就绪 → 表情管理器就绪），这里给 5 s 余量。
+     * 投早了不会报错 —— expression_manager 的 post() 对未初始化是**静默丢弃**，
+     * 只会表现为"屏幕没反应"，所以这个等待不能省。 */
+    vTaskDelay(pdMS_TO_TICKS(5000));
+
+    ESP_LOGW(TAG, "表情自检开始：%u 步 x %d ms，请看屏幕",
+             (unsigned)total, EXPRESSION_SELFTEST_STEP_MS);
+    for (size_t i = 0; i < total; i++) {
+        ESP_LOGI(TAG, "自检 %u/%u", (unsigned)(i + 1), (unsigned)total);
+        server_text_callback(k_expression_selftest[i],
+                             strlen(k_expression_selftest[i]), NULL);
+        vTaskDelay(pdMS_TO_TICKS(EXPRESSION_SELFTEST_STEP_MS));
+    }
+    ESP_LOGW(TAG, "表情自检结束（最后一条 EXPRESSION 日志应为 unknown -> neutral）");
+    vTaskDelete(NULL);
+}
+
+#endif /* EXPRESSION_SELFTEST */
+
 esp_err_t xiaozhi_audio_start(void)
 {
     if (s_started) {
@@ -1409,7 +1816,17 @@ esp_err_t xiaozhi_audio_start(void)
     if (wake_word_init(1) == ESP_OK) {
         wake_word_set_callback(wake_word_detected_cb, NULL);
         s_wake_word_ready = true;
+#if defined(CONFIG_CLOUD_PROTOCOL_V3)
+        /* V3：唤醒词检测是纯本地 WakeNet 运算，不依赖网络 —— 开机即启用
+         * （WAKE_IDLE 状态）。唤醒后再按需重新 hello 建立会话
+         * （见 v3_open_session_for_wake）。 */
+        wake_word_start();
+        xEventGroupSetBits(s_events, XIAOZHI_EVENT_WAKE_ACTIVE);
+        set_voice_state(VOICE_STATE_WAKE_IDLE);
+        ESP_LOGI(TAG, "唤醒词引擎已就绪并启用（WAKE_IDLE），说“你好小智”开始对话");
+#else
         ESP_LOGI(TAG, "唤醒词引擎已就绪，等待 WebSocket 连接后启用");
+#endif
     } else {
         ESP_LOGE(TAG, "唤醒词引擎初始化失败，语音上行将保持关闭");
     }
@@ -1431,6 +1848,20 @@ esp_err_t xiaozhi_audio_start(void)
         s_events = NULL;
         return ESP_ERR_NO_MEM;
     }
+
+    /* 回退官方测试时加的启动状态行（用户要求的清晰日志的一部分）。 */
+    ESP_LOGI(TAG, "Expression self-test=%s",
+             EXPRESSION_SELFTEST ? "ON" : "OFF");
+
+#if EXPRESSION_SELFTEST
+    /* 表情链路离线自检，说明见本文件上方；验证完把 EXPRESSION_SELFTEST 改回 0。
+     * 创建失败不影响音频服务，只打一条日志。 */
+    if (xTaskCreatePinnedToCoreWithCaps(expression_selftest_task, "expr_selftest",
+                                       3072, NULL, 2, NULL, tskNO_AFFINITY,
+                                       MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) != pdPASS) {
+        ESP_LOGW(TAG, "表情自检任务创建失败，跳过");
+    }
+#endif
     return ESP_OK;
 }
 

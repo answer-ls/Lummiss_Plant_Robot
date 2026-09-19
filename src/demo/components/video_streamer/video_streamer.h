@@ -139,8 +139,43 @@ bool video_streamer_submit_jpeg_owned(
     video_streamer_input_release_cb_t release_cb,
     void *release_ctx);
 
-/* 控制是否继续处理并上传视频帧。关闭时保留 WebSocket 控制通道，
- * 便于浏览器再次开启视频流；摄像头 USB 采集不会被重启。 */
+/* ==================== 按需视频流：运行状态与启停 ====================
+ *
+ * 默认 IDLE。开机只建立 WebSocket 控制通道（Hello / 小智文本 / Opus 音频），
+ * 不编码、不上传 H.264；只有收到服务端开启命令才进入 STREAMING。
+ * 这条链路**不**和「WiFi 连上」「WebSocket 连上」「OTA 完成」挂钩。
+ *
+ * 初始化与开启是两件事：
+ *   video_streamer_init()  → 建队列/任务/PSRAM 缓冲，此时仍是 IDLE
+ *   video_streamer_start() → 真正开始编码上传，必须等服务端命令 */
+typedef enum {
+    VIDEO_STATE_IDLE = 0,      /* 未上传：门控关闭，提交进来的帧被直接丢弃 */
+    VIDEO_STATE_STARTING,      /* 正在进入上传：清积压帧 + 请求 IDR */
+    VIDEO_STATE_STREAMING,     /* 正在编码并上传 */
+    VIDEO_STATE_STOPPING,      /* 正在退出上传：丢弃积压帧 */
+} video_state_t;
+
+/* 开启 / 关闭 H.264 上传，两者都幂等：
+ *   - 已 STARTING/STREAMING 时再次 start → 直接返回，不会重复建任务或队列
+ *   - 已 IDLE 时再次 stop               → 直接返回
+ * 关闭只停「编码 + 上传」，WebSocket 控制通道与 UVC 采集都保持不动，
+ * 相机仍可被拍照 / AI 识别等其它业务使用。
+ *
+ * 执行体本身很快（切门控标志 + 清两条队列），但仍建议 WebSocket /
+ * MCP 接收任务改用下面的 request_* 系列，把动作交给视频控制任务执行。 */
+esp_err_t video_streamer_start(void);
+esp_err_t video_streamer_stop(void);
+bool video_streamer_is_active(void);
+video_state_t video_streamer_get_state(void);
+const char *video_streamer_state_name(video_state_t state);
+
+/* 供 WebSocket / MCP 接收回调使用：把启停请求投递给内部视频控制任务后
+ * 立即返回，绝不在接收任务里做耗时动作。返回 false 表示未初始化或队列满。 */
+bool video_streamer_request_start(void);
+bool video_streamer_request_stop(void);
+
+/* 兼容旧接口：等价于 video_streamer_start() / video_streamer_stop()。
+ * 新代码请直接用上面两个函数。 */
 void video_streamer_set_enabled(bool enabled);
 bool video_streamer_is_enabled(void);
 

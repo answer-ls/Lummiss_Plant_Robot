@@ -8,21 +8,29 @@
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
-#include "esp_netif_sntp.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "network_manager.h"
+#include "time_service.h"
 
 static const char *TAG = "HOME_INFO";
 
 #define HOME_INFO_TASK_STACK        8192
-#define HOME_INFO_TASK_PRIORITY     5
+#define HOME_INFO_TASK_PRIORITY     0
+#define HOME_INFO_TASK_CORE         0
 #define HOME_INFO_HTTP_TIMEOUT_MS   12000
 #define HOME_INFO_RESPONSE_BYTES    4096
 #define HOME_INFO_RETRY_SECONDS     60
 #define HOME_INFO_WEATHER_SECONDS   (30 * 60)
 #define HOME_INFO_LOCATION_SECONDS  (6 * 60 * 60)
+#define HOME_INFO_RETRY_MIN_SECONDS 5U
+#define HOME_INFO_RETRY_MAX_SECONDS 60U
+
+/* 默认时区：中国全境统一 UTC+8 且不使用夏令时。
+ * 时钟只在 NTP 校时成功后就该显示，不能再等第三方定位 / 天气接口——
+ * 否则接口一旦不通，屏幕会一直停在 "--:--"。定位或天气返回真实偏移后再覆盖它。 */
+#define HOME_INFO_DEFAULT_UTC_OFFSET_SECONDS  (8 * 3600)
 
 /* IP 定位不需要 API Key，用于自动取得经纬度和时区。天气接口同样不需要 Key。 */
 #define HOME_INFO_LOCATION_URL \
@@ -63,10 +71,14 @@ static esp_err_t http_event_handler(esp_http_client_event_t *event)
     if (copy_size != (size_t)event->data_len) {
         response->overflow = true;
     }
+    /* 响应数据较大时主动给网络任务让出调度点，避免连续回调长期占用 CPU。 */
+    taskYIELD();
     return ESP_OK;
 }
 
-static esp_err_t http_get_json(const char *url, http_response_buffer_t *response)
+/* label 只用于日志，标明是哪一路接口失败，方便对着串口判断。 */
+static esp_err_t http_get_json(const char *label, const char *url,
+                               http_response_buffer_t *response)
 {
     memset(response, 0, sizeof(*response));
     const esp_http_client_config_t config = {
@@ -89,12 +101,12 @@ static esp_err_t http_get_json(const char *url, http_response_buffer_t *response
     esp_http_client_cleanup(client);
 
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "HTTPS 请求失败：%s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "%s接口请求失败：%s", label, esp_err_to_name(err));
         return err;
     }
     if (status != 200 || response->overflow || response->length == 0) {
-        ESP_LOGW(TAG, "API 响应异常：HTTP=%d，长度=%u，溢出=%d",
-                 status, (unsigned)response->length, response->overflow);
+        ESP_LOGW(TAG, "%s接口响应异常：HTTP=%d，长度=%u，溢出=%d",
+                 label, status, (unsigned)response->length, response->overflow);
         return ESP_FAIL;
     }
     return ESP_OK;
@@ -125,7 +137,7 @@ static void copy_city_name(const cJSON *root)
 static esp_err_t fetch_location(double *latitude, double *longitude)
 {
     http_response_buffer_t response;
-    esp_err_t err = http_get_json(HOME_INFO_LOCATION_URL, &response);
+    esp_err_t err = http_get_json("定位", HOME_INFO_LOCATION_URL, &response);
     if (err != ESP_OK) {
         return err;
     }
@@ -178,7 +190,7 @@ static esp_err_t fetch_weather(double latitude, double longitude)
     snprintf(url, sizeof(url), HOME_INFO_WEATHER_URL, latitude, longitude);
 
     http_response_buffer_t response;
-    esp_err_t err = http_get_json(url, &response);
+    esp_err_t err = http_get_json("天气", url, &response);
     if (err != ESP_OK) {
         return err;
     }
@@ -218,23 +230,18 @@ static esp_err_t fetch_weather(double latitude, double longitude)
     return ESP_OK;
 }
 
+/* 只**等待**时间同步完成，绝不在这里初始化 SNTP —— 那是 time_service 的唯一职责。
+ *
+ * 之前这里自己调 esp_netif_sntp_init + esp_netif_sntp_sync_wait，结果两件事一起发生：
+ *   1) init 报 "esp_netif_sntp already initialized"（app_main 已经初始化过）；
+ *   2) sync_wait 内部是 xQueueSemaphoreTake 一个**二值信号量**，只可能被消费一次
+ *      —— app_main 已经取走了，本函数于是白等满 15 s 再报"网络校时超时"，
+ *      而系统时间其实早就同步好了。
+ * 现在时间同步状态由 time_service 用粘性事件位广播，谁都可以反复问。 */
 static bool synchronize_clock(void)
 {
-    static bool initialized;
-    if (!initialized) {
-        /* 阿里云 NTP 对国内网络更友好，pool.ntp.org 作为备用。 */
-        esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG_MULTIPLE(
-            2, ESP_SNTP_SERVER_LIST("ntp.aliyun.com", "pool.ntp.org"));
-        esp_err_t err = esp_netif_sntp_init(&config);
-        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-            ESP_LOGW(TAG, "启动网络校时失败：%s", esp_err_to_name(err));
-            return false;
-        }
-        initialized = true;
-    }
-
-    if (esp_netif_sntp_sync_wait(pdMS_TO_TICKS(15000)) != ESP_OK) {
-        ESP_LOGW(TAG, "网络校时超时，稍后重试");
+    if (!time_service_wait_synced(15000)) {
+        ESP_LOGW(TAG, "等待网络校时超时，稍后重试");
         return false;
     }
     ESP_LOGI(TAG, "网络时间同步成功");
@@ -249,10 +256,13 @@ static void home_info_task(void *arg)
     bool location_valid = false;
     TickType_t last_location_tick = 0;
     TickType_t last_weather_tick = 0;
+    uint32_t failure_backoff_seconds = HOME_INFO_RETRY_MIN_SECONDS;
 
     while (true) {
         if (!network_manager_wait_connected(30000)) {
             ESP_LOGW(TAG, "等待 WiFi 联网后获取时间和天气");
+            /* 网络不可用时也必须退避，不能快速 continue 形成忙等。 */
+            vTaskDelay(pdMS_TO_TICKS(5000));
             continue;
         }
 
@@ -270,8 +280,17 @@ static void home_info_task(void *arg)
             if (fetch_location(&latitude, &longitude) == ESP_OK) {
                 location_valid = true;
                 last_location_tick = now;
+                failure_backoff_seconds = HOME_INFO_RETRY_MIN_SECONDS;
             } else {
-                vTaskDelay(pdMS_TO_TICKS(HOME_INFO_RETRY_SECONDS * 1000U));
+                ESP_LOGW(TAG, "定位失败，%u 秒后退避重试",
+                         (unsigned)failure_backoff_seconds);
+                vTaskDelay(pdMS_TO_TICKS(failure_backoff_seconds * 1000U));
+                if (failure_backoff_seconds < HOME_INFO_RETRY_MAX_SECONDS) {
+                    failure_backoff_seconds *= 2U;
+                    if (failure_backoff_seconds > HOME_INFO_RETRY_MAX_SECONDS) {
+                        failure_backoff_seconds = HOME_INFO_RETRY_MAX_SECONDS;
+                    }
+                }
                 continue;
             }
         }
@@ -281,9 +300,22 @@ static void home_info_task(void *arg)
         if (weather_due) {
             if (fetch_weather(latitude, longitude) == ESP_OK) {
                 last_weather_tick = now;
+                failure_backoff_seconds = HOME_INFO_RETRY_MIN_SECONDS;
+            } else {
+                ESP_LOGW(TAG, "天气失败，%u 秒后退避重试",
+                         (unsigned)failure_backoff_seconds);
+                vTaskDelay(pdMS_TO_TICKS(failure_backoff_seconds * 1000U));
+                if (failure_backoff_seconds < HOME_INFO_RETRY_MAX_SECONDS) {
+                    failure_backoff_seconds *= 2U;
+                    if (failure_backoff_seconds > HOME_INFO_RETRY_MAX_SECONDS) {
+                        failure_backoff_seconds = HOME_INFO_RETRY_MAX_SECONDS;
+                    }
+                }
+                continue;
             }
         }
 
+        /* 定位和天气成功后进入低频轮询，任务不会空转。 */
         vTaskDelay(pdMS_TO_TICKS(HOME_INFO_RETRY_SECONDS * 1000U));
     }
 }
@@ -299,8 +331,19 @@ esp_err_t home_info_start(void)
         return ESP_ERR_NO_MEM;
     }
 
-    BaseType_t result = xTaskCreate(home_info_task, "home_info", HOME_INFO_TASK_STACK,
-                                    NULL, HOME_INFO_TASK_PRIORITY, NULL);
+    /* 时钟先按默认时区（UTC+8）成立：NTP 一成功就能出时间，
+     * 不再把"显示时间"绑死在 ipwho.is 这类第三方接口上。
+     * 这里的写入发生在任务创建之前，无需加锁。 */
+    s_timezone_offset_seconds = HOME_INFO_DEFAULT_UTC_OFFSET_SECONDS;
+    s_timezone_valid = true;
+    ESP_LOGI(TAG, "默认时区 UTC+8（中国），定位成功后按实际时区修正");
+
+    /* 天气/定位属于最低优先级后台任务，固定在 CPU0。使用与 IDLE 同级的
+     * 优先级，让 CPU0 空闲任务在 TLS 大数运算期间仍能获得时间片，避免
+     * 任务看门狗只看到 IDLE0 长时间无法运行。请求完成后任务始终进入延时。 */
+    BaseType_t result = xTaskCreatePinnedToCore(
+        home_info_task, "home_info", HOME_INFO_TASK_STACK, NULL,
+        HOME_INFO_TASK_PRIORITY, NULL, HOME_INFO_TASK_CORE);
     if (result != pdPASS) {
         vSemaphoreDelete(s_snapshot_mutex);
         s_snapshot_mutex = NULL;

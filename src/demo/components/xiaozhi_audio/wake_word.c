@@ -13,6 +13,7 @@
 static const char *TAG = "WAKE_WORD";
 
 #define WAKE_EVENT_RUNNING  BIT0
+#define WAKE_FETCH_TIMEOUT_MS 100U
 #define WAKE_PREROLL_SAMPLE_RATE 16000U
 #define WAKE_PREROLL_SECONDS     2U
 #define WAKE_PREROLL_SAMPLES     (WAKE_PREROLL_SAMPLE_RATE * WAKE_PREROLL_SECONDS)
@@ -38,9 +39,19 @@ typedef struct {
     size_t preroll_capacity;
     size_t preroll_count;
     size_t preroll_write;
+    volatile uint32_t feed_count;
+    volatile uint32_t fetch_count;
+    volatile uint32_t fetch_null_count;
+    volatile uint32_t feed_fail;
+    volatile uint32_t wake_detect_count;
 } wake_word_ctx_t;
 
 static wake_word_ctx_t s_ww;
+
+static inline void stats_inc(volatile uint32_t *value)
+{
+    __atomic_add_fetch(value, 1U, __ATOMIC_RELAXED);
+}
 
 /* 保存最近两秒 AFE 输出。检测任务是唯一写入者，检测回调在同一任务中读取，
  * 因而不需要额外锁，也不会在每个音频块上 malloc/free。 */
@@ -97,10 +108,16 @@ static void detection_task(void *arg)
         xEventGroupWaitBits(ctx->event_group, WAKE_EVENT_RUNNING,
                             pdFALSE, pdTRUE, portMAX_DELAY);
 
+        /* stop 后必须能回到等待状态；feed 持续时正常不会超时。 */
         afe_fetch_result_t *afe_result = ctx->afe_iface->fetch_with_delay(
-            ctx->afe_data, portMAX_DELAY);
+            ctx->afe_data, pdMS_TO_TICKS(WAKE_FETCH_TIMEOUT_MS));
 
-        if (afe_result == NULL || afe_result->ret_value == ESP_FAIL) {
+        if (afe_result == NULL) {
+            stats_inc(&ctx->fetch_null_count);
+            continue;
+        }
+        stats_inc(&ctx->fetch_count);
+        if (afe_result->ret_value == ESP_FAIL) {
             continue;
         }
 
@@ -117,6 +134,7 @@ static void detection_task(void *arg)
             }
 
             ctx->detected = true;
+            stats_inc(&ctx->wake_detect_count);
             ESP_LOGI(TAG, "检测到唤醒词: %s", ctx->last_wake_word);
 
             wake_word_stop();
@@ -141,9 +159,9 @@ esp_err_t wake_word_init(int channels)
     memset(&s_ww, 0, sizeof(s_ww));
     s_ww.channels = channels <= 0 ? 1 : channels;
 
-    /* 从 SPIFFS 加载语音识别模型。模型文件通过 esp-sr 组件提供，
-     * 运行时从 "model" 前缀的 SPIFFS 分区读取。                     */
-    s_ww.models = esp_srmodel_init("model");
+    /* 从 SPIFFS 加载语音识别模型。YOLO 使用 model 分区，
+     * ESP-SR 唤醒模型由构建脚本独立烧录到 storage 分区。 */
+    s_ww.models = esp_srmodel_init("storage");
     if (s_ww.models == NULL || s_ww.models->num <= 0) {
         ESP_LOGE(TAG, "加载 Wakenet 模型失败");
         return ESP_ERR_NOT_FOUND;
@@ -188,7 +206,9 @@ esp_err_t wake_word_init(int channels)
 
     afe_config->aec_init = false;
     afe_config->afe_perferred_core = 1;
-    afe_config->afe_perferred_priority = 3;
+    /* AFE 内部处理线程必须优先于 YOLO/home_info，避免 feed 持续写入而
+     * fetch 长时间得不到调度。 */
+    afe_config->afe_perferred_priority = 10;
     afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
 
     s_ww.afe_iface = esp_afe_handle_from_config(afe_config);
@@ -227,7 +247,7 @@ esp_err_t wake_word_init(int channels)
     }
 
     BaseType_t task_ok = xTaskCreatePinnedToCore(
-        detection_task, "wake_detect", 4096, NULL, 3,
+        detection_task, "wake_detect", 4096, NULL, 11,
         &s_ww.detection_task, 1);
     if (task_ok != pdPASS) {
         ESP_LOGE(TAG, "创建检测任务失败");
@@ -235,7 +255,9 @@ esp_err_t wake_word_init(int channels)
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG, "唤醒词引擎初始化完成: %s, channels=%d, feed=%u, fetch=%u",
+    ESP_LOGI(TAG,
+             "唤醒词引擎初始化完成: %s, channels=%d, feed=%u, fetch=%u, "
+             "AFE=CPU1/P10, fetch_task=P11",
              s_ww.wake_words_str, s_ww.channels,
              (unsigned)s_ww.feed_chunk_size,
              (unsigned)s_ww.fetch_chunk_size);
@@ -307,7 +329,13 @@ void wake_word_feed(const int16_t *data, size_t count)
         remaining -= copy;
 
         if (s_ww.feed_buffer_count >= s_ww.feed_chunk_size) {
-            s_ww.afe_iface->feed(s_ww.afe_data, s_ww.feed_buffer);
+            const int fed = s_ww.afe_iface->feed(s_ww.afe_data,
+                                                 s_ww.feed_buffer);
+            if (fed > 0) {
+                stats_inc(&s_ww.feed_count);
+            } else {
+                stats_inc(&s_ww.feed_fail);
+            }
             s_ww.feed_buffer_count = 0;
         }
     }
@@ -321,6 +349,20 @@ bool wake_word_is_detected(void)
 const char *wake_word_get_last(void)
 {
     return s_ww.last_wake_word[0] != '\0' ? s_ww.last_wake_word : "unknown";
+}
+
+void wake_word_get_stats(wake_word_stats_t *stats)
+{
+    if (stats == NULL) {
+        return;
+    }
+    stats->feed_count = __atomic_load_n(&s_ww.feed_count, __ATOMIC_RELAXED);
+    stats->fetch_count = __atomic_load_n(&s_ww.fetch_count, __ATOMIC_RELAXED);
+    stats->fetch_null_count =
+        __atomic_load_n(&s_ww.fetch_null_count, __ATOMIC_RELAXED);
+    stats->feed_fail = __atomic_load_n(&s_ww.feed_fail, __ATOMIC_RELAXED);
+    stats->wake_detect_count =
+        __atomic_load_n(&s_ww.wake_detect_count, __ATOMIC_RELAXED);
 }
 
 size_t wake_word_copy_preroll(int16_t *output, size_t max_samples)

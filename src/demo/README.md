@@ -222,18 +222,25 @@ SDIO 使用 Slot 1、4-bit、40 MHz。依赖锁定结果为 `esp_hosted 2.7.4` �
 
 ## 屏幕接线
 
+屏幕是**外接**的 GMT020-02-8P（ST7789，原生 240×320），不是板载屏，**与 GPIO20 无关**。
+下表与 `components/board/include/board_pins.h` 的 `BOARD_LCD_*` 一致
+（2026-09-17 提交 a908e83 改线后）。更早那版 SCLK=GPIO20 / MOSI=GPIO32 / RST=GPIO3 /
+DC=GPIO2 / CS=GPIO1 / BL=3V3 已失效，不要照它接线：
+
 | 屏幕引脚 | ESP32-P4 |
 | --- | --- |
 | GND | GND |
 | VCC | 3V3 |
-| SCL/SCLK | GPIO20 |
-| SDA/MOSI | GPIO32 |
-| RST/RES | GPIO3 |
-| DC | GPIO2 |
-| CS | GPIO1 |
-| BL/BLK | 3V3 |
+| SCL/SCLK | GPIO3 |
+| SDA/MOSI | GPIO2 |
+| RST/RES | GPIO1 |
+| DC | GPIO5 |
+| CS | GPIO4 |
+| BL/BLK | GPIO47（程序控制） |
+| TE | GPIO6 |
 
-BL 直接接 3V3，当前程序不能控制背光亮度。
+背光现在由 GPIO47 控制，`display_driver.c` 初始化时拉高；若实物 BL 仍直接接 3V3，
+这一步只是空操作。
 
 ## 构建与烧录
 

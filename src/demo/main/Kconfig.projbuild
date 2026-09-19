@@ -1,0 +1,68 @@
+menu "Xiaozhi official server test mode"
+
+config XIAOZHI_USE_OFFICIAL_SERVER
+    bool "临时使用小智官方服务器验证语音与 emotion 表情"
+    default n
+    help
+        仅用于公司 Lummiss 后端不可用期间的功能验证，属于临时开关。
+        开启后：
+
+          - OTA 地址切到 https://api.tenclass.net/xiaozhi/ota/；
+          - WebSocket 握手补 Protocol-Version: 1，客户端 Hello 改按小智
+            官方 WebSocket v1 协议发送（audio_params，不再携带
+            capability_manifest）；
+          - 禁止向 WebSocket 发送 H.264 视频二进制帧：官方 WebSocket 的
+            二进制帧只承载 Opus 音频，混发视频会让服务端按音频解码。
+            视频上传整体关闭，只保留小智音频、屏幕显示、SD 卡表情资源
+            与 Expression Manager；
+          - type == "llm" 的下行消息按官方格式解析 emotion/text，
+            经事件队列交给 Expression Manager 切换表情。
+
+        WebSocket 地址仍然只从 OTA 响应的 websocket.url / websocket.token
+        读取，代码里不硬编码 WebSocket 地址。
+
+        关闭该开关即恢复原有 Lummiss 服务器行为；两套逻辑用编译宏隔离，
+        原有 Lummiss 代码全部保留。
+
+endmenu
+
+menu "Cloud protocol"
+
+choice CLOUD_PROTOCOL
+    prompt "设备与 Lummiss 云端之间的通信协议"
+    default CLOUD_PROTOCOL_V3
+    help
+        依据《ESP32-嵌入式三通道接入实施文档》v1.0（2026-09-18）。
+
+        两套协议用编译宏互斥隔离，不允许同时运行两条通信链路。
+
+config CLOUD_PROTOCOL_V3
+    bool "三通道新协议：MQTT 控制 + UDP Opus + WebRTC H264"
+    help
+        新基线协议：
+
+          HTTPS OTA  →  取 mqtt 六字段（endpoint / client_id / username /
+                        password / publish_topic / subscribe_topic）
+          MQTT/TCP   →  控制、MCP、状态、WebRTC SDP/ICE 信令；不传音视频帧
+          UDP        →  AI 对话的 Opus 音频（AES-128-CTR）
+          WebRTC     →  H.264 视频
+
+        设备不再常驻 Agent WebSocket。OTA 响应缺少 mqtt 段时启动失败，
+        **不静默退回 WebSocket**。
+
+        阶段一（当前）只实现 OTA + MQTT + AI Hello v3 + Server Hello；
+        UDP 音频（阶段二）、MCP（阶段三）、WebRTC（阶段四）尚未实现，
+        对应能力不得出现在 tools/list 中。
+
+config CLOUD_PROTOCOL_LEGACY_WS
+    bool "旧协议：Agent WebSocket 单连接（仅用于回滚）"
+    help
+        迁移前的实现：OTA 取 websocket.url / token，单条 WSS 同时承载
+        JSON 控制、MCP、Opus 音频与 H.264 视频，视频由自定义
+        VIDEO_START / VIDEO_STOP 命令驱动。
+
+        保留本选项只为后端异常时能快速回滚；正式新协议下不要启用。
+
+endchoice
+
+endmenu

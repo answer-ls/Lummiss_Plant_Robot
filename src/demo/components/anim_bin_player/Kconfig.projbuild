@@ -1,4 +1,4 @@
-menu "Lummiss 动画播放器"
+menu "Lummiss animation player"
 
 config LUMMISS_ANIM_FIRST_FRAME_ONLY
     bool "仅显示 LUM1 第一帧"

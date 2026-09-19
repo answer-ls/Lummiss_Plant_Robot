@@ -1,6 +1,6 @@
 # Lummiss 盆栽陪伴机器人项目交接说明
 
-更新时间：2026-09-17
+更新时间：2026-09-18
 
 ## 1. 当前结论
 
@@ -17,7 +17,10 @@
 - **2026-09-17 HBVCAM 完整预览分辨率对照测试**：profile 5 开启 UVC、JPEG 解码、YUV 转换、H.264、WiFi/WebSocket 和 UI/SD；分别对 `1280×720 MJPEG@30` 与 `640×480 MJPEG@30` 独立构建/启动。`1280×720` 观察到 UVC complete 约 `23.4～27.0 FPS`、drop `11.8%～25.9%`、handoff rejected `33～46`/统计窗，H.264/发送约 `14～16.7 FPS`；YUV 平均约 `30.8～31.3 ms`，出现 JPEG 解码错误 259、缺 EOI 无效帧和输出丢帧。`640×480` 的日志窗口观察到 UVC complete `29.8～30.0 FPS`、drop `0%`、handoff rejected `0`，稳态 H.264/发送约 `30.2 FPS`；JPEG/YUV/H.264 平均约 `4.46/10.57/5.41 ms`，统计窗内无无效帧、队列丢弃或发送失败。结论：当前浏览器预览优先使用 `640×480`；640×480 这轮只记录了短时稳态窗口，尚非长时间稳定性验收。测试时本地 PC 地址覆盖使 WebSocket 成功连接；OTA 响应自身缺少 `websocket.url`。测试后已关闭本地 PC 覆盖地址（`VIDEO_STREAM_PC_PREVIEW_ENABLED=0`）；H.264/上传代码仍保留，OTA 若提供有效 WebSocket 配置仍可使用云端地址。COM17 的 ClearCommError/重连没有伴随固件 panic 记录。
 - **2026-09-16 UVC 组帧根因定位**：640×480 日志中 SOI/EOI、FID、EOF 均存在，但 `frame_len` 在约 2136 字节后停止。原因是 `uvc_isoc.c` 对 `actual_num_bytes==0` 的普通零长度 ISOC 包统计后错误设置 `skip_current_frame`；frame buffer 没有释放，后续同 FID/PTS payload 因 skip 标志无法继续追加。现已改为零长度包只计数并忽略，并加入 `empty_inside_active_frame`、`frame_abort_by_empty`、`header_only_inside_active_frame`、`frame_abort_by_header_only` 及事件中的 `active=before→after` 诊断。该修复已构建通过，尚待开发板重新烧录后的 640×480 冷启动实测确认。
 - **2026-09-17 YUV 转换独立 A/B**：在 640×480 MJPEG@30、profile 8（UVC + JPEG 硬解 + YUV 转换）下，分别独立运行 ref（约 69 秒）和 sample_even（约 102 秒）；H.264、WiFi/WebSocket、UI/LVGL、SD 均关闭，DMA2D 不支持并回退 CPU。排除首个部分统计窗口后，sample_even 的 YUV 平均耗时 8.72 ms，ref 为 10.31 ms，约快 15.4%；两轮 UVC complete 均约 30.03 FPS、drop 均为 0%，handoff rejected 均为 0，rate_limit 均约 50.6 次/5 秒。该结果只说明隔离链路下转换更快且未观察到 UVC 回归；H.264 开启时的 PSRAM/USB 争用和浏览器端帧率仍未验证。sample_even 保持 Y 不变、U/V 直接取偶数行，颜色精度尚未评估。当前源码 `video_streamer.h` 的 `VIDEO_YUV_CONVERSION_TEST_MODE` 设为 `REF`，复测 sample_even 时需切换为 `VIDEO_YUV_CONVERSION_MODE_SAMPLE_EVEN`。
-- UI 状态机、传感器、触摸、LED、电机、专注模式、电源管理和整机联调均未进入实现阶段。
+- **2026-09-18 人机交互外设驱动层落地**：新增 `components/mech_button`（机械按键 GPIO22）、`components/touch_key`（两路 TTP223 触摸 GPIO52/51，当普通数字 GPIO 读，不走 P4 内部触摸外设）、`components/ambient_led`（两路 WS2812 氛围灯 GPIO20/21，RMT 后端），并新增档位 9 `CAMERA_TEST_PERIPH_ONLY`（UVC + 外设自检）与 `main/peripheral_test.c` 自检入口。构建通过、档位 9 已在开发板实机运行：**未干扰 UVC**（complete 29.8～30.2 FPS、drop 0.0%、handoff rejected 0），开机静默期自检**无幽灵输入事件**。**这三组引脚的物理接线只属于将来要打的新 PCB**，开发板上并无对应接线（详见第 6A 节）。
+- **2026-09-18 视频上传改为按需开启**：删掉了两处「开机自动开视频」的默认值 —— `video_streamer.c` 的 `s_stream_enabled = true`（编译期就开着）和 `camera_driver.c` 里基于 `CAMERA_VIDEO_STREAM_ENABLED = 1` 的强制启用（摄像头初始化完就调 `set_enabled`）。现在开机默认 `IDLE`：WiFi、WebSocket、Hello、小智音频全部照常，但**不上传任何 H.264**；必须等服务端下发 `{"type":"video","state":"start"}` 才进入 `STREAMING`。停止、断线自动停、重连不自动恢复，详见第 7A 节。
+- **2026-09-18 云端通信迁移到三通道协议（阶段一、二已实机打通）**：后端已从「OTA + 单条 Agent WebSocket」迁到 MQTT 控制 + UDP Opus 音频 + WebRTC 视频。固件按编译开关 `CONFIG_CLOUD_PROTOCOL_V3`（默认，`main/Kconfig.projbuild`）切换：OTA 取 MQTT 六字段 → MQTT hello v3 → Server Hello（session_id + UDP 参数）→ **UDP + AES-128-CTR 双向 Opus**。旧 Agent WebSocket 在 V3 下完全不建立；`CONFIG_CLOUD_PROTOCOL_LEGACY_WS` 保留旧协议仅作回滚。实机已验证：全双工对话（`tx=258 rx=213` 零错、`SPK frames=213`）、MCP 握手 + 工具调用（音量控制）、多轮自动对话。**WebRTC（阶段四）未实现**；协议细节与踩坑见第 8A 节。
+- UI 状态机、传感器、电机、专注模式、电源管理和整机联调均未进入实现阶段；触摸与氛围灯已有驱动层，但尚未接 App Event Bus / 业务状态，也缺少实物（按键 / TTP223 模块 / 灯带）验收。
 
 开发流程基线为根目录的 `盆栽陪伴机器人_开发文档.md`。本文只记录当前事实和下一步，不替代该设计文档。
 
@@ -53,6 +56,7 @@ src/esp_draw_bit     厂商示例副本，只作参考
 | 远程 WiFi API | `espressif/esp_wifi_remote` 1.3.0 |
 | BLE/WiFi 配网组件 | `espressif/network_provisioning` 1.2.4 |
 | 唤醒词/语音前端 | `espressif/esp-sr` ~2.3.0（AFE + Hi-Max 唤醒模型） |
+| 氛围灯组件 | `espressif/led_strip` 3.0.3（RMT 后端，**显式关闭 DMA**） |
 | 默认串口 | COM17 |
 
 工程根目录必须保持英文路径。旧中文路径曾导致 Python/Kconfig 的 GBK 解码错误和 Ninja 乱码路径错误。
@@ -64,7 +68,7 @@ src/esp_draw_bit     厂商示例副本，只作参考
 | 文件 | 职责 |
 | --- | --- |
 | `main/main.c` | 唯一 `app_main()`，按档位启动 Network / 首页信息 / UI Task / Camera Task |
-| `main/test_profile.h` | **启动组合测试档位的唯一定义点**：档位号 0~8、档位→功能位映射、`TP_HAS()` 和 `test_profile_name()` |
+| `main/test_profile.h` | **启动组合测试档位的唯一定义点**：档位号 0~9、档位→功能位映射、`TP_HAS()` 和 `test_profile_name()`；档位 9 = `CAMERA_TEST_PERIPH_ONLY`（UVC + 外设自检） |
 | `main/display_driver.c/.h` | ST7789、LVGL 和动态时间天气首页 |
 | `main/screen_carousel.c/.h` | TF 卡 GIF 轮播：挂载 SD、预读任务、LVGL 定时器每 5 秒换 `lv_gif` 的 `src` |
 | `main/camera_driver.c/.h` | USB Host、UVC 枚举、格式轮转、卡死恢复、帧回调和视频流统计 |
@@ -74,10 +78,15 @@ src/esp_draw_bit     厂商示例副本，只作参考
 | `components/provisioning/provisioning_manager.c/.h` | BLE 配网、Security 2、设备名、每设备 PoP 和配网生命周期 |
 | `BLE_WIFI_PROVISIONING.md` | App 对接参数、二维码格式、配网流程和重新配网接口 |
 | `components/sd_card/sd_card.c/.h` | SDMMC Slot 0 挂载，含片上 LDO ch.4 供电和重试 |
-| `components/video_streamer/video_streamer.c/.h` | MJPEG 队列、硬件 JPEG 解码、CPU 分块 YUV422→YUV420、H.264 编码；**并持有唯一的 Agent WebSocket**（视频二进制帧、小智文本/Opus 都走它），对小智暴露 `video_streamer_set_agent_callbacks()` / `..._agent_send_text()` / `..._agent_send_audio()` |
+| `components/video_streamer/video_streamer.c/.h` | MJPEG 队列、硬件 JPEG 解码、CPU 分块 YUV422→YUV420、H.264 编码；**并持有唯一的 Agent WebSocket**（视频二进制帧、小智文本/Opus 都走它），对小智暴露 `video_streamer_set_agent_callbacks()` / `..._agent_send_text()` / `..._agent_send_audio()`。**视频上传默认关闭（`VIDEO_STATE_IDLE`）**，由服务端 `video` 命令经内部事件队列启停，见第 7A 节 |
 | `components/xiaozhi_audio/xiaozhi_audio.c/.h` | ES8311 采集/播放、Opus 编解码、小智协议（hello/listen/tts/stt/ping/pong）；不自己建连接，全部经 video_streamer 的 Agent WebSocket |
 | `components/xiaozhi_audio/wake_word.c/.h` | AFE 唤醒词检测（Hi-Max 模型，16 kHz 单声道），从 SPIFFS "model" 分区加载，在 `xiaozhi_audio_start()`（主任务上下文）初始化 |
 | `components/ota_client/ota_client.c/.h` | 取 OTA 结果里的 `websocket_url` + 动态 Token，校验必须是 `wss://` 且 Token 非空；串口只打长度不打正文 |
+| `components/board/include/board_pins.h` | **全板 GPIO 宏的唯一来源**，驱动里不许硬编码 GPIO 号；人机交互段按 `BOARD_USE_NEW_PCB` 分板型 |
+| `components/mech_button/mech_button.c/.h` | 机械按键（GPIO22，外部上拉、按下为低）：40 ms 消抖、900 ms 长按、5 ms 轮询任务；对外 `button_init()` / `button_is_pressed()` / `button_register_callback()` |
+| `components/touch_key/touch_key.c/.h` | 两路 TTP223 触摸（GPIO52/51，**当普通数字 GPIO 读**）：单击 / 长按 / 双击；命名 `TOUCH_KEY_1/2` 而非左右 |
+| `components/ambient_led/ambient_led.c/.h` | 两路 WS2812 氛围灯（GPIO20/21，RMT 后端）：STATIC / BREATH / BLINK / FLOW，65 项呼吸 LUT（半余弦 + gamma 2.2），20 ms 渲染任务 |
+| `main/peripheral_test.c/.h` | 档位 9 的自检入口：17 步灯效序列 + 输入事件回调计数 + 开机静默期结论行 |
 | `components/video_streamer/dma2d_yuv.c/.h` | DMA2D 硬件 YUV422→YUV420（**本板 v1.3 不可用**，仅 codec-only 档位以外永不生效） |
 | `partitions.csv` | 分区表：nvs 24K + phy_init 4K + factory 8M + **model 1M（SPIFFS，存放 ESP-SR 唤醒词模型）** + storage 6M |
 | `tools/pc_camera_server.py` | PC 端 H.264 接收、保存、持久 PyAV 解码和 MJPEG 网页预览 |
@@ -87,9 +96,15 @@ src/esp_draw_bit     厂商示例副本，只作参考
 | `tools/gif_resize_for_sd.py` | 把表情 GIF 缩放到屏幕尺寸并写入 TF 卡目录 |
 | `tools/gif2c.py` | 把 GIF 转成 C 数组（**当前产物 `main/gif_assets.c` 已删除**，改走 TF 卡运行时解码） |
 
-当前统一构建目录为 `build`，使用 `sdkconfig.bletest`。该配置已关闭强制 BLE 配网并启用开发板实际使用的 ESP-Hosted SDIO。根目录 `sdkconfig` 仍是历史 SPI/强制 BLE 配置，不要用于当前构建。
+当前统一构建目录为 `build`，使用 `sdkconfig.bletest`。该配置已关闭强制 BLE 配网并启用开发板实际使用的 ESP-Hosted SDIO。同目录下的 `sdkconfig` 是历史游离文件，不要用于当前构建（2026-09-18 已把它的 ESP-Hosted 段也改回 SDIO，但它与 `sdkconfig.bletest` 并非同一份配置，直接拿它构建会丢档位与 BLE 设置）。
+
+**这条不能只靠自觉遵守**（2026-09-18 已因此挂过一次）：`8c3901c` 提交在改步进电机的同时，把 `sdkconfig.bletest` 的 ESP-Hosted 传输从 SDIO 翻成了 SPI，Wi-Fi 整条链路随之失效，而 commit message 对此只字未提。判断方法与修复见第 9 节「ESP-Hosted 必须是 SDIO」。
 
 **2026-09-12 清理**：删除无调用者的 `components/mjpeg_streamer/`（2026-09-10 直通预览的遗留，全树零引用）和未编译进固件的 `main/gif_assets.c/.h`（22k 行生成资源，已被 TF 卡运行时解码取代）。测试档位宏从 `camera_driver.h` + `main.c` 两处 6 个手写布尔宏收敛到 `main/test_profile.h` 一处。
+
+**2026-09-18 新增组件**：`components/mech_button`（按键）、`components/touch_key`（TTP223 触摸）、`components/ambient_led`（WS2812 氛围灯）三个独立驱动组件，以及 `main/peripheral_test.c/.h` 自检入口；全板 GPIO 宏统一收在 `components/board/include/board_pins.h`。详见第 6A 节。
+
+**2026-09-18 新增组件（三通道协议迁移）**：`components/cloud_mqtt`（MQTT 客户端 + MCP 层 `cloud_mcp.c` + 工具注册表）、`components/cloud_udp`（UDP + AES-128-CTR 音频通道）、`components/network/time_service.c`（全工程唯一 SNTP 实例）。`main/Kconfig.projbuild` 新增 `CLOUD_PROTOCOL` choice（V3 默认 / LEGACY_WS 回滚）。**注意：V3 下 OTA 不再返回 `websocket` 段而返回 `mqtt` 六字段，旧 WS 链路完全不建立**；`ota_client` 的 websocket 解析仅在 LEGACY_WS 下生效。详见第 8A 节。
 
 ## 4. 按开发文档阶段审计
 
@@ -101,7 +116,7 @@ src/esp_draw_bit     厂商示例副本，只作参考
 | 阶段 1：基础工程 | 基本完成 | ESP-IDF 工程、串口日志、UI/Camera FreeRTOS 任务、NVS 初始化、PSRAM、16 MB Flash、分区表、ESP32-P4 v1.x 镜像 | NVS 的产品数据结构及读写验证 |
 | 阶段 2：屏幕 | 部分完成 | ST7789 驱动、LVGL 8.4、320×240 动态时间首页、IP 定位、网络校时、天气 API、镜像修正、8 组表情资源保留、源码构建通过 | 真机颜色/方向/API/稳定性验收；LISTEN/THINK/REPLY/SLEEP/FAULT 页面；页面切换接口；电池管理完成后接入电量 |
 | 阶段 3：UI 状态机 | 未开始 | 当前只有静态时间首页 | Event Bus、状态请求、优先级、覆盖、恢复、超时和异常 |
-| 阶段 4：传感器/触摸/LED | 未开始 | 无 | 土壤、光照、温湿度、左右触摸、呼吸灯 |
+| 阶段 4：传感器/触摸/LED | 部分完成 | 按键（GPIO22）、两路 TTP223 触摸（GPIO52/51）、两路 WS2812 氛围灯（GPIO20/21）的驱动层与档位 9 自检入口已实现、构建通过；开发板实测未干扰 UVC 且无幽灵输入事件 | 土壤、光照、温湿度传感器；触摸到左右语义与 App Event Bus 的映射；灯效与业务状态绑定；实物（按键 / TTP223 模块 / 灯带）功能验收 |
 | 阶段 5：音频 | 部分完成 | `components/xiaozhi_audio`：板载 ES8311 I2S 采集与播放、Opus 编解码、16 kHz 单声道 60 ms 分帧、上行/下行实时通路已实机工作；**唤醒词检测已集成**（ESP-SR AFE + Hi-Max 模型，代码已就绪，待实机复测） | AEC、全双工、产品化增益/音量、长时间稳定性 |
 | 阶段 6：Wi-Fi | 部分完成 | P4-C6 ESP-Hosted/SDIO、独立 Network Manager、固定凭据、DHCP 实机成功、2 秒自动重连 | NVS 凭据、BLE 配网、HTTP 通用封装 |
 | 阶段 7：小智 | 部分完成 | 客户端 hello、`listen` 启停、`tts`/`stt` 下行文本、二进制 Opus 下行、`ping`/`pong` 已实现；端到端语音链路实机打通；**唤醒词检测已接入**（ESP-SR AFE，WebSocket 连接后自动启用，检测到唤醒词后停止 MIC 上行并触发聊天，回答结束后恢复监听） | `abort` 与鉴权失败后的清 Token/重 OTA 未接；UI 状态映射、MCP |
@@ -116,7 +131,7 @@ src/esp_draw_bit     厂商示例副本，只作参考
 
 ```text
 [x] 建立 ESP-IDF 工程
-[~] 确认 GPIO 分配：只确认屏幕和高速 USB，整机 GPIO 未冻结
+[~] 确认 GPIO 分配：屏幕、高速 USB、P4-C6 SDIO 和新 PCB 的人机交互三组（按键 22 / 触摸 52、51 / 氛围灯 20、21）已固定；传感器、电机、电源仍未冻结
 [~] ST7789 点亮：驱动与固件已完成，缺少用户对实机显示的确认
 [~] LVGL 8.4.0 跑通：组件、端口及图片对象已编译进固件，缺少屏幕实机确认
 [~] 动画帧播放：8 组素材已保留，当前常驻首页不编译动画资源
@@ -137,24 +152,30 @@ MVP1 六项中，ST7789、LVGL、超过 5 个表情资源和时间首页静态�
 
 屏幕与接线：
 
+屏幕是**外接**的 GMT020-02-8P 小屏（ST7789），不是板载屏，**与 GPIO20 无关**。
+下表与 `src/demo/components/board/include/board_pins.h` 的 `BOARD_LCD_*` 保持一致
+（2026-09-17 提交 a908e83 改线后的结果）。更早那版 SCLK=GPIO20 / MOSI=GPIO32 /
+RST=GPIO3 / DC=GPIO2 / CS=GPIO1 / BL=3V3 已失效，不要再照它接线：
+
 | GMT020-02-8P | ESP32-P4 |
 | --- | --- |
 | GND | GND |
 | VCC | 3V3 |
-| SCL/SCLK | GPIO20 |
-| SDA/MOSI | GPIO32 |
-| RST/RES | GPIO3 |
-| DC | GPIO2 |
-| CS | GPIO1 |
-| BL/BLK | 3V3 |
+| SCL/SCLK | GPIO3 |
+| SDA/MOSI | GPIO2 |
+| RST/RES | GPIO1 |
+| DC | GPIO5 |
+| CS | GPIO4 |
+| BL/BLK | GPIO47（程序控制） |
 
 当前显示参数：
 
 - ST7789 面板原生 240×320，LVGL 逻辑分辨率为横屏 320×240。
 - SPI2，40 MHz，RGB565，颜色反相开启，显存偏移 `(0, 0)`。
-- BL 直接接 3V3，只能常亮，程序无法调光或熄灭背光。
+- 背光 BL 走 GPIO47，`display_driver.c` 初始化时拉高点亮。若实物 BL 仍直接接 3V3，这一步只是空操作。
 - 当前使用 LVGL 控件绘制 320×240 首页，联网前显示占位符，联网成功后更新真实数据。
-- 时间由网络校时维护；IP 定位服务提供城市坐标和时区，Open-Meteo 返回当前温度与 WMO 天气码。
+- 时间由 NTP 网络校时维护；时区默认按中国 UTC+8 成立，定位成功后再按实际时区修正（见下方 2026-09-18 小节）。
+- IP 定位服务（ipwho.is）提供城市坐标，Open-Meteo 返回当前温度与 WMO 天气码；两者都不通时时间照常走，只有天气停在「获取中」。
 - 实机反馈原显示左右镜像，横屏旋转配置已改为 `swap_xy=true, mirror_x=true, mirror_y=false`。
 - 电量区域已按当前阶段要求隐藏，待阶段 11 电池管理具备可靠数据后再加入。
 - 天气每 30 分钟更新一次；定位每 6 小时更新一次；断线时保留最近一次成功结果。
@@ -162,6 +183,41 @@ MVP1 六项中，ST7789、LVGL、超过 5 个表情资源和时间首页静态�
 原动画源文件已删除（2026-09-12）：`main/gif_assets.c/.h` 是 `tools/gif2c.py` 生成的
 22k 行内嵌资源，从未编译进固件，且已被 `screen_carousel` 的 TF 卡运行时解码取代。
 表情素材本身保留在 TF 卡和 `项目文档/` 里，需要重新生成时跑 `tools/gif2c.py`。
+
+### 时钟曾被天气接口“卡死”（2026-09-18 定位并修复）
+
+**现象**：屏幕停在 `--:--` / `--月--日 星期-` / `获取中`，但串口里
+`HOME_INFO: 网络时间同步成功` 明明已经打印。
+
+**根因是数据层的依赖链，不是显示驱动**：`home_info_get_snapshot()` 原来用
+
+```c
+snapshot->time_valid = s_clock_synced && s_timezone_valid;
+```
+
+而 `s_timezone_valid` **只在 IP 定位或天气接口成功时才被置位**。于是 ipwho.is 一旦不通，
+「NTP 已同步」也照样不出时间 —— 校时和时区本来是两件事，被串成了一条链。
+
+**修复**
+
+| 位置 | 改动 |
+| --- | --- |
+| `components/home_info/home_info.c` | 启动时即把时区置为默认 UTC+8（`HOME_INFO_DEFAULT_UTC_OFFSET_SECONDS`）并标记有效：NTP 一成功就出时间；接口返回真实偏移后再覆盖 |
+| 同上 | 定位 / 天气未就绪时的重试由 60 s 缩短为 20 s（`HOME_INFO_FAST_RETRY_SECONDS`），两者都就绪后回到 60 s 常规轮询 |
+| 同上 | `http_get_json()` 增加 `label` 参数，日志可区分是「定位接口」还是「天气接口」失败 |
+| `main/display_driver.c` | 首页时间 / 天气的有效性翻转时各打一行日志，串口可直接判断 UI 有没有拿到新数据 |
+
+**排查这类问题先看新增的两行**
+
+```text
+DISPLAY: 首页时间：等待网络校时，暂显示占位符    ← 说明 time_valid 仍为 false
+DISPLAY: 首页天气：等待天气接口，暂显示「获取中」
+HOME_INFO: 定位接口请求失败：ESP_ERR_HTTP_CONNECT
+```
+
+若定位 / 天气持续报 `ESP_ERR_HTTP_CONNECT` 或连接超时，是该 WiFi 到
+`ipwho.is`、`api.open-meteo.com` 的链路不通（境外 Cloudflare 线路常见），属网络问题而非固件问题；
+**此时时间仍应正常显示**。换网络（如手机热点）可作快速对照。
 
 2026-09-10 接入动态时间、天气 API 和镜像修正后的构建结果：
 
@@ -172,6 +228,113 @@ bootloader.bin：0x5310，Bootloader 分区剩余 13%
 ```
 
 烧录后正常现象应为：屏幕先显示时间和天气占位符；WiFi 联网后串口依次输出“网络时间同步成功”“自动定位成功”和“天气更新”，页面自动替换为当前日期、星期、时间、天气和温度，不显示电量。文字应正常朝向且不再左右镜像。
+
+## 6A. 人机交互外设（按键 / TTP223 触摸 / WS2812 氛围灯）
+
+2026-09-18 新增，属阶段 4 的驱动层。要求是在现有组件化结构下新增三类外设并自带自检，
+不改动已稳定的 UVC / JPEG-H264 / WiFi / ESP-Hosted / BLE 配网 / SD / 音频 / LVGL / 电机。
+
+### 引脚（唯一定义点：`components/board/include/board_pins.h`）
+
+| 外设 | 宏 | 引脚 | 说明 |
+| --- | --- | --- | --- |
+| WS2812 灯带 A | `BOARD_WS2812_A_GPIO` | GPIO20 | 12 颗，RMT |
+| WS2812 灯带 B | `BOARD_WS2812_B_GPIO` | GPIO21 | 12 颗，RMT |
+| 机械按键 | `BOARD_KEY_GPIO` | GPIO22 | 外部上拉，按下为低 |
+| TTP223 触摸 1 | `BOARD_TOUCH_1_GPIO` | GPIO52 | 模块自带上/下拉，输出数字电平 |
+| TTP223 触摸 2 | `BOARD_TOUCH_2_GPIO` | GPIO51 | 同上 |
+
+`BOARD_TOUCH_ACTIVE_LOW`（当前 `0`，即触摸时输出高电平）是 TTP223 极性的唯一开关：
+模块背面 A 焊盘短接后改成 `1` 即可，驱动只认这个宏。灯珠数（`BOARD_WS2812_*_LED_COUNT`）
+同样在 board_pins.h 里改，不动驱动代码（写多了只是多发一段无效数据，无害；写少了末尾灯珠不亮）。
+
+**这些脚只属于将来要打的新 PCB。** 开发板上并没有这三处接线；`board_pins.h` 已按
+`BOARD_USE_NEW_PCB` 拆成两支，开发板支目前是与 PCB 相同的占位值 ——
+**不能拿它当“开发板上这三组外设可用”的证据**。
+
+### 驱动组件
+
+| 组件 | 关键设计 |
+| --- | --- |
+| `mech_button` | 5 ms 轮询 + 40 ms 消抖（连续相同采样才提交状态）；900 ms 长按只报一次；未长按时抬起报单击。对外 API 为 `button_init()` / `button_is_pressed()` / `button_register_callback()`，**不直接驱动 UI 或音频** |
+| `touch_key` | 同上的状态机，另加 350 ms 双击窗口（单击挂起、等窗口过期再补发，避免把双击误报成两次单击）。命名为 `TOUCH_KEY_1/2`，**不假设左右** —— GPIO52/51 与左右的对应关系未定，映射到 `APP_EVT_TOUCH_LEFT/RIGHT` 属于后续工作 |
+| `ambient_led` | `espressif/led_strip` 3.0.3 的 RMT 后端（**不是 bit-bang**），两路独立控制；呼吸用 65 项查表（半余弦 + gamma 2.2）线性插值，避免线性变化看起来“不平滑”；20 ms 渲染任务，效果代码内不出现阻塞延时 |
+
+`ambient_led` API：`ambient_led_init()` / `set_rgb_a()` / `set_rgb_b()` / `set_rgb(id, …)` /
+`set_brightness()` / `set_effect()` / `all_off()` / `count()`。
+
+**RMT 显式 `with_dma = false`**：本机内部 DMA 池只有 146 KiB 且已被视频/语音挤到碎片化
+（见第 10 节第 1 条与附录 A.9），WS2812 刷新率极低，绝不能让它再去抢 DMA。
+
+### 档位 9 与自检入口
+
+`main/test_profile.h` 新增 `CAMERA_TEST_PERIPH_ONLY 9`（`TP_BITS = TP_UVC | TP_PERIPH`）：
+保留 UVC 取流，关闭 WiFi / WebSocket / UI / SD / 音频 / 天气，用于隔离地跑外设自检。
+`main/main.c` 在 `#if TP_HAS(PERIPH)` 处调用 `peripheral_test_start()`。
+
+`peripheral_test.c` 做两件事：
+
+1. 17 步灯效序列循环打印（A 红/绿/蓝 → B 红/绿/蓝 → A+B 白/红 → 亮度 50%/12% →
+   呼吸 → 流水 → 闪烁 → 全灭），按日志即可核对时序；
+2. **开机静默期自检**：注册输入回调累加事件计数，3000 ms 后打印
+   “各输入源事件计数 + 当前电平态 + 结论”。窗口长度 3000 ms **必须大于长按阈值 900 ms**，
+   否则会把幽灵事件漏在窗口外 —— 这正是前两次人工看日志失败的原因（串口输出都被截断在判定点之前）。
+
+**档位 0（完整系统）刻意不含 `TP_PERIPH`**，避免在 DMA 池紧张时再加三个任务与两个 RMT 通道。
+`CAMERA_TEST_PROFILE` 当前设为 9 用于自检；要回到完整系统，改回 `CAMERA_TEST_FULL`。
+
+### 开发板实测结论（2026-09-18，档位 9）
+
+已验证：
+
+- 三组驱动全部初始化成功；两路 `led_strip_new_rmt_device` 成功，长时间运行**没有出现
+  “刷新灯带失败”告警**（驱动对 `led_strip_refresh()` 失败有一次性告警）—— RMT 通道、
+  编码器、数据输出全程正常；
+- 17 步序列一个循环实测 1259 ms → 41266 ms = 40007 ms，与设计 40000 ms 差 7 ms（0.018%）；
+- **UVC 无回归**：complete 29.8～30.2 FPS、drop 0.0%、handoff rejected 0。新增的三个轮询
+  任务挂在 CPU0，没有干扰 USB 摄像头通路；
+- 开机静默期自检：按键 / touch1 / touch2 事件计数均为 0，结论“通过（无幽灵事件）”。
+
+**未验证**：灯是否真的亮、颜色与灯珠方向是否正确、按键与 TTP223 的真实响应 ——
+这些都需要实物。
+
+### 开发板上已确认的硬件事实（写下来免得重复排查）
+
+| 脚 | 状态 | 含义 |
+| --- | --- | --- |
+| GPIO22 | 接 **RST 复位键** | 按下直接复位芯片，**不能**当普通按键输入验证；驱动只做输入 + 上拉，不会误触发 |
+| GPIO52 | 上电读高 | 驱动内部下拉已使能（`BOARD_TOUCH_ACTIVE_LOW=0`）却仍读到高 → **板上某外部源强于内部下拉把它拉高**。厂商资料包全树搜 51/52 零命中，需查原理图或断电量对 3V3/GND 电阻 |
+| GPIO51 | 上电读低（空闲） | 开发板上**唯一**能做真实输入链路验证的脚 |
+
+**唯一可做的无器件实测**：杜邦线把 **GPIO51 短到 3V3**，应打出 `TOUCH: touch2 pressed`，
+松开发 `released` + `click`，按住 900 ms 发 `long press`。这能真实走完
+“电平→去抖→事件→回调”整条链路，只是验证的仍是 PCB 版驱动的代码路径。
+
+### 一个已修掉的驱动缺陷：幽灵长按
+
+早期日志里出现过**只有 `long press`、没有前置 `pressed`** 的事件。根因是轮询式输入的
+计时基准：`press_started_us` 留静态 0（= `esp_timer_get_time()` 的开机原点），而
+`stable_pressed` 在 init 时被直接置为上电读数，于是一个上电就处于激活态的脚在第一次采样时
+立刻满足“已按住 900 ms”。
+
+修法不是把 0 换成一个当前时刻（那只是把幽灵推迟一个阈值），而是新增
+**“上电即激活 ⇒ 该段按住整段作废”** 的语义（`boot_hold`）：既不补发 `pressed`，
+抬起时也不发 `released`，否则会冒出“没有 pressed 的 released”同样带乱下游状态机。
+另外两个驱动的 init 都会打印**上电初值电平**并翻译成“按下/松开”“触摸态/空闲”，
+这是没有实物时唯一能判断接线的手段。
+
+### 与 GPIO20 的关系（旧文档矛盾已结案）
+
+`PROJECT_HANDOFF.md` §6 与 `src/demo/README.md` 的**旧版**接线表曾写屏幕 SCLK=GPIO20，
+与 `board_pins.h` 的 `BOARD_LCD_SCLK=GPIO3` 矛盾。真相是屏幕为**外接** ST7789
+（GMT020-02-8P），接在 1~6/47 上、**与 GPIO20 无关**；两份文档已按代码更正。
+→ **WS2812_A 用 GPIO20 不存在冲突。**
+
+### 尚未做（本阶段刻意不碰）
+
+- 把按键 / 触摸事件接入 App Event Bus（`APP_EVT_TOUCH_LEFT/RIGHT/RIGHT_DOUBLE` 等）；
+- 把 WS2812 绑定到业务状态（HOME 慢呼吸 / LISTEN 蓝呼吸 / THINK / REPLY / SLEEP …）；
+- 确定触摸 GPIO52/51 与“左/右”的对应关系。
 
 ## 7. 摄像头当前验证结论
 
@@ -345,6 +508,92 @@ codec-only 档位（`CAMERA_TEST_UVC_H264_ONLY`）里摄像头是第一个来抢
 如果是回调延迟导致丢帧，`callback_gap_max` 应该在丢帧时同步升高，而实测丢帧 23.8% 与 2.1%
 两种状态下它都是 9 ms。缩容有效的原因目前**未有解释**，不要再拿它当结论用。
 
+## 7A. 视频上传：按需开启（2026-09-18）
+
+**改造前为什么会自动上传**：不是某处显式调用，而是两个**编译期默认值**叠加的结果 ——
+
+| 位置 | 改前 | 改后 |
+| --- | --- | --- |
+| `components/video_streamer/video_streamer.c` | `static bool s_stream_enabled = true;`（上电门控就是开的） | `= false;`（默认 IDLE） |
+| `main/camera_driver.c`（原 889 行） | `video_streamer_set_enabled(CAMERA_VIDEO_STREAM_ENABLED != 0)` —— 摄像头初始化完成即强制开 | **删除**该自动调用，改为只打一行"关闭，等待服务端 VIDEO_START" |
+| `main/test_profile.h` | `CAMERA_VIDEO_STREAM_ENABLED 1` | 改名 `CAMERA_VIDEO_STREAM_AUTOSTART 0`，降级为纯调试开关 |
+
+**新链路**
+
+```text
+开机 → video_streamer_init()（只建队列/任务/缓冲，state = IDLE）
+     → WiFi → WebSocket → Hello → 小智音频      全部正常，但不上传视频
+     → 服务端 VIDEO_START → 事件 → 控制任务 → start() → STREAMING
+     → 服务端 VIDEO_STOP  → 事件 → 控制任务 → stop()  → IDLE
+```
+
+`video_streamer_init()` 只创建必要的状态/锁/队列/PSRAM 缓冲，**不等于开启上传**；开启只能走 `video_streamer_start()`，而它只由服务端命令（或调试开关）触发。
+
+> **前置条件：Agent WebSocket 必须真的建起来。** `VIDEO_START` 只能从这条 WS 进来，而 WS
+> 地址与 Token 来自 OTA 响应的 `websocket.url` / `websocket.token`。OTA 一失败就没有控制
+> 通道，"按需开启"也就永远等不到命令 —— 2026-09-18 档位 0 的日志正是这种状态（同时
+> `XIAOZHI_AUDIO: MIC packets=0`，因为小智音频也挂在这条 WS 上）。见 §8 末尾的 OTA 地址回归。
+
+**状态机与 API**（`components/video_streamer/video_streamer.h`）
+
+| 项 | 说明 |
+| --- | --- |
+| `video_state_t` | `VIDEO_STATE_IDLE / STARTING / STREAMING / STOPPING`，默认 `IDLE` |
+| `video_streamer_start()` / `stop()` | 幂等执行体：已 `STREAMING` 再 start、已 `IDLE` 再 stop 都直接返回，不重复建任务或队列 |
+| `video_streamer_is_active()` / `get_state()` / `state_name()` | 只读查询 |
+| `video_streamer_request_start()` / `request_stop()` | **非阻塞投递**，专供 WebSocket / MCP 接收回调使用 |
+| `video_streamer_set_enabled()` | 兼容旧调用，等价于 `start()` / `stop()` |
+
+**事件解耦**：WebSocket 接收回调只解析 JSON 并把命令丢进 `s_ctrl_queue`（深度 4），由 `video_ctrl` 任务（核 0、优先级 5、栈 3072）串行执行启停；回调里不做任何清理动作，因此**不会阻塞 WS 接收任务**。`start()/stop()` 另有互斥锁包住「读状态 → 清队列 → 改状态」整段，保证并发下幂等仍成立。
+
+**服务端协议**（两条都支持；字段最终以服务端实际定义为准）
+
+```json
+{"type": "video", "state": "start"}      // 云端写法，新增支持
+{"type": "video", "state": "stop"}
+{"type": "video_on"} / {"type": "video_off"}   // 旧 PC 调试命令，保留
+```
+
+识别成功即回 `{"type":"video_state","ok":true,"video_enabled":true|false}`（回的是**目标**状态，不是当前状态；实际动作在控制任务里完成）。
+
+**停止时的清理顺序（不可颠倒）**
+1. 门控置 0 —— 此后 `video_streamer_submit_jpeg_owned()` 直接拒收，摄像头新帧不再进入流水线；
+2. 清空 MJPEG 输入队列（未解码帧，连同 `release_cb` 一起归还摄像头池）；
+3. 清空 H.264 输出队列（已编码、尚未发送的帧）；
+4. 置 `IDLE`。
+
+**重新开启从新帧开始**：`start()` 会置 `s_force_idr`，编解码任务在下一帧编码前调用 `esp_h264_enc_force_idr()`。否则停止期间编码器参考帧已失效，恢复后继续发 P 帧，PC 端会花屏到下一个 GOP 边界（GOP=30，最长 1 秒）。
+
+**WebSocket 断线**：`DISCONNECTED` / `CLOSED` 时若状态不是 `IDLE`，投递一次 STOP，日志 `VIDEO_CTRL: WebSocket disconnected -> VIDEO_STOP (no auto resume)`。**重连不自动恢复**，必须等服务端重新下发 `VIDEO_START`。
+
+**VIDEO_STOP 不停 UVC**：只关「编码 + 上传」。UVC 采集与 WebSocket 控制通道都保持运行，摄像头仍可供拍照 / AI 识别等后续业务使用；停 UVC 会牵动 USB 重新枚举，代价大于收益，故不做。
+
+**预期日志**
+
+```text
+VIDEO_CTRL: initial state = IDLE
+VIDEO_STREAM: video upload disabled, waiting for remote command
+CAMERA: 视频编码与上传：关闭，等待服务端 VIDEO_START（UVC 采集保持运行）
+VIDEO_STREAM: WebSocket 已连接：wss://...
+VIDEO_CTRL: WS connected, video state = IDLE (keep IDLE unless server sends VIDEO_START)
+——— 收到开启 ———
+VIDEO_CTRL: VIDEO_START received
+VIDEO_CTRL: IDLE -> STARTING
+VIDEO_STREAM: 视频上传流已开启
+VIDEO_STREAM: H264 pipeline started
+VIDEO_CTRL: STARTING -> STREAMING
+——— 收到停止 ———
+VIDEO_CTRL: VIDEO_STOP received
+VIDEO_CTRL: STREAMING -> STOPPING
+VIDEO_STREAM: 视频上传流已关闭
+VIDEO_STREAM: queues flushed
+VIDEO_CTRL: STOPPING -> IDLE
+```
+
+**调试开关**：`main/test_profile.h` 的 `CAMERA_VIDEO_STREAM_AUTOSTART` 设 1，会在摄像头初始化后直接 `start()`，用于手边没有服务端时单独看画面。**生产与正常联调必须保持 0。**
+
+**注意**：App Event Bus 目前**并不存在**（只在 `mech_button.h` / `touch_key.h` 的注释里被列为将来计划），所以视频控制用的是组件内部的专用事件队列，没有引入 `APP_EVT_VIDEO_STREAM_START/STOP`。
+
 ## 8. WiFi 当前实现
 
 当前链路目标为：
@@ -372,11 +621,222 @@ ESP-Hosted 参数来自同型号开发板厂商示例，最终生成的 `sdkconf
 
 2026-09-14 真机验证已覆盖 BLE 扫描、Security 2 会话、凭据下发、C6 连接、DHCP 成功、配网服务关闭和正常业务启动；重新烧录正常配置后，也验证了“已有凭据直接联网”的启动路径。日志同时提示 Host 2.7.0 高于 C6 协处理器 2.3.0；当前 BLE/WiFi 与 UVC 并行运行正常，后续仍应升级 C6 从机固件并做完整回归。
 
-若在 STA 连接日志之前发生 Hosted/SDIO 握手失败，应确认板载 C6 从机固件。厂商提供的参考文件为：
+若在 STA 连接日志之前发生 Hosted/SDIO 握手失败：**先按第 9 节「ESP-Hosted 必须是 SDIO」确认传输没被改成 SPI**，再确认板载 C6 从机固件。厂商提供的参考文件为：
 
 ```text
 E:\Lummiss_Plant_Robot\开发板示例\JC1060P470C_I_W_Y\8-Burn operation\Burn files\JC-C6-slave_v2.3.2.bin
 ```
+
+### OTA 地址必须是项目自己的服务端（2026-09-18 回归）
+
+`components/ota_client/ota_client.c` 的 `OTA_URL` 曾在小智官方地址
+`https://api.tenclass.net/xiaozhi/ota/` 上（工作区里的未提交改动；HEAD 版本是
+`https://www.lummiss.com/lummiss/ota/`）。官方地址对这台设备只返回 `server_time` 和
+`firmware`，**没有 `websocket` 段**，于是出现：
+
+```text
+E OTA: OTA 响应中缺少 websocket.url
+E VIDEO_STREAM: 缺少 OTA WSS 地址、Token 或设备身份，视频不建立 WebSocket
+```
+
+后果是 Agent WebSocket 压根不建立 —— 小智音频一直 `MIC packets=0`，服务端的
+`VIDEO_START` 也无从下发（见 §7A 的前置条件）。2026-09-18 已还原为项目自己的地址。
+
+判断只看这一行，`websocket` 必须是「存在」：
+
+```text
+OTA: OTA 响应结构：server_time=存在 firmware=存在 websocket=存在 activation=缺少 error=缺少
+```
+
+### 临时切到小智官方服务器：编译开关 `XIAOZHI_USE_OFFICIAL_SERVER`（2026-09-18 新增）
+
+公司 Lummiss 后端维修期间，需要借官方服务器验证「小智回复的情绪 → 屏幕表情」
+这条链路。为此加了编译开关，**原有 Lummiss 代码一行没删**，两套逻辑靠宏隔离。
+
+开关定义在 `src/demo/main/Kconfig.projbuild`（默认 `n`）：
+
+```text
+menu "小智官方服务器测试模式"
+    config XIAOZHI_USE_OFFICIAL_SERVER    bool, default n
+endmenu
+```
+
+打开后各处行为：
+
+| 位置 | 变化 |
+| --- | --- |
+| `components/ota_client/ota_client.c` | `OTA_URL` → `https://api.tenclass.net/xiaozhi/ota/` |
+| `components/video_streamer/video_streamer.c` | 握手补 `Protocol-Version: 1`；Hello 换成官方 v1 格式（`audio_params`，去掉 `capability_manifest`）；`video_streamer_start()` 直接拒绝启动，发送侧另有编译期拦截 —— **官方 WS 的二进制帧只装 Opus，混发 H.264 会让服务端按音频解码** |
+| `components/xiaozhi_audio/xiaozhi_audio.c` | `type=="llm"` 时打 `XIAOZHI: LLM emotion=… text=…`；缺 `emotion` 字段回退 `neutral` |
+| `main/expression_manager.c` | 按官方词表查表，打 `EXPRESSION: emotion happy -> EXP_HAPPY` |
+
+**WebSocket 地址仍然只从 OTA 响应的 `websocket.url` / `websocket.token` 读**，
+代码里没有硬编码 WS 地址。音频上行不受开关影响（`video_streamer` 里音频入队只
+看 `s_ws_connected`，不看视频门控），所以关掉视频不影响说话。
+
+#### ⚠️ 只换 OTA 地址拿不到 Token，必须先激活
+
+官方服务器对**未激活**设备只回 `server_time` / `firmware` / `activation`，
+**没有 `websocket` 段** —— 这正是本节开头记的那次回归。打开开关后若看到：
+
+```text
+W OTA: 设备未激活。激活码：XXXXXX，提示：…
+E OTA: 官方服务器未下发 websocket.url（设备未激活）
+E VIDEO_STREAM: 缺少 OTA WSS 地址、Token 或设备身份，视频不建立 WebSocket
+```
+
+这不是代码问题，是设备还没绑定：去官方控制台用激活码把设备加上，再重启复检。
+
+为此把 `ota_client.c` 里 activation 段的解析**提到了 websocket 校验之前**：原来
+「缺 websocket.url 就 return」会把激活码这条最关键的信息吞掉，只剩一句没有指向性
+的错误。
+
+若响应里连 `activation` 段都没有，说明官方侧不认这台设备。官方激活还带
+`challenge` + HMAC-SHA256（密钥取 eFuse `USER_DATA` 里的序列号，见参考实现
+`xiaozhi-esp32-main/main/ota.cc` 的 `Ota::Activate()`），本工程**没有实现**
+`/ota/activate` 这一步；需要的话再补。
+
+#### 表情素材对应关系（2026-09-18 逐帧比对确认）
+
+`src/demo/tools/gif/exp_0N.bin` 与源图 `项目文档/GIF/*.gif` 的对应关系。注意
+exp_01/03/04/06/07 五张**帧数、帧延时、首帧全都一样**，按文件属性区分不开，
+只能解出全帧平均画面来比：
+
+| 素材 | 画面 | 帧数 | 映射到的官方 emotion |
+| --- | --- | --- | --- |
+| `exp_01.bin` | 乐（张嘴大笑） | 12 | `laughing` / `funny` / `silly` |
+| `exp_02.bin` | 哀（垂眼撇嘴） | 22 | `sad` / `crying` |
+| `exp_03.bin` | 喜（眯眼吐舌） | 12 | `happy` / `loving` / `delicious` |
+| `exp_04.bin` | 怒（斜眉瞪眼） | 12 | `angry` |
+| `exp_05.bin` | 思考（眼珠游移） | 8 | `thinking` |
+| `exp_06.bin` | 惊讶（圆眼小嘴） | 12 | `surprised` / `shocked` |
+| `exp_07.bin` | 疑惑（斜视撇嘴） | 12 | `confused` / `embarrassed` |
+| `exp_08.bin` | 眨眼（中性） | 14 | `neutral` 及所有未识别词的兜底 |
+
+映射表在 `expression_manager.c` 的 `k_emotions[]`，**词表外的取值统一回退
+`neutral`（exp_08）**。切屏仍然发生在 LVGL 定时器里，WebSocket 回调只往队列投词，
+不碰 LVGL。
+
+### 两个踩过的构建坑（2026-09-18）
+
+1. **`main/Kconfig.projbuild` 新加后会「看不见」。** ESP-IDF 在 CMake configure
+   阶段用 `file(GLOB)` 收集各组件的 Kconfig，新建文件后不重跑 configure 就不会被
+   收进去，`sdkconfig` 里也不会出现这一项。新增/改名 Kconfig 后必须：
+
+   ```powershell
+   idf.py -B build reconfigure
+   ```
+
+   验证办法：看 `build/kconfigs_projbuild.in` 里有没有你的文件。
+
+2. **本工程实际生效的配置文件是 `sdkconfig.bletest`，不是 `sdkconfig`。**
+   `SDKCONFIG` 缓存在 `build/CMakeCache.txt` 里：
+
+   ```text
+   SDKCONFIG:UNINITIALIZED=e:\Lummiss_Plant_Robot\src\demo/sdkconfig.bletest
+   ```
+
+   改 `sdkconfig` 完全不生效（`sdkconfig` 也在 `.gitignore` 里）。判断标准是构建
+   开头那行：
+
+   ```text
+   -- Project sdkconfig file E:/Lummiss_Plant_Robot/src/demo/sdkconfig.bletest
+   ```
+
+   所以开关要写进 `sdkconfig.bletest`；注意这个文件是**被 git 跟踪**的。
+
+## 8A. 云端通信迁移：三通道协议（MQTT 控制 + UDP Opus + WebRTC）
+
+> 2026-09-18 起实施。权威文档：《ESP32-嵌入式三通道接入实施文档》v1.0（后端下发，
+> 微信文件 `ESP32-嵌入式三通道接入实施文档.md`），以及参考工程
+> `xiaozhi-esp32-main/docs/mqtt-udp.md` + 上游 `78/xiaozhi-esp32`
+> `main/protocols/mqtt_protocol.cc`（协议实现逐行对照的依据）。
+
+### 8A.1 架构与状态
+
+后端已从「OTA + 单条 Agent WebSocket（JSON/MCP/Opus/H.264 混跑）」迁到三通道：
+
+| 通道 | 承载 | 实机状态 |
+| --- | --- | --- |
+| HTTPS OTA | 配置、MQTT 六字段、固件 | ✅ 验证通过 |
+| MQTT/TCP 1883 | AI hello、MCP、控制、状态、RTC 信令（**不传音视频帧**） | ✅ 验证通过 |
+| UDP 8884 + AES-128-CTR | AI 对话 Opus 双向 | ✅ 验证通过（喇叭出声） |
+| WebRTC/DTLS-SRTP | H.264 视频 | ❌ 阶段四未实现 |
+
+固件协议选择：`main/Kconfig.projbuild` 的 `choice CLOUD_PROTOCOL` ——
+`CONFIG_CLOUD_PROTOCOL_V3`（默认）/ `CONFIG_CLOUD_PROTOCOL_LEGACY_WS`（仅回滚）。
+V3 下**旧 Agent WebSocket 完全不建立**（不注入 WS 地址，video_streamer 按设计保持 IDLE）；
+LEGACY_WS 保留旧协议代码仅作回滚，两套不允许同时运行。
+
+启动状态机（日志按此顺序打印 `STATE -> …`）：
+`BOOT → NTP_TIME_READY → OTA_CONFIGURED → MQTT_CONNECTED → MQTT_SUBSCRIBED →
+AI_HELLO_SENT → AI_SESSION_READY → IDLE`。
+
+**2026-09-18 实机验收已通过**：双向音频 `tx=258(错0) rx=213(错0)`、`SPK frames=213`；
+多轮连续对话（唤醒 → STT → LLM → TTS → 自动恢复监听）；MCP 握手 + tools/list +
+tools/call（音量控制实测可用）；LVGL 不再因内存不足重启。
+
+### 8A.2 组件与文件
+
+| 文件 | 职责 |
+| --- | --- |
+| `components/cloud_mqtt/` | MQTT 客户端（封装 esp-mqtt，收 4 KiB/发 1 KiB 缓冲，keepalive 120 s）；MCP 层 `cloud_mcp.c`（队列 + mcp_task，工具注册表） |
+| `components/cloud_udp/` | UDP 音频通道：16 字节头 + AES-128-CTR 加解密、收发任务（栈 8192，PSRAM）、下行回调注入 xiaozhi_audio |
+| `components/network/time_service.c/.h` | **全工程唯一 SNTP 实例**，粘性事件位广播同步状态 |
+| `main/Kconfig.projbuild` | `CLOUD_PROTOCOL` choice + 小智官方测试开关 |
+| `main/main.c` | 注册 MCP 工具（音量等）、NTP 前移到 OTA 之前 |
+
+### 8A.3 协议关键事实（踩坑记录，改代码前先读）
+
+1. **UDP 包头 = 服务端下发的 16 字节 nonce 作模板**，设备只覆写 2-3（payload_len）、
+   8-11（timestamp）、12-15（sequence）三个字段；nonce 的 0-1 即 type/flags、
+   **4-7 即 ssrc(connection_id)**——文档说"由网关分配"，实际上它就藏在 nonce 里，
+   设备原样回显，**不自行编造**。手搓包头写 `connection_id=0` 会导致
+   「上行正常（STT 能识别）但下行零包」——2026-09-18 实机定位并以 nonce 模板修复。
+2. **首包序列号必须为 1**（上游 `++local_sequence_`）；服务端接收侧拒绝
+   `sequence <= 期望值`（初值 0）的包，首包发 0 会被当重放丢弃。
+3. AES-128-CTR 的 **IV 就是本包 16 字节头本身**（加密与解密同一构造），
+   不是 nonce 原文；key 由 32 个 hex 字符解码为 16 字节。每次重新 hello 换新 key。
+4. **MQTT 回调只做解析与入队**（文档 §6.2 禁止回调里控电机/发 HTTP/建 PeerConnection）：
+   MCP 消息由 `cloud_mcp_submit()` 拷入队列，工具在 `cloud_mcp_task`（PSRAM 栈）执行。
+5. **SNTP 全工程只能初始化一次**：`esp_netif_sntp_sync_wait()` 内部是二值信号量，
+   只能被消费一次，第二个调用方必超时——统一走 `time_service_*`（粘性事件位），
+   home_info 只等不初始化。
+6. **内部 RAM 纪律**：esp-mqtt 收发**各**一份缓冲（曾 16 KiB×2 把 LVGL 显示缓冲
+   挤到分配失败 abort）。当前收 4096/发 1024；**阶段四 WebRTC 前必须把收缓冲调回
+   ≥16 KiB**（SDP 最大 64 KiB，文档 §2.3）。mcp/udp 任务栈在 PSRAM（WithCaps），
+   **WithCaps 建的任务必须 `vTaskDeleteWithCaps` 删除**。
+7. `cloud_udp_rx` 任务栈 8192（PSRAM）：4096 在第一个下行音频包上栈保护越界
+   （本地缓冲 ~1 KB + mbedtls + 回调链），已加大，**别再改小**。
+8. 工具采用注册表（`cloud_mcp_register_tool`）：`tools/list` 与 `tools/call`
+   都按注册表生成；**注册必须早于 `cloud_mqtt_start()`**（服务端握手后立刻拉
+   tools/list）。未注册的名字回 -32602，不假装受理。
+
+### 8A.3A MCP 工具清单（tools/list 实际内容）
+
+| 工具 | 来源 | 说明 |
+| --- | --- | --- |
+| `self.get_device_status` | 官方 AddCommonTools | 返回 `{"audio_speaker":{"volume":N}}`；本设备无电池/背光可调，官方其余字段省略不编造；官方约定 LLM 调控制类工具前先查这里 |
+| `self.audio_speaker.set_volume` | 官方 AddCommonTools | volume 0-100 → `xiaozhi_audio_set_volume()`；codec 未就绪时如实回 `NOT_AVAILABLE` |
+| `motion.stop` / `motion.get_state` | Lummiss 自定义 | 开发板无 DRV8833，get_state **无绝对角度**（无编码器/限位），tools/list 描述里已写明 |
+| `light.pulse` | Lummiss 自定义 | 档位 0 未初始化氛围灯时如实回 `NOT_AVAILABLE` |
+
+未实现的能力（`media.webrtc.*`、`self.camera.take_photo`、`motion.rotate_to`）
+**不注册** —— tools/list 只公布真实可调用的工具。新工具用
+`cloud_mcp_register_tool()` 注册（处理函数放能力所属组件，勿硬编码进 cloud_mcp）。
+
+### 8A.4 遗留 / 待办
+
+1. **WebRTC（阶段四）**：H264 → WebRTC Track（Constrained Baseline、1280×720、
+   20 fps、IDR ≤2 s）、RTC 信令 `rtc_signal`/`rtc_signal_ack`/`rtc_event`（1 秒 ACK
+   超时、重发 2 次、`message_id` 幂等）、10 s HEARTBEAT、凭据走 HTTPS + 一次性
+   `deviceTicket`（90 s）。视频启动来源改为 MQTT 的 `media.webrtc.start`（2 秒内回
+   `accepted=true`，耗时初始化放独立任务）；视频默认 IDLE 的原则不变。
+2. **阶段四前置**：把 MQTT 收缓冲调回 ≥16 KiB；向后端确认 ssrc/connection_id
+   的分配与校验规则（本固件已按 nonce 模板回显）。
+3. **表情素材仍未拷入 SD 卡**：`/sdcard/expressions/exp_01..08.bin`
+   （源文件在 `src/demo/tools/gif/`）。emotion 触发已验证，只差素材文件。
+4. 旧协议回滚：Kconfig 选 `LEGACY_WS` 重建即可；相关代码全部保留未删。
 
 ## 9. 构建方法
 
@@ -388,9 +848,134 @@ idf.py -B build -p COM17 flash monitor
 
 `_build_main.bat` 可在普通终端激活本机 ESP-IDF 5.5.5 并完成联合构建。由于本机安装器把 Python 约束文件放在特殊位置，脚本设置了 `IDF_PYTHON_CHECK_CONSTRAINTS=no`；实际 Python 依赖检查仍在激活阶段显示为 OK。
 
+**注意：`_build_main.bat` 只做 `build`，不含烧录**（内部是 `idf.py -B build -DSDKCONFIG=sdkconfig.bletest build`）。只跑它不会更新芯片里的固件，必须另有一步 flash。
+
+### ESP-Hosted 必须是 SDIO（2026-09-18 故障复查）
+
+`sdkconfig.bletest` 里这几项必须是下表的值。只要传输被翻成 SPI，P4 就会去 GPIO6~12 上打 SPI —— **那六个脚正是板载 ES8311 音频的 I2C/I2S 引脚（7/8 I2C、9 DOUT、10 WS、11 PA_EN、12 BCLK）** —— 对 C6 既不复位也不通信。
+
+| 项 | 必须值 |
+| --- | --- |
+| 传输 | `CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE=y`，且 `# CONFIG_ESP_HOSTED_SPI_HOST_INTERFACE is not set` |
+| 从机目标 | `CONFIG_ESP_HOSTED_IDF_SLAVE_TARGET="esp32c6"`（`"invalid"` 同样是坏的） |
+| 引脚 | CLK=18 / CMD=19 / D0=14 / D1=15 / D2=16 / D3=17 / RESET=54 |
+| 总线与复位 | `SDIO_SLOT_1` + `SDIO_4_BIT_BUS` + `SDIO_CLOCK_FREQ_KHZ=40000`，`ESP_HOSTED_GPIO_SLAVE_RESET_SLAVE=54` |
+
+**症状识别**：串口出现 `spi: Resetting slave on SPI bus with pin 12`，随后每约 10.3 s 重试一次、共三次，最后报：
+
+```text
+W (22974) transport: Failed to get ESP_Hosted slave transport up
+func: esp_hosted_reconfigure   expression: transport_drv_reconfigure()
+E (22994) WIFI_MANAGER: wifi_manager_init(141): 初始化 esp_wifi_remote 失败
+```
+
+正常时这里应当出现 SDIO 初始化与 C6 建链日志。修复即把上表几项改回正确值后重建；厂商包 `开发板示例/JC1060P470C_I_W_Y/1-Demo/Demo_IDF/ESP-IDF_5.5.3/xiaozhi-esp32-main/sdkconfig.old` 保留了这块板正确的 SDIO 段，可直接对照。
+
+**自己动手改的步骤（2026-09-18 补）**
+
+1. 先认清是哪份文件被改了。工程里同时存在三份名字相近的配置，只有第一份参与构建：
+
+| 文件 | 角色 |
+| --- | --- |
+| `src/demo/sdkconfig.bletest` | **构建实际读取的**，要改就改它 |
+| `src/demo/sdkconfig.defaults` | 首次生成配置的种子，其第 101–121 行就是正确的 SDIO 段，可当标准答案照抄 |
+| `src/demo/sdkconfig` | 历史游离文件，只在构建命令没带 `-DSDKCONFIG` 时才被读到 |
+
+2. 定位。VS Code 打开 `sdkconfig.bletest`，Ctrl+F 搜 `HOST_INTERFACE`；或命令行：
+
+```bat
+cd /d E:\Lummiss_Plant_Robot\src\demo
+findstr /N "HOST_INTERFACE SLAVE_RESET_SLAVE PIN_CLK" sdkconfig.bletest
+```
+
+3. 改，而且要改三处，**只改第一处不算改完**：主段（约 2883 行）、从机复位脚（约 2946 行）、文件尾部那段"改名别名镜像"（约 3620 行）。最后一段最容易被漏，它同时带着 `CONFIG_ESP_SPI_HOST_INTERFACE` 和 `CONFIG_ESP_GPIO_SLAVE_RESET_SLAVE=12`，两处都会独立生效。
+
+4. 自检。输出里只允许出现 SDIO：
+
+```bat
+findstr /C:"HOST_INTERFACE=y" sdkconfig.bletest
+```
+
+正确结果是恰好两行 `CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE=y` 与 `CONFIG_ESP_SDIO_HOST_INTERFACE=y`；出现任何 `SPI` 都说明没改干净。
+
+5. 重编，然后单独烧录（`_build_main.bat` 不含 flash）。不必 `fullclean`。
+
+**更省事的改法**：别手改文本，用 menuconfig：
+
+```bat
+cd /d E:\Lummiss_Plant_Robot\src\demo
+idf.py -B build -DSDKCONFIG=sdkconfig.bletest menuconfig
+```
+
+路径是 `Component config → ESP-Hosted → Host interface`，选 SDIO，再进 SDIO 段确认 Slot 1 / 4-bit / 40 MHz / CLK18 CMD19 D0-D3 14-17 / RESET 54。**这条命令必须带 `-DSDKCONFIG=sdkconfig.bletest`**：漏掉它，menuconfig 打开并写回的就是另一份 `sdkconfig`，界面里看着改对了，实际构建配置没动，下次照样挂。
+
+
+**这条复发路径已经修复**：`_build_main.bat` 已固定传入 `-DSDKCONFIG=sdkconfig.bletest`，因此删除 `build/` 后也不会静默切换到历史 `sdkconfig`。工程入口同时固定 `ESP_IDF_VERSION=5.5`，确保 `esp_wifi_remote` 加载 ESP-IDF 5.5 的 C6 从机选择配置；否则 Kconfig 会把 SDIO 选择回退成 SPI。
+
+**2026-09-19 SDIO 构建复核**：重新配置后 `build/config/sdkconfig.h` 已确认只启用 `CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE`，从机为 `esp32c6`，SDIO Slot 1、4-bit、40 MHz、CLK/CMD=18/19、D0-D3=14/15/16/17、RESET=54。完整 Ninja 构建已通过并生成 `build/lummiss_main.bin`；构建期间仅有 ESP-ROM GDB 初始化目录未设置的非致命警告。
+
+**还有一条更容易被忽略的复发路径**：`sdkconfig.bletest` 受 git 跟踪，而 `8c3901c` 这个坏提交至今仍是 HEAD。修复若只停在工作区、不提交，一旦 `git reset`、换机器或队友 clone，SPI 配置就会原样回来。修好后应尽快提交。
+
+**2026-09-19 二次复发（含最小修复清单）**：本次只翻了主段（约 2912 行起），尾部镜像段（约 3648 行起）未被动过。最小修复就是三处，行号每次会漂，以 `findstr` 定位为准：
+
+1. **传输选择**：
+   - `CONFIG_ESP_HOSTED_SPI_HOST_INTERFACE=y` → `# CONFIG_ESP_HOSTED_SPI_HOST_INTERFACE is not set`
+   - `# CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE is not set` → `CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE=y`
+2. **在 SDIO 选择行之后补回 14 行参数块**（SPI 模式会把整块 SDIO 参数顶掉）：
+
+```text
+CONFIG_ESP_HOSTED_SDIO_RESET_ACTIVE_HIGH=y
+CONFIG_ESP_HOSTED_SDIO_OPTIMIZATION_RX_STREAMING_MODE=y
+CONFIG_ESP_HOSTED_SDIO_SLOT_1=y
+CONFIG_ESP_HOSTED_SDIO_SLOT=1
+CONFIG_ESP_HOSTED_SDIO_4_BIT_BUS=y
+CONFIG_ESP_HOSTED_SDIO_BUS_WIDTH=4
+CONFIG_ESP_HOSTED_SDIO_CLOCK_FREQ_KHZ=40000
+CONFIG_ESP_HOSTED_SDIO_GPIO_RESET_SLAVE=54
+CONFIG_ESP_HOSTED_SDIO_PIN_CMD=19
+CONFIG_ESP_HOSTED_SDIO_PIN_CLK=18
+CONFIG_ESP_HOSTED_SDIO_PIN_D0=14
+CONFIG_ESP_HOSTED_SDIO_PIN_D1=15
+CONFIG_ESP_HOSTED_SDIO_PIN_D2=16
+CONFIG_ESP_HOSTED_SDIO_PIN_D3=17
+```
+
+3. **从机复位**：`CONFIG_ESP_HOSTED_GPIO_SLAVE_RESET_SLAVE=12` → `=54`（同时检查镜像段里不带 HOSTED 字样的 `CONFIG_ESP_GPIO_SLAVE_RESET_SLAVE`，本次它未被翻，保持 54）。
+
+改完自检：主段与镜像段都必须是 SDIO（`findstr /C:"SDIO_HOST_INTERFACE=y"` 应至少两行，且不允许出现 `ESP_HOSTED_SPI_HOST_INTERFACE=y`）。
+
+**遗留的误触发源排查**：本次复发发生在两次正常构建之间，期间无人使用 menuconfig。嫌疑最大的是 ESP-IDF 插件的"SDK Configuration Editor"（GUI）——打开即按当前 Kconfig 重新渲染并保存，会把未选中的 SPI 参数块展开顶掉 SDIO。下次复发时先 `git diff sdkconfig.bletest` 看是不是只有这一块变化，并留意是否在 GUI 里打开过配置页。
+
+### 判断“烧进去的是不是新固件”
+
+**不要看 `Compile time`**：app_desc 里那个时间戳只由定义应用描述符的那个 TU 的 `__DATE__/__TIME__` 决定，增量编译改业务代码时它不会重编，两次构建显示同一时间是正常的。
+
+可靠证据有三个：
+
+1. `idf_monitor` 启动时会把 build 目录 ELF 的 sha256 与设备打印的 `ELF file SHA256` 对比，不一致就打 `--- Warning: Checksum mismatch between flashed and built applications. Checksum of built application is <hex>`。**看到这条就等于“芯片里跑的不是刚构建的那个固件”**，此时分析日志没有意义。反之，三者一致（设备打印 = monitor 报的 built checksum = 本地 `Get-FileHash build/lummiss_main.elf -Algorithm SHA256`）就是烧录成功的硬证据。
+2. 日志里新增 / 改写过的文案是否出现（例：外设自检那次新增的“3000 ms 后打印一次静默期自检结论”，旧固件没有这半句）。
+3. `App version`（git describe）。
+
 VS Code 当前默认使用 `build`、`sdkconfig.bletest` 和 Ninja。若任务仍出现 `build_main_verified` 或 `build_bletest7`，需要确认工作区打开的是 `src/demo` 并执行 `Developer: Reload Window`。
 
 ## 10. 现在最需要解决的问题
+
+### 2026-09-18（三通道迁移后）状态更新
+
+1. **语音链路已切到三通道并实机打通**：MQTT 控制 + UDP 双向 Opus，全双工对话
+   实测通过（`tx=258 rx=213` 零错、`SPK frames=213`、多轮自动对话），详见第 8A 节。
+   旧的「Agent WebSocket」在 V3 下完全不建立。
+2. **原第 2 条（视频应离开语音 WS 通道）已由三通道迁移从协议上解决**：
+   V3 下 H.264 视频不再走任何 WebSocket，规划路径是 WebRTC（阶段四）；
+   视频/音频分通道正是新协议的设计。该条目的遗留工作并入阶段四。
+3. **内部 DMA 池紧张有所缓解但仍需警惕**：MQTT 收发缓冲调整为 4 KiB/1 KiB 后，
+   `[VIDEO] MEM DMA` 恢复到 43～51/23～24 KB（旧 WS 时代 63/24，V3 初版曾跌到
+   3/1 KB 并触发过 LVGL 分配失败 abort）。第 1 条的池子分析在 V3 下依然成立，
+   WebRTC 阶段要重新核算（MQTT 收缓冲要调大、WebRTC 自身还要吃内存）。
+4. **新增待确认项**：UDP 的 ssrc/connection_id 已按上游协议改为回显服务端
+   nonce 的 4-7 字节（实测 `nonce[0]=0x01 ssrc=0x6b67f749/0x5ca2b182` 等按会话
+   变化）。若后端网关对 ssrc 有校验规则（例如必须与会话绑定），需与后端确认；
+   判据是对话时 `UDP 统计 rx` 是否持续增长。
 
 ### 2026-09-15 新增（优先级高于下方各条）
 
@@ -455,6 +1040,14 @@ VS Code 当前默认使用 `build`、`sdkconfig.bletest` 和 Ninja。若任务�
    改动已落盘（`CONFIG_MBEDTLS_HARDWARE_AES=n`），**待实机复测**：判据是串口里 `esp-aes:`
    一行都不再出现。
 
+2. **按需视频流需要在设备上走完四条路径。** 2026-09-18 已把「开机自动开视频」改成服务端命令驱动（第 7A 节），**构建通过但尚未实机验证**。烧录后按顺序确认：
+   (a) 开机 → WiFi → WebSocket 全部就绪后**没有任何 H.264 上传**，判据是 `VIDEO_CTRL: WS connected, video state = IDLE`；
+   (b) 服务端下发 `{"type":"video","state":"start"}`，日志走 `IDLE -> STARTING -> STREAMING`，画面首帧即可解（强制 IDR 生效）；
+   (c) 下发 `stop` 回到 `IDLE`，再 `start` 时**不闪出关闭前的旧画面** —— 这是「清空两条队列 + 强制 IDR」的联合判据，单独看任何一个都证明不了；
+   (d) 拔网/服务端断开时自动停，恢复连接后保持 `IDLE`，直到服务端重新下发 `start`。
+
+   顺带说明：改造前是「WebSocket 一连上就上传」，所以下方第 2 条记的「断线恶化成 56 秒黑屏」要在新的按需模式下重新观察 —— 现在断线会立刻停视频，恢复后是否黑屏取决于服务端何时重新 `start`，而不是固件自己重连就恢复画面。
+
 以下为此前记录，编号不变：
 
 1. **640×480 完整链路需要长时间验收。** 2026-09-17 profile 5 短时统计显示 H.264/WebSocket 约 30 FPS、UVC drop 0%；1280×720 则约 14～16.7 FPS 且有帧损坏。先以 640×480 连续观察至少 10 分钟，再判断稳定性。profile 8 的 sample_even/ref A/B 不能直接推断完整链路的效果。
@@ -462,12 +1055,32 @@ VS Code 当前默认使用 `build`、`sdkconfig.bletest` 和 Ninja。若任务�
 3. **640×480 浏览器预览待长测验收。** 完整 profile 5 短时窗口里 `sent` 与 `encoded` 均约 30 FPS、`send_fail=0`；还需连续运行至少 10 分钟，观察断线、预览卡顿及 UVC/JPEG 错误。PC 预览覆盖宏当前关闭，重新测试 PC 预览时需显式开启 `VIDEO_STREAM_PC_PREVIEW_ENABLED` 并重新构建烧录。
 4. **短期设备链路已通过，长期稳定性未测。** 热复位完整重建、JPEG 完整性门控、双任务编解码/上传和 CPU 分块转换均已实机工作；需连续运行至少 10 分钟，再逐步扩展到长时间测试。
 5. **动态首页待真机结论。** 构建通过不能证明镜像修正、中文字体、IP 自动定位和两个 HTTPS API 在设备网络上均正常，需要烧录后的照片及 `HOME_INFO` 日志。
-6. **阶段 0 尚未冻结。** 除屏幕、USB 和 P4-C6 SDIO 外，关键器件型号与 GPIO 未定，会阻塞阶段 4、5、9、11。
+6. **阶段 0 尚未冻结。** 除屏幕、USB、P4-C6 SDIO 和新 PCB 的人机交互三组（按键 GPIO22 / 触摸 GPIO52、51 / 氛围灯 GPIO20、21）外，关键器件型号与 GPIO 未定，会阻塞阶段 4、5、9、11。
 7. **当前只完成第一层模块化。** 屏幕和摄像头已提取为驱动文件，但仍位于主组件，尚未拆成独立 ESP-IDF 组件、服务层和业务层。
 8. **没有页面和状态机。** 当前静态 HOME 不能代表 HOME→LISTEN→THINK→REPLY→恢复流程，也无法做优先级和异常覆盖。
-9. **屏幕背光不可控。** BL 接 3V3 无法满足休眠、低电量和亮度调节，需要正式硬件增加背光驱动和 PWM GPIO。
+9. **屏幕背光只有开/关，没有调光。** 现接线为 `BOARD_LCD_BL=GPIO47`，`display_driver.c` 初始化时拉高点亮，因此休眠时熄灭已可做；但要做亮度调节仍需改成 PWM（LEDC），并需确认实物 BL 是否真的接到 GPIO47（旧文档写的是 BL 直连 3V3）。
+10. **按键 / TTP223 / WS2812 只到驱动层，缺实物验收。** 三组驱动已构建并实机运行（见第 6A 节），但灯是否真的亮、颜色与灯珠方向、按键与触摸的真实响应都未验证。这些引脚的物理接线只属于新 PCB，开发板上无法验证（GPIO22=RST 键、GPIO52 被板级拉高）。新 PCB 回来之前，可先用杜邦线短接 GPIO51→3V3 验证触摸的整条输入链路。
 
 ## 11. 按流程继续的顺序
+
+### 2026-09-18（三通道迁移后）新增
+
+1. **MCP 工具实测验收**：对话里说"把音量调到 30"/"声音太大了"，确认 LLM 走
+   `self.get_device_status` → `self.audio_speaker.set_volume`，`CLOUD_MCP:
+   tools/call … -> {"volume":30}` 且喇叭音量真的变化。表情素材拷入 SD 卡后
+   一并验收 `light.pulse`（档位 0 会如实回 NOT_AVAILABLE，属预期——氛围灯
+   只在档位 9 初始化）。
+2. **表情素材拷入 SD 卡**（第 5 次提醒，两分钟的事）：`src/demo/tools/gif/
+   exp_01..08.bin` → SD 卡 `/expressions/`。判据：唤醒后
+   `ANIM_BIN` 不再报 BIN 不存在，屏幕出现表情动画。
+3. **与后端确认两件事**（UDP 下行虽已打通，仍需对账）：
+   ssrc/connection_id 的分配与校验规则（固件已按 nonce 模板回显，实测
+   `nonce[0]=0x01 ssrc=0x…`）；TTS 音频是否始终从 `60.210.30.199:8884` 回发
+   （换源端口会被端口受限型 NAT 拦掉）。
+4. **阶段三收尾 + 阶段四（WebRTC）**：按文档 §5——凭据走 HTTPS + 一次性
+   deviceTicket、MQTT RTC 信令（1 秒 ACK、message_id 幂等）、10 s HEARTBEAT、
+   H264 → WebRTC Track。开工前把 MQTT 收缓冲调回 ≥16 KiB（SDP 最大 64 KiB）。
+   视频默认 IDLE 原则不变：`media.webrtc.start` → 2 秒内 `accepted=true`。
 
 ### 2026-09-15 起
 
@@ -502,6 +1115,12 @@ VS Code 当前默认使用 `build`、`sdkconfig.bletest` 和 Ninja。若任务�
 7. 继续把 display、ui、expression 拆分为独立组件，提供 `expression_play()` 等统一接口。
 8. 完成阶段 3：实现 App Event Bus、UI 状态机、优先级、超时和状态恢复；只有 UI Task 调用 LVGL。
 9. ~~H.264 HTTP 实时链路通过后替换为 WebSocket~~ **已完成（2026-09-10）**：P4 侧走 `esp_websocket_client`（`ws://<PC>:8001/ws`），每帧前置 16 字节自描述头（分辨率/帧率随帧携带）；PC 侧 HTTP(8000) 保留预览页、`/h264` 回退入口与 `/cmd` 下行命令。编码队列和 Network Manager 接口未动。后续要做运行期改分辨率：需把 `VIDEO_STREAM_WIDTH/HEIGHT` 从编译期宏改为运行期变量，并同步 `camera_driver.c` 的格式耦合（兜底格式表、格式提升、帧门控、`preferred_mjpeg` 判定），帧头自描述已解除 PC 端对分辨率的感知需求。
+
+以下为 2026-09-18 新增：
+
+10. **新 PCB 回来后先验外设（阶段 4）**：用实物确认按键（GPIO22）、两路 TTP223（GPIO52/51）、两路 WS2812（GPIO20/21）的真实行为与极性（`BOARD_TOUCH_ACTIVE_LOW`、呼吸曲线、灯珠方向与数量）。**同时先把“GPIO52 在开发板上被板级硬件拉高”这件事查清**（查原理图，或断电量对 3V3/GND 电阻）——它会影响对新 PCB 接线的判断，也可能与 TTP223 自身的上下拉冲突。
+11. **再把外设接进业务**：按键 / 触摸 → App Event Bus（`APP_EVT_*`）、WS2812 → UI / 业务状态（HOME 慢呼吸 / LISTEN 蓝呼吸 …）。这一步依赖阶段 3 的 Event Bus 与 UI 状态机，不要抢在前面做。
+12. **按需视频流实机验收（对应第 10 节「2026-09-15 新增」第 2 条）**：不依赖新硬件，现在就能做。四条路径里重点验 (c) —— `stop` 之后再 `start` 不能闪出关闭前的旧画面。同时和后端把字段定死：当前 `{"type":"video","state":"..."}` 与旧的 `{"type":"video_on/off"}` 都兼容，确定一种后应删掉另一种，避免协议长期双轨。
 
 下一个会话开始时，先读取本文件、`盆栽陪伴机器人_开发文档.md` 和 `src/demo/CAMERA_UPLOAD_TEST.md`，再根据 H.264 串口统计、PC `/status`、浏览器预览及保存的 `.h264` 继续。修改 C/C++ 源码时继续使用中文注释。
 

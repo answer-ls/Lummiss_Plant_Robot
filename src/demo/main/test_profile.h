@@ -22,6 +22,7 @@
  * 6 = UVC/USB Host + JPEG/H.264 编码，不启动 WiFi/ESP-Hosted/WebSocket/UI/SD
  * 7 = UVC/USB Host + JPEG 硬件解码，不启动 YUV/H.264/WiFi/WebSocket/UI/SD
  * 8 = UVC/USB Host + JPEG 解码/YUV 转换，不启动 H.264/WiFi/WebSocket/UI/SD
+ * 9 = UVC/USB Host + 按键/TTP223 触摸/WS2812 氛围灯，不启动 WiFi/WebSocket/UI/SD/音频/天气
  */
 #define CAMERA_TEST_FULL                   0
 #define CAMERA_TEST_UVC_ONLY               1
@@ -32,13 +33,20 @@
 #define CAMERA_TEST_UVC_H264_ONLY          6
 #define CAMERA_TEST_UVC_JPEG_ONLY          7
 #define CAMERA_TEST_UVC_YUV_ONLY           8
+#define CAMERA_TEST_PERIPH_ONLY            9
 
-/* ← 改这一行切换档位；当前启用 WiFi + H.264 视频链路供 PC 预览 */
+/* ← 改这一行切换档位。
+ * 当前临时设为 9，用于验证 GPIO20 上的 WS2812 灯带；
+ * 测试完成后回到完整系统请改回 CAMERA_TEST_FULL。 */
 #define CAMERA_TEST_PROFILE                CAMERA_TEST_FULL
 
-/* 完整系统基线开启 H.264 视频编码和 WebSocket 视频上传；
- * 设为 0 只关闭视频流，保留小智音频使用的同一条 WebSocket 连接。 */
-#define CAMERA_VIDEO_STREAM_ENABLED        1
+/* 视频上传采用「按需开启」：开机默认 IDLE，只建立 WebSocket 控制通道，
+ * 必须等服务端下发 VIDEO_START 才编码上传；VIDEO_STOP / 断线自动停止，
+ * 重连不自动恢复（详见 components/video_streamer/video_streamer.h）。
+ *
+ * 这个宏只是**调试开关**：设 1 会在摄像头驱动初始化后立刻强制开视频，
+ * 用于手边没有服务端时单独看画面。生产/正常联调必须保持 0。 */
+#define CAMERA_VIDEO_STREAM_AUTOSTART      0
 
 /* 纯 UVC 冷启动测试一次只允许请求一种模式。修改下面最后一行后必须重新
  * 编译、复位开发板并让摄像头重新枚举，禁止在同一次运行中轮换分辨率。 */
@@ -54,8 +62,14 @@
 #define TP_WIFI     (1u << 4)   /* Network Manager / ESP-Hosted / C6 */
 #define TP_WEATHER  (1u << 5)   /* 天气 HTTPS 和首页信息 */
 #define TP_XIAOZHI  (1u << 6)   /* 板载 ES8311 麦克风/扬声器和小智语音会话 */
+#define TP_PERIPH   (1u << 7)   /* 机械按键 + TTP223 触摸 + WS2812 氛围灯（纯驱动自检） */
 
-/* 档位 → 功能位，唯一的映射点。 */
+/* 档位 → 功能位，唯一的映射点。
+ *
+ * 档位 0（完整系统）暂时不带 TP_PERIPH：RMT 通道和三个采样/灯效任务都会新增
+ * 内部内存占用，而当前第一优先级问题正是内部内存被挤碎，所以在长测通过前
+ * 不让完整档位多背一块负担。要在完整系统里也启用，把下面完整系统那一行的
+ * TP_BITS 末尾加上 " | TP_PERIPH" 即可，没有别的改动。 */
 #if   CAMERA_TEST_PROFILE == CAMERA_TEST_FULL
 #  define TP_BITS (TP_UVC | TP_HANDOFF | TP_UI | TP_SD | TP_WIFI | TP_WEATHER | TP_XIAOZHI)
 #elif CAMERA_TEST_PROFILE == CAMERA_TEST_UVC_ONLY
@@ -68,6 +82,8 @@
 #  define TP_BITS (TP_UVC | TP_UI | TP_SD | TP_WIFI)
 #elif CAMERA_TEST_PROFILE == CAMERA_TEST_UVC_UI_SD_WIFI_VIDEO
 #  define TP_BITS (TP_UVC | TP_HANDOFF | TP_UI | TP_SD | TP_WIFI)
+#elif CAMERA_TEST_PROFILE == CAMERA_TEST_PERIPH_ONLY
+#  define TP_BITS (TP_UVC | TP_PERIPH)
 #elif CAMERA_TEST_PROFILE == CAMERA_TEST_UVC_H264_ONLY || \
       CAMERA_TEST_PROFILE == CAMERA_TEST_UVC_JPEG_ONLY || \
       CAMERA_TEST_PROFILE == CAMERA_TEST_UVC_YUV_ONLY
@@ -102,6 +118,8 @@ static inline const char *test_profile_name(void)
     return "UVC + JPEG 硬解（无 YUV/H.264/WiFi/WS/UI/SD）";
 #elif CAMERA_TEST_PROFILE == CAMERA_TEST_UVC_YUV_ONLY
     return "UVC + JPEG 解码/YUV 转换（无 H.264/WiFi/WS/UI/SD）";
+#elif CAMERA_TEST_PROFILE == CAMERA_TEST_PERIPH_ONLY
+    return "UVC + 按键/TTP223 触摸/WS2812 氛围灯（无 WiFi/WS/UI/SD/音频/天气）";
 #endif
 }
 

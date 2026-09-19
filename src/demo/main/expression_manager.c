@@ -2,8 +2,10 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <strings.h>
 
 #include "anim_bin_player.h"
+#include "ambient_led.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -22,15 +24,69 @@ static lv_timer_t *s_timer;
 static int64_t s_emotion_deadline;
 static bool s_initialized;
 
-static const char *emotion_file(const char *emotion)
+/* ===================== 情绪词 -> 表情素材映射 =====================
+ *
+ * 表里左侧是服务端下发的情绪词，右侧是 SD 卡上的素材。
+ * exp_0N 与画面的对应关系由 src/demo/tools/gif 下的源图逐帧比对确认：
+ *
+ *   exp_01 乐   | exp_02 哀   | exp_03 喜   | exp_04 怒
+ *   exp_05 思考 | exp_06 惊讶 | exp_07 疑惑 | exp_08 眨眼
+ *
+ * 小智官方词表有二十多个取值，本地只有 8 张素材，所以多个词会落到同一张
+ * 素材上（例如 laughing/funny/silly 共用「乐」）。**表里没有的词统一回退
+ * neutral**，也就是「眨眼」这张中性脸——这是官方约定，不会出现收到未知
+ * 情绪后屏幕不动的空窗。
+ *
+ * 注意：这张表只是「词→素材」的查表，真正切屏发生在 LVGL 定时器
+ * expression_timer 里。WebSocket 回调只负责往队列投词，不碰任何 LVGL 对象。 */
+typedef struct {
+    const char *emotion;   /* 服务端下发的 emotion 取值（大小写不敏感） */
+    const char *exp_name;  /* 日志用符号名，便于和服务端日志逐行对账 */
+    const char *file;      /* SD 卡素材绝对路径 */
+} emotion_entry_t;
+
+static const emotion_entry_t k_emotions[] = {
+    /* ---- 小智官方词表 ---- */
+    { "neutral",     "EXP_NEUTRAL",     EXPRESSION_DIR "/exp_08.bin" },
+    { "happy",       "EXP_HAPPY",       EXPRESSION_DIR "/exp_03.bin" },
+    { "laughing",    "EXP_LAUGHING",    EXPRESSION_DIR "/exp_01.bin" },
+    { "funny",       "EXP_FUNNY",       EXPRESSION_DIR "/exp_01.bin" },
+    { "silly",       "EXP_SILLY",       EXPRESSION_DIR "/exp_01.bin" },
+    { "sad",         "EXP_SAD",         EXPRESSION_DIR "/exp_02.bin" },
+    { "crying",      "EXP_CRYING",      EXPRESSION_DIR "/exp_02.bin" },
+    { "angry",       "EXP_ANGRY",       EXPRESSION_DIR "/exp_04.bin" },
+    { "surprised",   "EXP_SURPRISED",   EXPRESSION_DIR "/exp_06.bin" },
+    { "shocked",     "EXP_SHOCKED",     EXPRESSION_DIR "/exp_06.bin" },
+    { "confused",    "EXP_CONFUSED",    EXPRESSION_DIR "/exp_07.bin" },
+    { "embarrassed", "EXP_EMBARRASSED", EXPRESSION_DIR "/exp_07.bin" },
+    { "thinking",    "EXP_THINKING",    EXPRESSION_DIR "/exp_05.bin" },
+    { "loving",      "EXP_LOVING",      EXPRESSION_DIR "/exp_03.bin" },
+    { "kissy",       "EXP_KISSY",       EXPRESSION_DIR "/exp_03.bin" },
+    { "delicious",   "EXP_DELICIOUS",   EXPRESSION_DIR "/exp_03.bin" },
+    { "confident",   "EXP_CONFIDENT",   EXPRESSION_DIR "/exp_03.bin" },
+    { "winking",     "EXP_WINKING",     EXPRESSION_DIR "/exp_08.bin" },
+    { "relaxed",     "EXP_RELAXED",     EXPRESSION_DIR "/exp_08.bin" },
+    { "sleepy",      "EXP_SLEEPY",      EXPRESSION_DIR "/exp_08.bin" },
+    { "cool",        "EXP_COOL",        EXPRESSION_DIR "/exp_08.bin" },
+
+    /* ---- Lummiss 自有词表：保留兼容，官方模式下不会出现 ---- */
+    { "joy",         "EXP_JOY",         EXPRESSION_DIR "/exp_01.bin" },
+};
+
+#define EMOTION_COUNT (sizeof(k_emotions) / sizeof(k_emotions[0]))
+
+static const emotion_entry_t *emotion_lookup(const char *emotion)
 {
-    if (strcmp(emotion, "sad") == 0) return EXPRESSION_DIR "/exp_01.bin";
-    if (strcmp(emotion, "surprised") == 0) return EXPRESSION_DIR "/exp_02.bin";
-    if (strcmp(emotion, "joy") == 0) return EXPRESSION_DIR "/exp_03.bin";
-    if (strcmp(emotion, "angry") == 0) return EXPRESSION_DIR "/exp_04.bin";
-    if (strcmp(emotion, "happy") == 0) return EXPRESSION_DIR "/exp_06.bin";
-    if (strcmp(emotion, "confused") == 0) return EXPRESSION_DIR "/exp_07.bin";
-    return EXPRESSION_DIR "/exp_08.bin";
+    if (emotion == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < EMOTION_COUNT; i++) {
+        /* 大小写不敏感：官方侧是小写，但没必要对服务端的大小写写法做假设。 */
+        if (strcasecmp(k_emotions[i].emotion, emotion) == 0) {
+            return &k_emotions[i];
+        }
+    }
+    return NULL;
 }
 
 static void play_file(const char *path, uint32_t duration_ms)
@@ -51,15 +107,35 @@ static void expression_timer(lv_timer_t *timer)
     expression_event_t event;
     if (xQueueReceive(s_queue, &event, 0) == pdPASS) {
         if (event.type == EVENT_EMOTION) {
-            play_file(emotion_file(event.value), 1800);
+            /* 词表外的取值回退 neutral。日志刻意打成
+             *   EXPRESSION: emotion happy -> EXP_HAPPY
+             * 这种一行式，方便和 xiaozhi_audio 侧的
+             *   XIAOZHI: LLM emotion=happy text=😀
+             * 对着看，确认「收到什么词」和「切了哪张素材」一致。 */
+            const emotion_entry_t *entry = emotion_lookup(event.value);
+            if (entry == NULL) {
+                ESP_LOGW(TAG, "emotion %s unknown -> neutral", event.value);
+                entry = emotion_lookup("neutral");
+            } else {
+                ESP_LOGI(TAG, "emotion %s -> %s", event.value, entry->exp_name);
+            }
+            /* 表情和氛围灯共用同一个事件入口，灯效层不会阻塞 LVGL 定时器。 */
+            ambient_led_set_emotion(event.value);
+            play_file(entry->file, 1800);
         } else if (strcmp(event.value, "listen") == 0) {
             s_emotion_deadline = 0;
+            ambient_led_clear_emotion();
+            ambient_led_set_state(AMBIENT_LED_STATE_LISTENING);
             play_file(EXPRESSION_DIR "/exp_08.bin", 0);
         } else if (strcmp(event.value, "thinking") == 0) {
             s_emotion_deadline = 0;
+            ambient_led_clear_emotion();
+            ambient_led_set_state(AMBIENT_LED_STATE_THINKING);
             play_file(EXPRESSION_DIR "/exp_05.bin", 0);
         } else if (strcmp(event.value, "home") == 0 ||
                    strcmp(event.value, "tts_stop") == 0) {
+            ambient_led_clear_emotion();
+            ambient_led_set_state(AMBIENT_LED_STATE_WAKE_IDLE);
             if (s_emotion_deadline == 0 || esp_timer_get_time() >= s_emotion_deadline) {
                 anim_bin_player_stop();
                 lv_scr_load(s_home);

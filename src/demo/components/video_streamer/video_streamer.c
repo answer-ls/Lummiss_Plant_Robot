@@ -1,4 +1,4 @@
-#include "video_streamer.h"
+﻿#include "video_streamer.h"
 #include "dma2d_yuv.h"
 
 #include <inttypes.h>
@@ -20,6 +20,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "esp_websocket_client.h"
 
@@ -27,6 +28,8 @@
 #include "network_manager.h"
 
 static const char *TAG = "VIDEO_STREAM";
+/* 视频控制层专用 TAG：启停状态迁移打在这里，便于和服务端命令逐条对账。 */
+static const char *TAG_CTRL = "VIDEO_CTRL";
 
 static video_streamer_config_t s_ws_config;
 #define VIDEO_WS_SEND_TIMEOUT_MS 2000
@@ -35,6 +38,19 @@ static video_streamer_config_t s_ws_config;
 extern esp_err_t xiaozhi_audio_set_volume(int volume) __attribute__((weak));
 extern int xiaozhi_audio_get_volume(void) __attribute__((weak));
 extern void expression_manager_post_emotion(const char *emotion) __attribute__((weak));
+
+/* ===================== 小智官方服务器测试模式 =====================
+ * CONFIG_XIAOZHI_USE_OFFICIAL_SERVER 打开时，设备连的是小智官方服务器，
+ * 链路约定与 Lummiss 不同：
+ *   1. WebSocket 二进制帧只承载 Opus 音频，不能再复用给 H.264 视频；
+ *   2. 客户端 Hello 按官方 WebSocket v1 协议发送（audio_params）；
+ *   3. 握手请求头需要额外带 Protocol-Version。
+ * 这里只做编译期裁剪，Lummiss 分支的代码原样保留，关闭宏即恢复。 */
+#if defined(CONFIG_XIAOZHI_USE_OFFICIAL_SERVER)
+#define VIDEO_OFFICIAL_SERVER_MODE 1
+#else
+#define VIDEO_OFFICIAL_SERVER_MODE 0
+#endif
 
 static void video_ws_handle_mcp(esp_websocket_client_handle_t client,
                                 const char *command)
@@ -139,7 +155,7 @@ static void video_ws_handle_mcp(esp_websocket_client_handle_t client,
 #define VIDEO_GOP                     VIDEO_ENCODE_FPS
 /* 目标码率 4 Mbps。实际画质取决于每帧比特预算（= BITRATE / ENCODE_FPS），
  * 当前 640×480@20fps 下约 0.65 bpp。QP 范围 20-40 防止极端压缩。 */
-#define VIDEO_BITRATE                 4000000
+#define VIDEO_BITRATE                 2000000
 #define VIDEO_QP_MIN                  20
 #define VIDEO_QP_MAX                  40
 /* 摄像头侧 MJPEG 输入环槽数（提交时 memcpy 进槽）。 */
@@ -189,8 +205,16 @@ static void video_ws_handle_mcp(esp_websocket_client_handle_t client,
 /* WebSocket 收发缓冲 32KB：单帧 H.264 码流（~25KB @ 4Mbps）1 片发完，
  * 避免分片导致的多次 SDIO RPC 开销。未开 DYNAMIC_BUFFER，启动时一次性分配。 */
 #define VIDEO_WS_BUFFER_SIZE          32768
-/* 断线后 2 秒重试，比组件默认的 10 秒恢复更快。 */
-#define VIDEO_WS_RECONNECT_MS         2000
+/* 断线重连间隔。
+ *
+ * Lummiss 模式保持 2 秒：自家服务端，恢复越快越好。
+ *
+ * 官方模式必须放慢到 10 秒：官方服务端在握手后 ~280 ms 就主动发 CLOSE
+ * 关掉连接（实测形态固定，见 test 说明），2 秒一次等于**持续冲击对方接口**，
+ * 有被限流甚至拉黑的风险；而且每 2 秒刷一屏重连日志，会把真正有用的
+ * 诊断信息（比如服务端关闭前有没有发东西）冲得看不见。
+ * 这里只调间隔，不加退避算法——官方侧恢复正常后 10 秒内就能自己接上。 */
+#define VIDEO_WS_RECONNECT_MS         (VIDEO_OFFICIAL_SERVER_MODE ? 10000 : 2000)
 /* 单帧发送超时。esp_websocket_client 将此值用于 transport_ws 的 select 可写等待，
  * 超时即判定连接失败并 abort。2 秒足够覆盖 TCP 背压最坏情况，代价是阻塞期间占住输出槽。 */
 #define VIDEO_WS_AUDIO_SEND_TIMEOUT_MS 200
@@ -305,7 +329,9 @@ static video_stream_stats_t s_stats;
 static int64_t s_next_submit_us;
 static uint32_t s_next_sequence;
 static bool s_initialized;
-static bool s_stream_enabled = true;
+/* 上传门控。默认关闭：开机后只跑 WebSocket 控制通道，
+ * 必须等服务端下发 VIDEO_START 才开始编码上传。 */
+static bool s_stream_enabled = false;
 /* 发送任务和 UVC 回调都读取该状态；断线时在入口丢帧，避免 JPEG 解码、
  * H.264 编码和输出槽继续为一个已经不可写的 socket 消耗资源。 */
 static volatile bool s_ws_connected;
@@ -315,6 +341,30 @@ static volatile uint32_t s_agent_audio_pending;
 static int64_t s_next_ws_send_us;
 static esp_websocket_client_handle_t s_ws_client;
 static video_streamer_agent_callbacks_t s_agent_callbacks;
+
+/* ================= 视频控制层（状态机 + 事件队列） =================
+ *
+ * WebSocket 接收任务只负责解析消息并把启停请求丢进 s_ctrl_queue，
+ * 真正的动作由 video_ctrl_task 串行执行。这样即使将来 start/stop
+ * 变成重建编码器这类耗时操作，也不会阻塞接收任务。 */
+typedef enum {
+    VIDEO_CTRL_CMD_START = 0,
+    VIDEO_CTRL_CMD_STOP,
+} video_ctrl_cmd_t;
+
+#define VIDEO_CTRL_QUEUE_DEPTH  4
+
+/* 当前运行状态。默认 IDLE：开机不编码、不上传。 */
+static video_state_t s_video_state = VIDEO_STATE_IDLE;
+static QueueHandle_t s_ctrl_queue;
+static TaskHandle_t s_ctrl_task;
+/* start/stop 执行体的互斥：控制任务与（调试用的）直接调用可能并发，
+ * 拿它把「读状态 → 清队列 → 改状态」整段串起来，幂等性才成立。 */
+static SemaphoreHandle_t s_ctrl_mutex;
+/* 下一次编码前强制产生 IDR。停止期间编码器的参考帧已经失效，
+ * 重新开启后若继续发 P 帧，PC 端只会花屏；强制 IDR 后立刻可解，
+ * 不必等下一个 GOP 边界（GOP=30 时最长要等 1 秒）。 */
+static volatile bool s_force_idr;
 
 /* 下行命令的累积缓冲。WebSocket 事件回调运行在客户端自己的任务里，
  * 与上传任务并发，但这两个变量只有该回调会写，因此不需要加锁。 */
@@ -326,6 +376,11 @@ static bool s_ws_receiving_binary;
 
 static void video_drop_pending_output(void)
 {
+    /* 编解码任务的输出队列可能还没建好（init 之后、编码任务起来之前），
+     * 那种情况下没有积压帧可丢，直接返回。 */
+    if (s_out_ready == NULL || s_out_free == NULL) {
+        return;
+    }
     unsigned index;
     uint32_t dropped = 0;
     while (xQueueReceive(s_out_ready, &index, 0) == pdTRUE) {
@@ -663,7 +718,67 @@ static bool video_ws_extract_cmd(const char *json, char *out, size_t out_size)
     return true;
 }
 
-void video_streamer_set_enabled(bool enabled)
+/* 解析服务端视频控制消息 {"type":"video","state":"start"|"stop"}。
+ * 返回 true 表示识别成功，*want_start 给出目标状态。
+ * 字段最终以服务端实际定义为准；这里同时兼容 {"type":"video_on"} 这类
+ * 旧写法（由 video_ws_extract_cmd 那条路径处理）。 */
+static bool video_ws_parse_video_command(const char *json, bool *want_start)
+{
+    cJSON *root = cJSON_Parse(json);
+    if (root == NULL) {
+        return false;
+    }
+
+    bool matched = false;
+    cJSON *type = cJSON_GetObjectItem(root, "type");
+    cJSON *state = cJSON_GetObjectItem(root, "state");
+    if (cJSON_IsString(type) && strcmp(type->valuestring, "video") == 0 &&
+        cJSON_IsString(state)) {
+        if (strcmp(state->valuestring, "start") == 0) {
+            *want_start = true;
+            matched = true;
+        } else if (strcmp(state->valuestring, "stop") == 0) {
+            *want_start = false;
+            matched = true;
+        }
+    }
+
+    cJSON_Delete(root);
+    return matched;
+}
+
+/* ==================== 视频控制层实现 ==================== */
+
+static void video_ctrl_set_state(video_state_t state)
+{
+    portENTER_CRITICAL(&s_lock);
+    s_video_state = state;
+    portEXIT_CRITICAL(&s_lock);
+}
+
+video_state_t video_streamer_get_state(void)
+{
+    video_state_t state;
+    portENTER_CRITICAL(&s_lock);
+    state = s_video_state;
+    portEXIT_CRITICAL(&s_lock);
+    return state;
+}
+
+const char *video_streamer_state_name(video_state_t state)
+{
+    switch (state) {
+    case VIDEO_STATE_IDLE:      return "IDLE";
+    case VIDEO_STATE_STARTING:  return "STARTING";
+    case VIDEO_STATE_STREAMING: return "STREAMING";
+    case VIDEO_STATE_STOPPING:  return "STOPPING";
+    default:                    return "UNKNOWN";
+    }
+}
+
+/* 门控标志的唯一写入点：start/stop 靠它开关编码与上传。
+ * 关掉以后，USB 采集和 WebSocket 控制通道都不受影响。 */
+static void video_ctrl_apply_enabled(bool enabled)
 {
     portENTER_CRITICAL(&s_lock);
     s_stream_enabled = enabled;
@@ -680,6 +795,156 @@ bool video_streamer_is_enabled(void)
     return enabled;
 }
 
+/* 清空还没解码的 MJPEG 输入帧，槽连同 release_cb 一起归还给摄像头池。
+ * 不清的话，下次开启会先把关闭前的旧画面发出去。 */
+static void video_drain_input_queue(void)
+{
+    if (s_input_queue == NULL) {
+        return;
+    }
+    unsigned index;
+    uint32_t flushed = 0;
+    while (xQueueReceive(s_input_queue, &index, 0) == pdTRUE) {
+        video_input_slot_release(&s_slots[index]);
+        flushed++;
+    }
+    if (flushed != 0) {
+        ESP_LOGI(TAG, "已丢弃未解码的 MJPEG 积压帧=%" PRIu32, flushed);
+    }
+}
+
+esp_err_t video_streamer_start(void)
+{
+#if VIDEO_OFFICIAL_SERVER_MODE
+    /* 官方服务器测试模式：WebSocket 的二进制帧被 Opus 音频独占，视频通道
+     * 整体停用。这里直接拒绝启动，避免编码器白白吃 CPU/PSRAM——即使有人
+     * 绕过这里把门控打开，发送侧还有一道编译期拦截（见发送任务）。 */
+    ESP_LOGW(TAG_CTRL, "官方服务器测试模式：忽略 VIDEO_START，视频上传保持关闭");
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+    if (s_ctrl_mutex != NULL) {
+        xSemaphoreTake(s_ctrl_mutex, portMAX_DELAY);
+    }
+
+    const video_state_t state = video_streamer_get_state();
+
+    /* 已经开着（或正在开）：不重复建任务/队列，也不重复清队列。 */
+    if (state == VIDEO_STATE_STARTING || state == VIDEO_STATE_STREAMING) {
+        ESP_LOGI(TAG_CTRL, "already %s, ignore repeated VIDEO_START",
+                 video_streamer_state_name(state));
+        goto unlock;
+    }
+
+    ESP_LOGI(TAG_CTRL, "%s -> STARTING", video_streamer_state_name(state));
+    video_ctrl_set_state(VIDEO_STATE_STARTING);
+
+    /* 先把关闭期间积压的帧全部丢掉，保证从当前这一刻的新帧开始编码。 */
+    video_drain_input_queue();
+    video_drop_pending_output();
+
+    /* 首帧强制 IDR：PC 端拿到即可解码，不必等 GOP 边界。 */
+    s_force_idr = true;
+    video_ctrl_apply_enabled(true);
+
+    ESP_LOGI(TAG, "H264 pipeline started");
+    video_ctrl_set_state(VIDEO_STATE_STREAMING);
+    ESP_LOGI(TAG_CTRL, "STARTING -> STREAMING");
+
+unlock:
+    if (s_ctrl_mutex != NULL) {
+        xSemaphoreGive(s_ctrl_mutex);
+    }
+    return ESP_OK;
+}
+
+esp_err_t video_streamer_stop(void)
+{
+    if (s_ctrl_mutex != NULL) {
+        xSemaphoreTake(s_ctrl_mutex, portMAX_DELAY);
+    }
+
+    const video_state_t state = video_streamer_get_state();
+
+    /* 已经是关的：直接忽略，不做任何清理。 */
+    if (state == VIDEO_STATE_IDLE) {
+        ESP_LOGI(TAG_CTRL, "already IDLE, ignore repeated VIDEO_STOP");
+        goto unlock;
+    }
+
+    ESP_LOGI(TAG_CTRL, "%s -> STOPPING", video_streamer_state_name(state));
+    video_ctrl_set_state(VIDEO_STATE_STOPPING);
+
+    /* 顺序不能反：先停门控，之后清理期间才不会有新帧补进来。 */
+    video_ctrl_apply_enabled(false);
+    /* 再清空两条流水线：未解码的 MJPEG + 已编码未发送的 H.264。 */
+    video_drain_input_queue();
+    video_drop_pending_output();
+    ESP_LOGI(TAG, "queues flushed");
+
+    video_ctrl_set_state(VIDEO_STATE_IDLE);
+    ESP_LOGI(TAG_CTRL, "STOPPING -> IDLE");
+
+unlock:
+    if (s_ctrl_mutex != NULL) {
+        xSemaphoreGive(s_ctrl_mutex);
+    }
+    return ESP_OK;
+}
+
+bool video_streamer_is_active(void)
+{
+    return video_streamer_get_state() == VIDEO_STATE_STREAMING;
+}
+
+void video_streamer_set_enabled(bool enabled)
+{
+    if (enabled) {
+        video_streamer_start();
+    } else {
+        video_streamer_stop();
+    }
+}
+
+static bool video_ctrl_post(video_ctrl_cmd_t cmd)
+{
+    if (s_ctrl_queue == NULL) {
+        ESP_LOGW(TAG_CTRL, "视频控制队列未就绪，请求已丢弃");
+        return false;
+    }
+    if (xQueueSend(s_ctrl_queue, &cmd, 0) != pdTRUE) {
+        ESP_LOGW(TAG_CTRL, "视频控制队列已满，请求已丢弃");
+        return false;
+    }
+    return true;
+}
+
+bool video_streamer_request_start(void)
+{
+    return video_ctrl_post(VIDEO_CTRL_CMD_START);
+}
+
+bool video_streamer_request_stop(void)
+{
+    return video_ctrl_post(VIDEO_CTRL_CMD_STOP);
+}
+
+/* 串行执行启停：避免 WebSocket 任务与断线处理同时清理队列造成竞态。 */
+static void video_ctrl_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        video_ctrl_cmd_t cmd;
+        if (xQueueReceive(s_ctrl_queue, &cmd, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        if (cmd == VIDEO_CTRL_CMD_START) {
+            video_streamer_start();
+        } else {
+            video_streamer_stop();
+        }
+    }
+}
+
 /* 处理服务器下发的控制命令并回包。
  * 支持新旧两套协议：{"type":"..."}（云端）与 {"cmd":"..."}（旧 PC 调试）。 */
 static void video_ws_handle_command(esp_websocket_client_handle_t client,
@@ -693,11 +958,42 @@ static void video_ws_handle_command(esp_websocket_client_handle_t client,
     char cmd[16];
     char reply[256];
 
+    /* 服务端视频控制：{"type":"video","state":"start"|"stop"}。
+     * 只投递事件并立刻回包 —— 实际启停由 video_ctrl 任务执行，
+     * 绝不在 WebSocket 接收任务里做启停动作。 */
+    {
+        bool want_start = false;
+        if (video_ws_parse_video_command(command, &want_start)) {
+            ESP_LOGI(TAG_CTRL, "%s received",
+                     want_start ? "VIDEO_START" : "VIDEO_STOP");
+            if (want_start) {
+                video_streamer_request_start();
+            } else {
+                video_streamer_request_stop();
+            }
+            snprintf(reply, sizeof(reply),
+                     "{\"type\":\"video_state\",\"ok\":true,"
+                     "\"video_enabled\":%s}",
+                     want_start ? "true" : "false");
+            ESP_LOGI(TAG, "下行命令 %s → %s", command, reply);
+            if (esp_websocket_client_send_text(client, reply, (int)strlen(reply),
+                                               pdMS_TO_TICKS(VIDEO_WS_SEND_TIMEOUT_MS)) < 0) {
+                ESP_LOGW(TAG, "回发命令响应失败");
+            }
+            return;
+        }
+    }
+
     if (!video_ws_extract_cmd(command, cmd, sizeof(cmd))) {
-        /* 服务端 Hello 包含 session_id 和 audio_params，不是简单命令格式。
-         * 只打日志保存，不回复。后续音频联调时再从 JSON 中提取参数。 */
+        /* 没有可识别的 type。两种来源都要打出来，不能只认 Hello：
+         *   1) 服务端 Hello —— 带 session_id 和 audio_params；
+         *   2) 服务端拒绝会话时发来的非标准消息 —— 这正是排查"连上就被断"
+         *      时最需要的那条信息，静默丢弃等于自己把证据扔了。
+         * 只打日志、不回复，保持原有行为。 */
         if (strstr(command, "\"session_id\"") != NULL) {
             ESP_LOGI(TAG, "服务端 Hello：%s", command);
+        } else {
+            ESP_LOGW(TAG, "无法识别的下行消息（无 type 字段）：%.200s", command);
         }
         return;
     }
@@ -732,12 +1028,20 @@ static void video_ws_handle_command(esp_websocket_client_handle_t client,
                  VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_ENCODE_FPS,
                  encoded, sent, failed, dropped, enabled ? "true" : "false");
     } else if (strcmp(cmd, "video_on") == 0 || strcmp(cmd, "video_off") == 0) {
-        const bool enabled = strcmp(cmd, "video_on") == 0;
-        video_streamer_set_enabled(enabled);
+        /* 旧 PC 调试命令，语义与云端 {"type":"video","state":...} 一致：
+         * 同样只投递事件，不在 WebSocket 任务里直接启停。 */
+        const bool want_start = strcmp(cmd, "video_on") == 0;
+        ESP_LOGI(TAG_CTRL, "%s received",
+                 want_start ? "VIDEO_START" : "VIDEO_STOP");
+        if (want_start) {
+            video_streamer_request_start();
+        } else {
+            video_streamer_request_stop();
+        }
         snprintf(reply, sizeof(reply),
                  "{\"type\":\"video_state\",\"ok\":true,"
                  "\"video_enabled\":%s}",
-                 enabled ? "true" : "false");
+                 want_start ? "true" : "false");
     } else if (strcmp(cmd, "tts") == 0 || strcmp(cmd, "stt") == 0 ||
                strcmp(cmd, "listen") == 0 || strcmp(cmd, "abort") == 0) {
         /* 语音协议交给已注册的 Agent 回调处理，此处不重复打印。 */
@@ -772,8 +1076,37 @@ static void video_ws_event_handler(void *handler_args,
     case WEBSOCKET_EVENT_CONNECTED:
         __atomic_store_n(&s_ws_connected, true, __ATOMIC_SEQ_CST);
         ESP_LOGI(TAG, "WebSocket 已连接：%s", s_ws_config.ws_url);
+        /* 连接建立**不等于**开视频：这里只报告当前状态，不动门控。
+         * 要开始上传必须等服务端下发 VIDEO_START。 */
+        ESP_LOGI(TAG_CTRL, "WS connected, video state = %s (keep IDLE unless server sends VIDEO_START)",
+                 video_streamer_state_name(video_streamer_get_state()));
 
-        /* 发送应用层 Hello，遵循 OTA 与 WebSocket 接口规范。 */
+        /* 发送应用层 Hello。
+         * 官方服务器测试模式下按小智官方 WebSocket v1 协议发送：只声明
+         * transport 与 audio_params，不发 Lummiss 的 capability_manifest
+         * （官方不认这个字段，且它描述的是视频能力，测试模式下视频已关闭）。
+         * 上行参数与 xiaozhi_audio 实际编码参数保持一致：16 kHz / 单声道 /
+         * 60 ms 帧。 */
+#if VIDEO_OFFICIAL_SERVER_MODE
+        {
+            char hello[256];
+            snprintf(hello, sizeof(hello),
+                     "{\"type\":\"hello\",\"version\":1,"
+                     "\"features\":{\"mcp\":true},"
+                     "\"transport\":\"websocket\","
+                     "\"audio_params\":{\"format\":\"opus\","
+                     "\"sample_rate\":16000,\"channels\":1,"
+                     "\"frame_duration\":60}}");
+            int sent = esp_websocket_client_send_text(
+                data->client, hello, (int)strlen(hello),
+                pdMS_TO_TICKS(VIDEO_WS_SEND_TIMEOUT_MS));
+            if (sent > 0) {
+                ESP_LOGI(TAG, "Hello 已发送（小智官方协议 v1）：%s", hello);
+            } else {
+                ESP_LOGW(TAG, "Hello 发送失败：%d", sent);
+            }
+        }
+#else
         {
             char hello[512];
             snprintf(hello, sizeof(hello),
@@ -797,6 +1130,7 @@ static void video_ws_event_handler(void *handler_args,
                 ESP_LOGW(TAG, "Hello 发送失败：%d", sent);
             }
         }
+#endif
         if (s_agent_callbacks.connection_changed != NULL) {
             s_agent_callbacks.connection_changed(true, s_agent_callbacks.ctx);
         }
@@ -807,6 +1141,13 @@ static void video_ws_event_handler(void *handler_args,
         /* 重连由组件负责，这里只复位可能残留的半条命令。 */
         __atomic_store_n(&s_ws_connected, false, __ATOMIC_SEQ_CST);
         ESP_LOGW(TAG, "WebSocket 连接断开，等待自动重连");
+        /* 断线必须停掉视频：否则重连后会把断开前的旧码流续着发出去。
+         * 这里只投递事件；重连成功也**不会**自动恢复上传，
+         * 必须等服务端再下一次 VIDEO_START。 */
+        if (video_streamer_get_state() != VIDEO_STATE_IDLE) {
+            ESP_LOGW(TAG_CTRL, "WebSocket disconnected -> VIDEO_STOP (no auto resume)");
+            video_streamer_request_stop();
+        }
         s_ws_command_len = 0;
         s_ws_audio_len = 0;
         s_ws_receiving_binary = false;
@@ -871,8 +1212,19 @@ static void video_ws_event_handler(void *handler_args,
         if (data->fin) {
             s_ws_command[s_ws_command_len] = '\0';
 
-            /* 拦截鉴权失败文本（服务端在鉴权失败时先发非 JSON 文本再关连接）。
-             * 清除旧 token 日志，方便排查是否需要重新 OTA。 */
+            /* 所有完整的下行文本帧必须留痕。
+             *
+             * 起因：官方服务器在拒绝一个会话时，可能先发一条**非标准 JSON 或纯文本**
+             * 再立刻发 CLOSE 帧。这类消息既没有能识别的 type，也没有 session_id，
+             * 原来的解析路径会静默 return —— 串口上就表现为"服务端什么都没说就断开"，
+             * 真实原因被观测盲区吃掉了。这里不解析、不判断，先原样打出来（截断 200
+             * 字节避免刷屏），把解释权交还给人。
+             *
+             * 拦截鉴权失败文本（服务端在鉴权失败时先发非 JSON 文本再关连接）。 */
+            ESP_LOGI(TAG, "下行文本帧 %u 字节：%.200s%s",
+                     (unsigned)s_ws_command_len, s_ws_command,
+                     s_ws_command_len > 200 ? "…（已截断）" : "");
+
             if (strstr(s_ws_command, "认证失败") != NULL) {
                 ESP_LOGE(TAG, "WebSocket 鉴权失败！请检查 Device-Id / Client-Id / Token 是否与 OTA 一致");
             }
@@ -1093,8 +1445,17 @@ static void video_upload_task(void *arg)
          (s_ws_config.token[0] == '\0' ||
           s_ws_config.device_id[0] == '\0' ||
           s_ws_config.client_id[0] == '\0'))) {
+#if defined(CONFIG_CLOUD_PROTOCOL_V3)
+        /* V3 协议下视频不走 WebSocket，由 MQTT 的 media.webrtc.* 驱动
+         * （阶段四）。这不是配置缺失，是设计如此，所以用 INFO 而不是 ERROR。 */
+        ESP_LOGI(TAG,
+                 "V3 协议：视频不需要 Agent WebSocket（走 MQTT media.webrtc.*，"
+                 "阶段四未实现），上传任务保持 IDLE");
+#else
         ESP_LOGE(TAG, "缺少 OTA WSS 地址、Token 或设备身份，视频不建立 WebSocket");
-        video_streamer_set_enabled(false);
+#endif
+        /* 没有可用控制通道就保持 IDLE（幂等：本来就 IDLE 时什么都不做）。 */
+        video_streamer_stop();
         for (;;) {
             unsigned dropped_index;
             if (xQueueReceive(s_out_ready, &dropped_index,
@@ -1126,9 +1487,18 @@ static void video_upload_task(void *arg)
         ws_config.crt_bundle_attach = esp_crt_bundle_attach;
     }
 
-    /* 构建自定义请求头：Device-Id、Client-Id、Authorization。 */
+    /* 构建自定义请求头：Device-Id、Client-Id、Authorization。
+     * 官方服务器还要求 Protocol-Version，且取值要与 Hello 体内的 version
+     * 一致（见 docs/websocket.md 第 2 节）。Lummiss 侧不需要该头，
+     * 因此只在官方模式下追加，保证原有握手报文一字不变。 */
     char ws_headers[1024] = {0};
     int header_off = 0;
+
+    if (VIDEO_OFFICIAL_SERVER_MODE) {
+        header_off += snprintf(ws_headers + header_off,
+                               sizeof(ws_headers) - header_off,
+                               "Protocol-Version: 1\r\n");
+    }
 
     if (!use_pc_preview && s_ws_config.device_id[0] != '\0') {
         header_off += snprintf(ws_headers + header_off,
@@ -1146,6 +1516,43 @@ static void video_upload_task(void *arg)
                                "Authorization: Bearer %s\r\n",
                                s_ws_config.token);
     }
+
+    if (VIDEO_OFFICIAL_SERVER_MODE) {
+        /* 握手身份自检，只打一次（官方模式重连间隔 10 s，次次打会刷屏）。
+         *
+         * 打印的值与上方拼进 ws_headers、随后赋给 ws_config.headers 的完全
+         * 同源 —— 即最终传入 esp_websocket_client_config_t 的字符串内容。
+         * Authorization 的值逐字符涂抹（长度保留）。
+         *
+         * test-token 判断的动机：实测官方下发的 token 长度=10，而
+         * "test-token" 恰好 10 字符 —— 若命中，说明官方给的是占位凭证，
+         * WS 应用层校验不过就被关，与「101 成功、280 ms 后 CLOSE、零下行」
+         * 的现象完全吻合。 */
+        static bool handshake_logged;
+        if (!handshake_logged) {
+            handshake_logged = true;
+            const char *tok = s_ws_config.token;
+            const size_t tok_len = strlen(tok);
+            char masked[80];
+            const size_t n = tok_len < sizeof(masked) - 1
+                               ? tok_len : sizeof(masked) - 1;
+            memset(masked, '*', n);
+            masked[n] = '\0';
+            ESP_LOGI(TAG, "XIAOZHI_WS: 实发 Header：");
+            ESP_LOGI(TAG, "XIAOZHI_WS:   Protocol-Version: 1");
+            ESP_LOGI(TAG, "XIAOZHI_WS:   Device-Id: %s", s_ws_config.device_id);
+            ESP_LOGI(TAG, "XIAOZHI_WS:   Client-Id: %s", s_ws_config.client_id);
+            ESP_LOGI(TAG, "XIAOZHI_WS:   Authorization: Bearer %s", masked);
+            ESP_LOGI(TAG,
+                     "XIAOZHI_WS: Token 长度=%u 是否test-token=%s "
+                     "含空格=%s 自带Bearer=%s",
+                     (unsigned)tok_len,
+                     strcmp(tok, "test-token") == 0 ? "是" : "否",
+                     strchr(tok, ' ') != NULL ? "是" : "否",
+                     strstr(tok, "Bearer") != NULL ? "是" : "否");
+        }
+    }
+
     if (header_off > 0) {
         ws_config.headers = ws_headers;
     }
@@ -1203,8 +1610,10 @@ static void video_upload_task(void *arg)
         }
         video_out_slot_t *slot = &s_out_slots[out_index];
 
-        /* 关闭期间清空已编码但尚未发送的旧帧，恢复后只发送新帧。 */
-        if (!video_streamer_is_enabled()) {
+        /* 关闭期间清空已编码但尚未发送的旧帧，恢复后只发送新帧。
+         * 官方服务器测试模式下再叠一道编译期拦截：WS 二进制帧只能装 Opus，
+         * 无论门控状态如何都不允许把 H.264 码流发出去。 */
+        if (VIDEO_OFFICIAL_SERVER_MODE || !video_streamer_is_enabled()) {
             xQueueSend(s_out_free, &out_index, portMAX_DELAY);
             continue;
         }
@@ -1277,6 +1686,8 @@ static void video_codec_task(void *arg)
     uint8_t *h264_input = esp_h264_aligned_calloc(
         VIDEO_WS_ALIGN, 1, VIDEO_H264_INPUT_SIZE, &aligned_input_size, ESP_H264_MEM_SPIRAM);
     esp_h264_enc_handle_t encoder = NULL;
+    /* 编码器参数句柄：重新开启视频后用它请求 IDR，见 s_force_idr 的说明。 */
+    esp_h264_enc_param_hw_handle_t encoder_param = NULL;
 #else
     uint8_t *h264_input = NULL;
     esp_h264_enc_handle_t encoder = NULL;
@@ -1294,6 +1705,11 @@ static void video_codec_task(void *arg)
         video_encoder_create(&encoder) != ESP_OK) {
         ESP_LOGE(TAG, "H.264 编码资源初始化失败");
         goto codec_fail;
+    }
+    /* 拿到参数句柄才能在重新开启视频时强制 IDR。拿不到不算致命错误：
+     * PC 端多等一个 GOP（1 秒）即可恢复。 */
+    if (esp_h264_enc_hw_get_param_hd(encoder, &encoder_param) != ESP_H264_ERR_OK) {
+        ESP_LOGW(TAG, "获取编码器参数句柄失败，重启视频后需等下一个 GOP 才能解码");
     }
 #endif
 
@@ -1602,6 +2018,17 @@ static void video_codec_task(void *arg)
             },
         };
 
+        /* 服务端重新开启视频后的第一帧强制 IDR：停止期间编码器的参考帧
+         * 已经失效，继续发 P 帧 PC 端只会花屏。请求在下一次编码生效，
+         * 非阻塞，不会拖慢本帧。 */
+        if (s_force_idr) {
+            s_force_idr = false;
+            if (encoder_param != NULL &&
+                esp_h264_enc_force_idr(&encoder_param->base) != ESP_H264_ERR_OK) {
+                ESP_LOGW(TAG, "强制 IDR 失败，PC 端需等下一个 GOP 才能解码");
+            }
+        }
+
         const int64_t encode_started_us = esp_timer_get_time();
         esp_h264_err_t encode_error =
             esp_h264_enc_process(encoder, &input_frame, &output_frame);
@@ -1798,6 +2225,30 @@ esp_err_t video_streamer_init(const video_streamer_config_t *config)
         return ESP_OK;
     }
 
+    /* 视频控制层放在最前面建：失败时还没有别的资源需要回收。
+     * 互斥锁 + 队列 + 任务只负责把启停请求串行化，本身不碰编码器。 */
+    s_ctrl_mutex = xSemaphoreCreateMutex();
+    if (s_ctrl_mutex == NULL) {
+        ESP_LOGE(TAG, "创建视频控制互斥锁失败");
+        return ESP_ERR_NO_MEM;
+    }
+    s_ctrl_queue = xQueueCreate(VIDEO_CTRL_QUEUE_DEPTH, sizeof(video_ctrl_cmd_t));
+    if (s_ctrl_queue == NULL) {
+        ESP_LOGE(TAG, "创建视频控制队列失败");
+        vSemaphoreDelete(s_ctrl_mutex);
+        s_ctrl_mutex = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    if (xTaskCreatePinnedToCore(video_ctrl_task, "video_ctrl", 3072, NULL, 5,
+                                &s_ctrl_task, VIDEO_UPLOAD_CORE) != pdPASS) {
+        ESP_LOGE(TAG, "创建视频控制任务失败");
+        vQueueDelete(s_ctrl_queue);
+        s_ctrl_queue = NULL;
+        vSemaphoreDelete(s_ctrl_mutex);
+        s_ctrl_mutex = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
     if (config != NULL && config->ws_url[0] != '\0') {
         memcpy(&s_ws_config, config, sizeof(s_ws_config));
         ESP_LOGI(TAG, "WebSocket 配置已接收（init 参数）：%s", s_ws_config.ws_url);
@@ -1853,6 +2304,12 @@ esp_err_t video_streamer_init(const video_streamer_config_t *config)
     }
 
     s_initialized = true;
+
+    /* 开机自检日志：明确说明视频没有自动开，避免把「看不见画面」当成故障。
+     * init 只建结构，不等于开启上传。 */
+    ESP_LOGI(TAG_CTRL, "initial state = %s",
+             video_streamer_state_name(video_streamer_get_state()));
+    ESP_LOGI(TAG, "video upload disabled, waiting for remote command");
     return ESP_OK;
 }
 

@@ -10,3 +10,7 @@ dependencies:
   espressif/esp_audio_codec: ~2.4.1
   espressif/esp_codec_dev: ~1.5.6
   espressif/esp-sr: ~2.3.0
+  # 官方 ESP-DL：提供 P4 可用的 COCO YOLO11n 模型和后处理。
+  espressif/esp-dl: ~3.3.6
+  # 官方 COCO YOLO11n 封装：提供 COCODetect、预处理和 NMS。
+  espressif/coco_detect: ~0.4.0

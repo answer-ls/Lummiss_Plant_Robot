@@ -17,6 +17,7 @@
 
 #include "camera_driver.h"
 #include "video_streamer.h"
+#include "person_detect.h"
 
 static const char *TAG = "CAMERA";
 
@@ -34,6 +35,7 @@ static const char *TAG = "CAMERA";
 #define CAMERA_USB_ALL_FREE        BIT3
 #define CAMERA_USB_EVENTS_EXITED   BIT4
 #define CAMERA_HANDOFF_IDLE        BIT5
+#define CAMERA_READY_BIT           BIT0
 #define CAMERA_USB_EVENTS_PRIORITY 19
 #define CAMERA_UVC_DRIVER_PRIORITY 20
 #define CAMERA_USB_CORE             0
@@ -73,6 +75,8 @@ static const char *TAG = "CAMERA";
 #endif
 
 static EventGroupHandle_t s_camera_events;
+static EventGroupHandle_t s_camera_ready_events;
+static bool s_camera_ready_announced;
 static portMUX_TYPE s_stats_lock = portMUX_INITIALIZER_UNLOCKED;
 static uvc_host_frame_info_t s_camera_formats[MAX_CAMERA_FORMATS];
 static size_t s_camera_format_count;
@@ -107,6 +111,45 @@ typedef struct {
 } camera_stats_t;
 
 static camera_stats_t s_stats;
+
+static void camera_log_memory(const char *stage)
+{
+    ESP_LOGI(TAG,
+             "MEM[%s]: DMA free=%u largest=%u INT free=%u largest=%u "
+             "PSRAM free=%u largest=%u",
+             stage,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+}
+
+esp_err_t camera_driver_prepare_ready_event(void)
+{
+    if (s_camera_ready_events == NULL) {
+        s_camera_ready_events = xEventGroupCreate();
+        if (s_camera_ready_events == NULL) {
+            ESP_LOGE(TAG, "创建 CAMERA_READY 事件失败");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    s_camera_ready_announced = false;
+    xEventGroupClearBits(s_camera_ready_events, CAMERA_READY_BIT);
+    return ESP_OK;
+}
+
+bool camera_driver_wait_ready(uint32_t timeout_ms)
+{
+    if (s_camera_ready_events == NULL) {
+        return false;
+    }
+    const EventBits_t bits = xEventGroupWaitBits(
+        s_camera_ready_events, CAMERA_READY_BIT, pdFALSE, pdTRUE,
+        timeout_ms == UINT32_MAX ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms));
+    return (bits & CAMERA_READY_BIT) != 0;
+}
 
 static void camera_record_frame_callback_time(int64_t started_us)
 {
@@ -494,6 +537,9 @@ static void camera_handoff_task(void *arg)
                                                __ATOMIC_ACQUIRE);
         bool retained = false;
         if (accepting) {
+            /* AI 只在 handoff 任务中抽取快照，绝不在 UVC 回调中运行或阻塞。
+             * person_detect 内部每秒最多复制一帧，忙时直接丢弃旧画面。 */
+            (void)person_detect_submit_mjpeg(item.copy->data, item.copy->data_len);
             retained = video_streamer_submit_jpeg_owned(
                 item.copy->data, item.copy->data_len,
                 camera_release_frame_copy, item.copy);
@@ -885,10 +931,16 @@ void camera_driver_run(void)
         ESP_LOGE(TAG, "初始化 H.264 实时流失败：%s",
                  esp_err_to_name(streamer_error));
     } else {
-        /* 先保留 UVC 采集，关闭 H.264 编码和视频上传，便于单独验证音频链路。 */
-        video_streamer_set_enabled(CAMERA_VIDEO_STREAM_ENABLED != 0);
-        ESP_LOGI(TAG, "视频传输%s（UVC 采集仍保持运行）",
-                 CAMERA_VIDEO_STREAM_ENABLED ? "已启用" : "已关闭");
+        /* 这里只初始化，不开启上传：开机默认 IDLE，必须等服务端下发
+         * VIDEO_START（见 video_streamer.h 的「按需视频流」说明）。
+         * UVC 采集照常运行，只是帧不再进入 H.264 流水线。
+         * 调试时可以打开 CAMERA_VIDEO_STREAM_AUTOSTART 跳过服务端命令。 */
+#if CAMERA_VIDEO_STREAM_AUTOSTART
+        video_streamer_start();
+        ESP_LOGI(TAG, "视频编码与上传：调试开关强制开启");
+#else
+        ESP_LOGI(TAG, "视频编码与上传：关闭，等待服务端 VIDEO_START（UVC 采集保持运行）");
+#endif
     }
 #endif
 
@@ -1038,6 +1090,10 @@ void camera_driver_run(void)
 #endif
         }
 
+        ESP_LOGI(TAG, "UVC stream open OK：%ux%u %s @ %.2f FPS",
+                 selected.h_res, selected.v_res,
+                 camera_format_name(selected.format), stream_fps);
+        camera_log_memory("UVC_OPEN");
         s_camera_stream = stream;
 
         portENTER_CRITICAL(&s_stats_lock);
@@ -1058,6 +1114,14 @@ void camera_driver_run(void)
             if (first_frame_ok) {
                 ESP_LOGI(TAG, "UVC 本次启动成功：首帧耗时 %u ms",
                          first_frame_elapsed_ms);
+                if (!s_camera_ready_announced) {
+                    s_camera_ready_announced = true;
+                    camera_log_memory("CAM_READY");
+                    ESP_LOGI(TAG, "CAMERA_READY：UVC stream open 成功且已收到第一帧有效 MJPEG");
+                    if (s_camera_ready_events != NULL) {
+                        xEventGroupSetBits(s_camera_ready_events, CAMERA_READY_BIT);
+                    }
+                }
             } else {
                 /* 首帧失败只保留一条摘要；详细 UVC 测试计数暂不刷屏。 */
                 ESP_LOGW(TAG, "UVC 本次启动失败：%u ms 内没有有效帧",

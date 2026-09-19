@@ -1,0 +1,7 @@
+dependencies:
+  idf: ">=5.5.3,<6.0"
+  # WS2812 驱动：IDF 核心不含 led_strip，由组件管理器拉取。3.x 走新的 RMT TX
+  # 驱动（driver/rmt_tx.h），要求 IDF >= 5.0；首次构建会联网下载，之后落进
+  # managed_components/。
+  espressif/led_strip:
+    version: "~3.0.0"

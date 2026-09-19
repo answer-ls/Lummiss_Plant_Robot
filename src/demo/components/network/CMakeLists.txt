@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "network_manager.c"
         "wifi_manager.c"
+        "time_service.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_event
@@ -11,4 +12,5 @@ idf_component_register(
         esp_wifi_remote
         esp_hosted
         provisioning
-        nvs_flash)
+        nvs_flash
+        ambient_led)

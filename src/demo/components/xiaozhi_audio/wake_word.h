@@ -13,10 +13,19 @@ extern "C" {
 
 typedef void (*wake_word_callback_t)(const char *wake_word, void *user_data);
 
+/* AFE 生产/消费诊断计数，计数器为累计值。 */
+typedef struct {
+    uint32_t feed_count;
+    uint32_t fetch_count;
+    uint32_t fetch_null_count;
+    uint32_t feed_fail;
+    uint32_t wake_detect_count;
+} wake_word_stats_t;
+
 /**
  * @brief 初始化 AFE 唤醒词引擎。
  *
- * 调用前需确保 SPIFFS 已挂载，"model" 分区中存在 Wakenet 模型文件。
+ * 调用前需确保 SPIFFS 已挂载，"storage" 分区中存在 Wakenet 模型文件。
  * 该函数会加载模型、创建 AFE 实例并启动内部检测任务。
  *
  * @param channels      麦克风声道数（通常为 1）
@@ -66,6 +75,9 @@ size_t wake_word_get_feed_size(void);
  * @param count  样本数量
  */
 void wake_word_feed(const int16_t *data, size_t count);
+
+/** @brief 读取 AFE feed/fetch/WakeNet 诊断计数。 */
+void wake_word_get_stats(wake_word_stats_t *stats);
 
 /**
  * @brief 查询是否已检测到唤醒词。

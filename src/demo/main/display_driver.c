@@ -169,6 +169,23 @@ static void update_home_screen(lv_timer_t *timer)
         return;
     }
 
+    /* 只在有效/无效翻转时各打一行：串口可以直接看出 UI 到底有没有
+     * 拿到时间与天气，不用盯着屏幕猜。 */
+    static int last_time_state = -1;
+    static int last_weather_state = -1;
+    const int time_state = info.time_valid ? 1 : 0;
+    const int weather_state = info.weather_valid ? 1 : 0;
+    if (time_state != last_time_state) {
+        last_time_state = time_state;
+        ESP_LOGI(TAG, "首页时间：%s",
+                 time_state ? "已显示真实时间" : "等待网络校时，暂显示占位符");
+    }
+    if (weather_state != last_weather_state) {
+        last_weather_state = weather_state;
+        ESP_LOGI(TAG, "首页天气：%s",
+                 weather_state ? "已显示实时天气" : "等待天气接口，暂显示「获取中」");
+    }
+
     if (info.time_valid && info.weekday >= 0 && info.weekday < 7) {
         lv_label_set_text_fmt(s_date_label, "%02d月%02d日 %s",
                               info.month, info.day, weekdays[info.weekday]);

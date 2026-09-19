@@ -12,6 +12,7 @@
 
 #include "provisioning_manager.h"
 #include "wifi_manager.h"
+#include "ambient_led.h"
 
 static const char *TAG = "NETWORK";
 
@@ -34,12 +35,14 @@ static void network_provisioning_event_callback(provisioning_event_t event,
     case PROVISIONING_EVENT_STARTED:
         s_provisioning_active = true;
         s_network_state = NETWORK_STATE_PROVISIONING;
+        ambient_led_set_state(AMBIENT_LED_STATE_NETWORK_CONNECTING);
         xEventGroupClearBits(s_network_events, NETWORK_CONNECTED_BIT);
         ESP_LOGI(TAG, "等待 App 通过 BLE 下发 Wi-Fi 凭据");
         break;
 
     case PROVISIONING_EVENT_CREDENTIALS_RECEIVED:
         s_network_state = NETWORK_STATE_CONNECTING;
+        ambient_led_set_state(AMBIENT_LED_STATE_NETWORK_CONNECTING);
         ESP_LOGI(TAG, "正在验证 App 下发的 Wi-Fi 凭据");
         break;
 
@@ -48,10 +51,12 @@ static void network_provisioning_event_callback(provisioning_event_t event,
          * 服务真正结束后再设置，确保视频链路不会与配网 BLE 同时启动。 */
         wifi_manager_set_auto_reconnect_enabled(true);
         s_network_state = NETWORK_STATE_CONNECTED;
+        ambient_led_set_state(AMBIENT_LED_STATE_WAKE_IDLE);
         break;
 
     case PROVISIONING_EVENT_FAILED:
         s_network_state = NETWORK_STATE_PROVISIONING;
+        ambient_led_set_state(AMBIENT_LED_STATE_ERROR);
         break;
 
     case PROVISIONING_EVENT_STOPPED:
@@ -62,6 +67,7 @@ static void network_provisioning_event_callback(provisioning_event_t event,
             ESP_LOGI(TAG, "BLE 已关闭，网络业务可以启动");
         } else {
             s_network_state = NETWORK_STATE_DISCONNECTED;
+            ambient_led_set_state(AMBIENT_LED_STATE_ERROR);
         }
         break;
     }
@@ -76,6 +82,7 @@ static void network_wifi_event_callback(wifi_manager_event_t event,
     switch (event) {
     case WIFI_MANAGER_EVENT_CONNECTING:
         s_network_state = NETWORK_STATE_CONNECTING;
+        ambient_led_set_state(AMBIENT_LED_STATE_NETWORK_CONNECTING);
         ESP_LOGI(TAG, "正在通过 ESP32-C6 连接 WiFi");
         break;
 
@@ -85,6 +92,7 @@ static void network_wifi_event_callback(wifi_manager_event_t event,
         }
         s_has_ip = true;
         s_network_state = NETWORK_STATE_CONNECTED;
+        ambient_led_set_state(AMBIENT_LED_STATE_WAKE_IDLE);
         if (!s_provisioning_active) {
             xEventGroupSetBits(s_network_events, NETWORK_CONNECTED_BIT);
         }
@@ -98,6 +106,9 @@ static void network_wifi_event_callback(wifi_manager_event_t event,
         s_network_state = s_provisioning_active
                               ? NETWORK_STATE_PROVISIONING
                               : NETWORK_STATE_DISCONNECTED;
+        ambient_led_set_state(s_provisioning_active
+                                  ? AMBIENT_LED_STATE_NETWORK_CONNECTING
+                                  : AMBIENT_LED_STATE_ERROR);
         xEventGroupClearBits(s_network_events, NETWORK_CONNECTED_BIT);
         ESP_LOGW(TAG, "网络断开，C6 reason=%u，等待自动重连",
                  data != NULL ? data->disconnect_reason : 0);
