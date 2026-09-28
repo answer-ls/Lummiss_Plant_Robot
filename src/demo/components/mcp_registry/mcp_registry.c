@@ -30,7 +30,9 @@ esp_err_t mcp_registry_register(const mcp_tool_t *tool)
         return ESP_ERR_NO_MEM;
     }
     s_tools[s_count++] = *tool;
-    ESP_LOGI(TAG, "MCP %s：%s", tool->handler != NULL ? "工具" : "声明（未实现）",
+    ESP_LOGI(TAG, "MCP %s：%s",
+             (tool->handler != NULL || tool->async_handler != NULL)
+                 ? "工具" : "声明（未实现）",
              tool->name);
     return ESP_OK;
 }
@@ -49,7 +51,7 @@ size_t mcp_registry_ready_count(void)
 {
     size_t ready = 0;
     for (size_t i = 0; i < s_count; i++) {
-        if (s_tools[i].handler != NULL) {
+        if (s_tools[i].handler != NULL || s_tools[i].async_handler != NULL) {
             ready++;
         }
     }
@@ -72,7 +74,7 @@ esp_err_t mcp_registry_build_capability_manifest(char *buf, size_t buf_size)
 
     bool first = true;
     for (size_t i = 0; i < s_count; i++) {
-        if (s_tools[i].handler == NULL) {
+        if (s_tools[i].handler == NULL && s_tools[i].async_handler == NULL) {
             continue;   /* 未实现的工具不对服务端宣称（用户规格） */
         }
         w = snprintf(buf + off, buf_size - off, "%s\"%s\"",

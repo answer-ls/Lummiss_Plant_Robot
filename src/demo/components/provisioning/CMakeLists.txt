@@ -5,6 +5,7 @@ idf_component_register(
         device_identity
         esp_event
         esp_wifi
+        espressif__esp_hosted
         nvs_flash
         protocomm
         espressif__network_provisioning)

@@ -16,6 +16,7 @@
 #include "esp_partition.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
 #include "freertos/idf_additions.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -42,6 +43,8 @@ static constexpr float PERSON_SCORE_THRESHOLD = 0.45F;//置信度
 static constexpr uint32_t TASK_STACK_SIZE = 16384U;
 static constexpr UBaseType_t TASK_PRIORITY = 4U;
 static constexpr BaseType_t TASK_CORE = 1;
+static constexpr EventBits_t MODEL_READY_BIT = BIT0;
+static constexpr EventBits_t MODEL_FAILED_BIT = BIT1;
 
 typedef struct {
     size_t size;
@@ -49,6 +52,8 @@ typedef struct {
 
 static QueueHandle_t s_queue;
 static TaskHandle_t s_task;
+static StaticEventGroup_t s_startup_event_storage;
+static EventGroupHandle_t s_startup_events;
 static uint8_t *s_jpeg_input;
 static size_t s_jpeg_allocated;
 static uint8_t *s_rgb565;
@@ -245,6 +250,7 @@ static void person_detect_task(void *arg)
         ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "model");
     if (model_partition == nullptr) {
         ESP_LOGE(TAG, "model partition not found");
+        xEventGroupSetBits(s_startup_events, MODEL_FAILED_BIT);
         s_initialized.store(false);
         release_runtime_resources();
         vTaskDelete(NULL);
@@ -262,6 +268,7 @@ static void person_detect_task(void *arg)
         COCODetect::YOLO11N_320_S8_V1, false);
     if (detector == nullptr) {
         ESP_LOGE(TAG, "model load failed");
+        xEventGroupSetBits(s_startup_events, MODEL_FAILED_BIT);
         s_initialized.store(false);
         release_runtime_resources();
         vTaskDelete(NULL);
@@ -277,6 +284,7 @@ static void person_detect_task(void *arg)
     jpeg_decoder_handle_t decoder = nullptr;
     if (jpeg_new_decoder_engine(&engine_cfg, &decoder) != ESP_OK) {
         ESP_LOGE(TAG, "创建 AI JPEG 硬件解码引擎失败");
+        xEventGroupSetBits(s_startup_events, MODEL_FAILED_BIT);
         delete detector;
         s_initialized.store(false);
         release_runtime_resources();
@@ -289,6 +297,8 @@ static void person_detect_task(void *arg)
         .rgb_order = JPEG_DEC_RGB_ELEMENT_ORDER_RGB,
         .conv_std = JPEG_YUV_RGB_CONV_STD_BT601,
     };
+    /* 模型的临时加载内存已经释放，允许天气 HTTPS 再启动。 */
+    xEventGroupSetBits(s_startup_events, MODEL_READY_BIT);
     queued_frame_t queued = {};
     int64_t last_stats_us = esp_timer_get_time();
     bool first_inference_logged = false;
@@ -442,6 +452,14 @@ extern "C" esp_err_t person_detect_init(void)
         return ESP_ERR_INVALID_STATE;
     }
 
+    if (s_startup_events == nullptr) {
+        s_startup_events = xEventGroupCreateStatic(&s_startup_event_storage);
+        if (s_startup_events == nullptr) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    xEventGroupClearBits(s_startup_events, MODEL_READY_BIT | MODEL_FAILED_BIT);
+
     const jpeg_decode_memory_alloc_cfg_t input_cfg = {
         .buffer_direction = JPEG_DEC_ALLOC_INPUT_BUFFER,
     };
@@ -516,6 +534,20 @@ extern "C" esp_err_t person_detect_init(void)
     ESP_LOGI(TAG, "本地人体检测已启用：每 %u ms 抽帧，阈值=%.2f",
              SNAPSHOT_INTERVAL_MS, PERSON_SCORE_THRESHOLD);
     return ESP_OK;
+}
+
+extern "C" esp_err_t person_detect_wait_startup(uint32_t timeout_ms)
+{
+    if (s_startup_events == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const EventBits_t bits = xEventGroupWaitBits(
+        s_startup_events, MODEL_READY_BIT | MODEL_FAILED_BIT,
+        pdFALSE, pdFALSE, pdMS_TO_TICKS(timeout_ms));
+    if ((bits & MODEL_READY_BIT) != 0) {
+        return ESP_OK;
+    }
+    return (bits & MODEL_FAILED_BIT) != 0 ? ESP_FAIL : ESP_ERR_TIMEOUT;
 }
 
 extern "C" bool person_detect_submit_mjpeg(const uint8_t *data, size_t size)

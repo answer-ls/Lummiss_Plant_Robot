@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "esp_app_desc.h"
+#include "cJSON.h"
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
@@ -209,7 +210,7 @@ esp_err_t ota_client_check(ota_result_t *result)
     char elf_sha256[65] = {0};
     esp_app_get_elf_sha256(elf_sha256, sizeof(elf_sha256));
     /* capability_manifest 从 mcp_registry 运行时生成 —— 与 tools/list、
-     * tools/call、hello v3 同源；只包含已实现（handler != NULL）的能力。 */
+     * tools/call、hello v3 同源；只包含已有同步或异步处理器的能力。 */
     char manifest[512];
     if (mcp_registry_build_capability_manifest(manifest, sizeof(manifest)) !=
         ESP_OK) {
@@ -286,6 +287,23 @@ esp_err_t ota_client_check(ota_result_t *result)
              ota_json_field_exists(ota_buffer, "activation") ? "存在" : "缺少",
              ota_json_field_exists(ota_buffer, "error") ? "存在" : "缺少");
 
+    /* 服务端业务错误也可能以 HTTP 200 + code/msg 返回。先识别该错误，
+     * 避免把 Redis 等后端故障误报为设备端缺少 MQTT 配置。 */
+    if (ota_json_field_exists(ota_buffer, "code")) {
+        const int64_t service_code = ota_json_get_int64(ota_buffer, "code");
+        if (service_code != 0) {
+            char service_msg[96] = {0};
+            (void)ota_json_get_string(ota_buffer, "msg", service_msg,
+                                      sizeof(service_msg));
+            snprintf(result->error, sizeof(result->error),
+                     "OTA 服务端业务错误 code=%" PRId64 " msg=%.64s",
+                     service_code, service_msg[0] ? service_msg : "未提供");
+            result->has_error = true;
+            ESP_LOGE(TAG, "%s", result->error);
+            return ESP_FAIL;
+        }
+    }
+
     if (ota_json_field_exists(ota_buffer, "error")) {
         char err_msg[256] = {0};
         if (ota_json_get_string(ota_buffer, "error",
@@ -324,16 +342,27 @@ esp_err_t ota_client_check(ota_result_t *result)
      * server_time / firmware / activation，不带 websocket 段。原来的顺序是先做
      * websocket 校验、缺 url 就 return，于是激活码这条最关键的信息永远打不出来，
      * 排查时只能看到一句「OTA 响应中缺少 websocket.url」。这里把它提前。 */
-    if (ota_json_field_exists(ota_buffer, "activation")) {
+    /* 限定读取 activation 对象，避免误取顶层状态 code 或其它对象中的字段。 */
+    cJSON *activation_root = cJSON_Parse(ota_buffer);
+    const cJSON *activation = cJSON_GetObjectItemCaseSensitive(activation_root, "activation");
+    if (cJSON_IsObject(activation)) {
         result->has_activation = true;
-        ota_json_get_string(ota_buffer, "code",
-                             result->activation_code, sizeof(result->activation_code));
-        ota_json_get_string(ota_buffer, "message",
-                             result->activation_message,
-                             sizeof(result->activation_message));
+        const cJSON *code = cJSON_GetObjectItemCaseSensitive(activation, "code");
+        const cJSON *message = cJSON_GetObjectItemCaseSensitive(activation, "message");
+        if (cJSON_IsString(code)) {
+            /* 超长值不截断，交由显示层报告无有效绑定码。 */
+            if (strlen(code->valuestring) < sizeof(result->activation_code))
+                strcpy(result->activation_code, code->valuestring);
+        } else if (cJSON_IsNumber(code) && code->valuedouble >= 100000 &&
+                   code->valuedouble <= 999999 && code->valuedouble == code->valueint) {
+            snprintf(result->activation_code, sizeof(result->activation_code), "%d", code->valueint);
+        }
+        if (cJSON_IsString(message))
+            snprintf(result->activation_message, sizeof(result->activation_message), "%s", message->valuestring);
         ESP_LOGW(TAG, "设备未激活。激活码：%s，提示：%.64s",
                  result->activation_code, result->activation_message);
     }
+    cJSON_Delete(activation_root);
 
     /* C1. websocket 段（旧协议通道）
      *

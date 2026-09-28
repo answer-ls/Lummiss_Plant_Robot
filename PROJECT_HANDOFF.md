@@ -1,10 +1,14 @@
 # Lummiss 盆栽陪伴机器人项目交接说明
 
-更新时间：2026-09-18
+更新时间：2026-09-23
 
 ## 1. 当前结论
 
 项目目前处于“基础工程 + 硬件可行性验证”阶段，还没有形成产品最小闭环。
+
+- **2026-09-23 新PCB TF卡仍待解决**：ESP32-P4 v3.1、ESP-IDF v5.5.5、SDSPI SPI2（CLK42/MOSI43/MISO41/CS44，1 MHz）。SDSC 120 MiB 可挂载 FAT32、重复读取正常；档位10的短文件测试在新建 `/sdcard/SDF001.TXT` 时前三笔 CMD24 成功，第四笔 LBA7420（FAT 区）R1=0、Data Response=0xE5（ACCEPTED），随后 CS 持续低、发送约84.5万时钟但 Busy 连续5秒为0x00，`fclose` 失败。此前失败 LBA 也出现过33、6492、40008等，并非固定扇区；Raw CMD24 曾成功连续写入并回读20笔，也曾复现同样Busy超时。此次超时释放CS后约10ms的CMD13/CMD17以及软件重新初始化均成功，早先另一次测试则未恢复，故不能笼统称卡不可恢复。尚不能宣称SD写入可用。档位10现已启用；新增 `WRITE_TIMEOUT_READBACK` 用于判断超时写入是否实际落卡，待烧录复测。
+- **2026-09-23 SD 最新诊断**：raw CMD24 在 LBA39450 的写前哈希为 `0x3b4713c5`、发送及写后回读哈希均为 `0xf231c1c5`，证明超时写入的数据确实可回读；CMD13 的 R1/R2 均为 0。但另一次启动把同一接口识别为 SDSC 8 MiB（16384 扇区），LBA0/32/33 均以 `Chips...` 开头，非此前 120 MiB FAT32 内容，挂载报 `FR_NO_FILESYSTEM`，因此 CS 释放实验尚未真正执行。实验版现只在 raw 单块写入时于 100 ms Busy 后拉高 CS，分阶段重新选卡检查 Ready；普通 FATFS 路径不变。新增仅实验档位使用的 5 次有限挂载重试及 245760 扇区身份门禁；未识别到原 FAT32 卡时禁止 raw 写入。代码已构建，待用户自行烧录复测。
+- **2026-09-23 新PCB Wi-Fi 测试通过**：C6 已烧录与主机匹配的 ESP-Hosted 2.7.4 从机固件；P4档位11的 SDIO/Wi-Fi Remote 正常。补齐 C6 蓝牙控制器初始化、启用，并把 NimBLE MTU 提至517后，BLE广播和Security 2配网可用；Windows官方CLI的系统配对失败由项目内无配对启动脚本绕过。最终收到 Wi-Fi 凭据、DHCP 获取 `192.168.1.60` 并报告“WiFi 联网成功”。档位11在用户手动配网完成前120秒报超时是测试等待期限，不代表后续联网失败。当前切回档位10专测SD，Wi-Fi在该档位关闭。
 
 - 阶段 1 已建立正式基础入口：`main.c` 使用 FreeRTOS 创建 UI Task 和 Camera Task，Network Manager 已负责 NVS 基础初始化。
 - 阶段 2 已完成 ST7789、LVGL 8.4 和动态时间首页代码及构建。首页使用网络校时、IP 自动定位与 Open-Meteo 天气 API，显示日期、星期、天气、温度和大号时间；电量留到电池管理阶段。镜像参数已修正，动态数据和屏幕效果仍待实机验证。
@@ -20,6 +24,7 @@
 - **2026-09-18 人机交互外设驱动层落地**：新增 `components/mech_button`（机械按键 GPIO22）、`components/touch_key`（两路 TTP223 触摸 GPIO52/51，当普通数字 GPIO 读，不走 P4 内部触摸外设）、`components/ambient_led`（两路 WS2812 氛围灯 GPIO20/21，RMT 后端），并新增档位 9 `CAMERA_TEST_PERIPH_ONLY`（UVC + 外设自检）与 `main/peripheral_test.c` 自检入口。构建通过、档位 9 已在开发板实机运行：**未干扰 UVC**（complete 29.8～30.2 FPS、drop 0.0%、handoff rejected 0），开机静默期自检**无幽灵输入事件**。**这三组引脚的物理接线只属于将来要打的新 PCB**，开发板上并无对应接线（详见第 6A 节）。
 - **2026-09-18 视频上传改为按需开启**：删掉了两处「开机自动开视频」的默认值 —— `video_streamer.c` 的 `s_stream_enabled = true`（编译期就开着）和 `camera_driver.c` 里基于 `CAMERA_VIDEO_STREAM_ENABLED = 1` 的强制启用（摄像头初始化完就调 `set_enabled`）。现在开机默认 `IDLE`：WiFi、WebSocket、Hello、小智音频全部照常，但**不上传任何 H.264**；必须等服务端下发 `{"type":"video","state":"start"}` 才进入 `STREAMING`。停止、断线自动停、重连不自动恢复，详见第 7A 节。
 - **2026-09-18 云端通信迁移到三通道协议（阶段一、二已实机打通）**：后端已从「OTA + 单条 Agent WebSocket」迁到 MQTT 控制 + UDP Opus 音频 + WebRTC 视频。固件按编译开关 `CONFIG_CLOUD_PROTOCOL_V3`（默认，`main/Kconfig.projbuild`）切换：OTA 取 MQTT 六字段 → MQTT hello v3 → Server Hello（session_id + UDP 参数）→ **UDP + AES-128-CTR 双向 Opus**。旧 Agent WebSocket 在 V3 下完全不建立；`CONFIG_CLOUD_PROTOCOL_LEGACY_WS` 保留旧协议仅作回滚。实机已验证：全双工对话（`tx=258 rx=213` 零错、`SPK frames=213`）、MCP 握手 + 工具调用（音量控制）、多轮自动对话。**WebRTC（阶段四）未实现**；协议细节与踩坑见第 8A 节。
+- **2026-09-22 WebRTC/内存最新状态（覆盖上条“WebRTC 未实现”的旧结论）**：LiveKit WHIP 单向 H.264、non-trickle ICE、DTLS-SRTP、`media.webrtc.start/stop` 已落地；UDP 音频主路径已支持 AES-128-GCM，CTR 仅保留兼容。最新实机已完成 WHIP HTTP 201、Remote SDP、ICE selected pair 与 DTLS/SRTP 建链，但在进入 STREAMING 后创建 1280×720 H.264 encoder 时失败。根因是官方 H.264 组件需要至少 92,167 B 连续 INTERNAL reference frame，而 `MEM[AFTER_DTLS]` 的 largest 只有 90,112 B，差约 2,055 B。详细日志、已完成的内存优化和下一步见 8B 节。
 - UI 状态机、传感器、电机、专注模式、电源管理和整机联调均未进入实现阶段；触摸与氛围灯已有驱动层，但尚未接 App Event Bus / 业务状态，也缺少实物（按键 / TTP223 模块 / 灯带）验收。
 
 开发流程基线为根目录的 `盆栽陪伴机器人_开发文档.md`。本文只记录当前事实和下一步，不替代该设计文档。
@@ -760,8 +765,8 @@ exp_01/03/04/06/07 五张**帧数、帧延时、首帧全都一样**，按文件
 | --- | --- | --- |
 | HTTPS OTA | 配置、MQTT 六字段、固件 | ✅ 验证通过 |
 | MQTT/TCP 1883 | AI hello、MCP、控制、状态、RTC 信令（**不传音视频帧**） | ✅ 验证通过 |
-| UDP 8884 + AES-128-CTR | AI 对话 Opus 双向 | ✅ 验证通过（喇叭出声） |
-| WebRTC/DTLS-SRTP | H.264 视频 | ❌ 阶段四未实现 |
+| UDP 8884 + AES-128-GCM（CTR 兼容） | AI 对话 Opus 双向 | ✅ GCM 已实现，继续做与推流共存长测 |
+| LiveKit WHIP / ICE / DTLS-SRTP | 1280×720@20 H.264 单向视频 | 🟡 WHIP/ICE/DTLS 已通，H.264 reference frame 连续内存不足 |
 
 固件协议选择：`main/Kconfig.projbuild` 的 `choice CLOUD_PROTOCOL` ——
 `CONFIG_CLOUD_PROTOCOL_V3`（默认）/ `CONFIG_CLOUD_PROTOCOL_LEGACY_WS`（仅回滚）。
@@ -837,6 +842,259 @@ tools/call（音量控制实测可用）；LVGL 不再因内存不足重启。
 3. **表情素材仍未拷入 SD 卡**：`/sdcard/expressions/exp_01..08.bin`
    （源文件在 `src/demo/tools/gif/`）。emotion 触发已验证，只差素材文件。
 4. 旧协议回滚：Kconfig 选 `LEGACY_WS` 重建即可；相关代码全部保留未删。
+
+## 8B. 2026-09-22 LiveKit WHIP 与内存优化交接
+
+> 本节覆盖 8A 中“WebRTC 尚未实现”和旧 MQTT P2P RTC 信令的历史描述。
+> 当前正式方案为 LiveKit WHIP：设备生成 Offer，ICE gathering 完成后 HTTPS POST
+> 服务端原样下发的 `publishUrl`，再由 ICE + DTLS-SRTP 传输单向 H.264。
+
+### 8B.1 当前链路与启停条件
+
+```text
+media.webrtc.start
+    ↓（MCP 回调只校验、复制、入队）
+webrtc_whip_task
+    ↓
+等待 CAMERA_READY + SD_INIT_DONE
+    ↓
+停止表情并释放动画临时资源
+    ↓
+PeerConnection + H.264 Track + Offer
+    ↓
+ICE gathering complete
+    ↓
+WHIP POST → HTTP 201 + SDP Answer
+    ↓
+ICE selected pair → DTLS-SRTP
+    ↓
+video_streamer 打开 H.264 encoder
+    ↓
+1280×720@20 H.264 → WebRTC Track
+```
+
+摄像头由现有 UVC 驱动持续采集，WebRTC stop 不关闭 Camera。当前保持
+`CAMERA_PERSON_DETECT_ENABLED=0`，先完成 Camera + H.264 + Audio + LVGL + WHIP 验证。
+
+### 8B.2 本轮已经落地的内存调整
+
+1. LVGL partial draw buffer 已继续做 A/B：从 `3200 B ×2`（5 行）降为
+   `1920 B ×2`（3 行双缓冲），比 5 行版本再释放 2,560 B INTERNAL+DMA；
+   LVGL task 7168 B stack 已放入 PSRAM。实机 stack high-water 为 `5012 bytes`，
+   当前不再盲目缩栈。
+2. V3 视频输入删除 `VIDEO_MJPEG 512 KB ×3` 重复 backing，直接持有 Camera handoff
+   共享槽并在处理后归还。
+3. Camera handoff 改为引用计数，当前 `512 KB PSRAM ×3`，由 Video/Photo 共享。
+   `PHOTO_JPEG` 不再永久或临时新申请 512 KB，而是保存完成后归还共享槽。
+4. 动画 `RGB565 150 KB ×3` 和 `ANIM_SD_READ 4 KB INTERNAL+DMA` 改为播放期间按需
+   申请；WHIP 前强制回 HOME 并等待资源释放。
+5. V3 不再创建废弃的 `VIDEO_AUDIO_Q`，音频继续走 `cloud_udp`。
+6. H.264 encoder 改为状态切到 `STARTING` 时通知 `video_codec` 单次 open，成功后才
+   打开帧提交门控，stop 后 close；首帧路径不再创建 encoder。官方组件的 reference
+   frame 内存属性没有修改。
+7. UVC URB/frame 配置与 Audio capture DMA 保持不变。
+8. 新增启动后约 4 秒的 `MEM[IDLE_STABLE]`，排除 main task 未退出造成的假低内存。
+
+### 8B.3 当前内存诊断点
+
+WHIP 路径会打印以下 free/largest：
+
+```text
+MEM[WHIP_BEFORE_BEGIN_PEER]
+MEM[BEFORE_PEER]
+MEM[AFTER_PEER_OPEN]
+MEM[AFTER_TRACK]
+MEM[AFTER_OFFER]
+MEM[AFTER_ICE]
+MEM[AFTER_REMOTE_SDP]
+MEM[AFTER_DTLS]
+MEM[AFTER_WHIP_HTTP_FREE]
+MEM[BEFORE_H264_OPEN]
+MEM[AFTER_H264_OPEN]
+MEM[STREAMING]
+```
+
+当前人为设置的安全目标为：WHIP 前 INTERNAL free ≥50 KB、largest ≥24～32 KB，
+DMA free ≥20 KB、largest ≥16 KB。它们是项目余量目标，不是 ESP-IDF 的硬阈值。
+
+最新启动稳定值：
+
+```text
+MEM[IDLE_STABLE]
+DMA      free=128655  largest=110592
+INTERNAL free=168247  largest=110592
+PSRAM    free=22853272 largest=22544384
+
+UVC complete=约30 FPS
+UVC drop=0.0%
+handoff rejected=0
+AFE feed/fetch 持续同步增长
+```
+
+说明 LVGL/动画/重复 MJPEG 等调整有效，WHIP 启动前已不缺 INTERNAL/DMA。
+
+### 8B.4 2026-09-22 最新 WHIP 实机结果
+
+设备运行的 ELF SHA 前缀为 `436d9da1b`，与本地最新 build 一致。MCP 已收到并接受：
+
+```text
+tools/call media.webrtc.start -> accepted=true
+video=1280x720@20 audio=false
+```
+
+WHIP 和网络部分全部成功：
+
+```text
+WHIP response HTTP=201
+REMOTE_SDP app_parse video_mid=0
+remote candidates=2，60.210.30.199:7885/udp
+binding request/response 成功
+ICE selected pair=60.210.30.199:7885
+DTLS handshake success
+SRTP connected OK
+state CONNECTING -> STREAMING
+```
+
+因此当前故障**不在服务端、WHIP HTTP、SDP、7885、ICE 或 DTLS-SRTP**。
+`peer_default` 内部仍打印 `video_mid=255`，但本轮 candidate 已进入 checklist、selected pair
+已经形成且 DTLS 成功，所以它不是当前阻塞点。
+
+进入 STREAMING 后失败于 H.264 encoder：
+
+```text
+MEM[AFTER_DTLS]
+DMA      free=108199  largest=90112
+INTERNAL free=147791  largest=90112
+
+esp_h264_enc_hw_new_param: No memory for reference frame
+esp_h264_enc_hw_new: No memory for parameter handle
+H264 encoder 按需打开失败
+```
+
+官方 `espressif__esp_h264/hw/src/esp_h264_enc_hw_param.c` 对 reference frame 使用
+`ESP_H264_MEM_INTERNAL`，大小公式为：
+
+```text
+3 × 16 × (16 + 8) × mb_width + 7
+1280 宽度：mb_width=80
+需要 92,167 bytes 连续 INTERNAL
+```
+
+而 DTLS 完成后 largest 只有 90,112 B，差 2,055 B；虽然 INTERNAL 总 free 还有
+147,791 B，但连续块不够，所以总量日志看似充足仍然分配失败。
+
+2026-09-22 已完成连续 INTERNAL 生命周期优化和止损修改：
+
+1. `video_streamer` 在调用 `esp_h264_enc_hw_new()` 前后打印
+   `MEM[H264_OPEN_BEFORE/AFTER]`，同时包含 DMA、INTERNAL、PSRAM、8BIT 的
+   free/largest；
+2. 项目侧按 esp_h264 1.4.1 官方源码同一公式打印 `H264_PARAM_ALLOC` 与
+   `H264_REF_ALLOC requirement`；managed component 的真实分配点也加入
+   `H264_PARAM_ALLOC/H264_REF_ALLOC` before/after 诊断；
+3. 已确认有效 caps 是 `MALLOC_CAP_INTERNAL | MALLOC_CAP_CACHE_ALIGNED`，API 请求
+   alignment=16，分配器还会按内部 cache alignment 向上扩展实际字节数；
+4. WHIP POST 的 HTTP client/TLS 对象在 `perform()` 返回后立即 cleanup；远端 SDP
+   成功设置后立即释放 Answer 与已冻结的 Offer，仅保留 STOP/DELETE 所需的 Location
+   和鉴权信息，并打印 `MEM[AFTER_WHIP_HTTP_FREE]`；DELETE 时重新临时创建 client；
+5. encoder open 从“收到首帧”移到 `STARTING` 状态迁移：控制任务通知 `video_codec`
+   打开一次，并同步等待结果；成功后才打开输入门控；
+6. 新增 `VIDEO_STATE_ERROR`。open 失败后立即关闭输入门控、清空队列，打印
+   `STARTING -> ERROR reason=RESOURCE_EXHAUSTED`，不会再由每一帧重复创建；显式 stop
+   可回 IDLE，后续 start 才会主动重试一次；
+7. LVGL draw buffer 已切到 3 行双缓冲 A/B，等待实机确认显示刷新正常，以及
+   `MEM[BEFORE_H264_OPEN]` 的 largest 是否跨过 reference frame 实际对齐需求。
+
+当前方案的实机判定顺序：
+
+1. 确认 `AFTER_WHIP_HTTP_FREE`、`AFTER_DTLS` 与 `BEFORE_H264_OPEN` 的 INTERNAL
+   largest；目标大于 100 KB，并尽量在 92,167 B reference frame 之外保留 8～16 KB；
+2. 若单次 open 失败，`media.webrtc.start` 回收会话且视频状态保持 ERROR，不能进入
+   假 STREAMING，也不能逐帧重试；
+3. 不修改 managed component 中 reference frame 的 `ESP_H264_MEM_INTERNAL`，除非乐鑫官方
+   API/版本明确支持将该硬件 DMA 缓冲迁移到 PSRAM。
+4. 如果 3 行双缓冲后仍不足，依据上述阶段日志定位长期占用者，不继续全局缩 buffer；
+   不降低 UVC URB、Audio DMA、分辨率，也不修改 ICE/DTLS/SRTP。
+
+### 8B.5 构建状态与下一轮验收
+
+2026-09-22 加入 WHIP 临时资源释放、状态切换单次 encoder open、3 行 LVGL 双缓冲
+后，完整 Ninja 构建已通过：
+
+```text
+build/lummiss_main.bin = 3,025,568 bytes
+app 分区剩余约 64%
+```
+
+构建只有已有的非致命提示：`CONFIG_WIFI_RMT_TX_BUFFER_TYPE` 重复定义、
+`ESP_IDF_VERSION` 环境变量未设置。下一轮验收顺序：
+
+1. H.264 预打开成功，且只打开一次；
+2. WHIP/ICE/DTLS 仍能完成；
+3. `STREAMING` 必须同时满足 `h264_fps>0`、`rtp_packets>0`，不能只看状态名；
+4. UVC 约 30 FPS、drop 约 0、handoff rejected=0；
+5. AFE feed/fetch 正常，语音与 LVGL 无卡顿；
+6. stop 后 H.264/Peer 内存回收；
+7. 连续 start/stop 20 次无 task/socket/heap 泄漏；
+8. 连续推流至少 30 分钟无崩溃。
+
+### 8B.6 2026-09-22 H264 INTERNAL Guard
+
+为避免 `esp_peer`、ICE 和 DTLS 的小块分配提前切碎 H.264 reference frame 所需的
+连续 INTERNAL 区域，现已加入 96 KiB Guard。官方组件源码确认 reference frame 调用：
+
+```c
+esp_h264_aligned_malloc(16, 1, requested_bytes, &actual_size,
+                        ESP_H264_MEM_INTERNAL);
+```
+
+`ESP_H264_MEM_INTERNAL` 等于 `MALLOC_CAP_INTERNAL`，官方分配器内部再附加
+`MALLOC_CAP_CACHE_ALIGNED`；**没有 `MALLOC_CAP_DMA`**。Guard 使用相同函数、相同
+alignment 和相同 capability。1280×720 公式请求 92,167 B，实际对齐分配为 92,224 B。
+
+Guard 生命周期如下：
+
+```text
+credential GET 完成并清理 HTTP/TLS
+→ reserve 96 KiB H264_GUARD
+→ esp_peer_open / ICE / WHIP POST / Remote SDP / DTLS
+→ DTLS_CONNECTED
+→ MEDIA_PREPARING
+→ H264_OPENING
+→ video_codec 任务原子取走 Guard
+→ heap_caps_free(Guard)
+→ 紧邻调用 esp_h264_enc_hw_new()
+→ open 成功后 STREAMING
+```
+
+Guard 的 `free` 与 `esp_h264_enc_hw_new()` 之间没有日志、延时、队列等待或动态分配。
+STOP、credential 后续失败、ICE 超时、WHIP POST/Remote SDP 失败、Peer 断线和 encoder
+open 失败均由 `stop_session()` 兜底释放；Guard 已由 encoder 正常消费时释放接口为空操作。
+
+新增关键日志：
+
+```text
+MEM[H264_GUARD_BEFORE]
+H264 INTERNAL Guard 已预留：request=98304 actual=...
+MEM[H264_GUARD_RESERVED]
+MEM[H264_GUARD_ACTIVE]
+state CONNECTING -> DTLS_CONNECTED
+state DTLS_CONNECTED -> MEDIA_PREPARING
+state MEDIA_PREPARING -> H264_OPENING
+H264_REF_ALLOC result=OK
+MEM[AFTER_H264_OPEN]
+state H264_OPENING -> STREAMING
+```
+
+若 Guard 持有期间 Peer/TLS/DTLS 报 `ESP_ERR_NO_MEM`，先根据现有分阶段 heap 日志确认
+失败点并缩小或撤销 Guard，不允许强行继续。本轮保持 96 KiB；只有 Guard 能完成建链、但
+reference frame 仍因 Guard 前后的小对象消耗而失败时，才单独 A/B 测试 100 KiB。
+
+加入 Guard 后完整 Ninja 构建通过：
+
+```text
+build/lummiss_main.bin = 3,026,896 bytes
+app 分区剩余约 64%
+```
 
 ## 9. 构建方法
 
@@ -1399,6 +1657,14 @@ alignment buffer 此时都已分配成功。失败一次池子就永久小一截
 周期的快照，很可能没落在失败那一瞬间（握手/重连时 UVC 与 WiFi 同时在抢池子）。`DMA_DESC_MEM_ALIGN_SIZE`
 在 P4 上是 8（`GDMA_LL_AXI_DESC_ALIGNMENT`），所以也不是对齐粒度把池子切碎导致的。
 
+### 2026-09-24 实机待排查：连续对话无第二次 STT 与 RTC 预览不稳
+
+- **麦克风/连续对话（未解决）**：用户确认在小智播报结束后 10 秒内继续说话。前一次完整日志显示首轮唤醒、STT、TTS 与扬声器播放成功；回答结束后 `CONTINUOUS_LISTENING` 上行开启，UDP `sendto` 持续成功，却没有第二次 STT。将客户端无 STT 看门狗从 10 秒延至 30 秒后，新日志仍在 30,014 ms 无 STT 而退回 `WAKE_IDLE`。新日志的两个 5 秒统计窗分别有 84 帧/120,960 样本，`abs_avg=1014/2116`、`peak=10450/12568`、`clipped=0`；`MIC packets` 从 416 增至 497，`read_err` 最终为 3，UDP 总计 `tx=531/错3`。这证明本地采集和发送在运行，但**不能证明服务端收到可识别语音**，也不能据这些幅度指标判定语音内容清晰。唤醒前的 33 包是 AFE 输出，后续实时上行目前取 ES7210 MIC2 原始 PCM、重采样并编码 Opus，两段路径不同，需独立 A/B 验证。该次新日志从会话中途开始，缺少唤醒及 `listen/start` 现场；不要把没有这两行误判为未发送。
+- **RTC 预览（单独问题）**：同一日志中 `media.webrtc.start` 已受理，WHIP POST 返回 HTTP 201，ICE 选对、DTLS/SRTP connected，状态到 `STREAMING`。因此不是建立连接失败。UVC 请求 30 fps、完成约 25.5–28.7 fps，drop 约 4.6–14.1%；视频编码/发送约 10–13 fps，`drop_output` 增至 86，`rate_limit` 增至 103，并多次报 JPEG 解码错误 259/RST marker 异常。启动期间 DMA 最大连续块降至约 3–6 KB，LCD SPI 出现 `Failed to allocate priv TX buffer`；CPU1 的 `taskLVGL`/`video_codec` 触发多次 IDLE1 WDT。`官方 JPEG DMA2D YUV422→YUV420` 核对 `mismatch=2009`，因此回退 CPU 转换。`rtp_packets=0` 目前**不能单独判定服务端没有收到 RTP**：本计数只在 `count_rtp` transformer 回调中增加，而 `esp_peer_set_rtp_transformer` 返回值被忽略；同时 `esp_peer_send_video` 返回成功、`send_fail=0`。停止时已关闭本地流，但 WHIP DELETE 返回 HTTP 404，且重复 `media.webrtc.stop` 有一次 `STOP_REJECTED`，需另查停止幂等及服务端会话状态。
+- **下一步隔离**：先在不发起 RTC 预览的情况下，从唤醒前录到第二句说完，检查 `listen/start`、音频统计、UDP 发送与 STT。RTC 单独复测时优先记录客户端实际画面/播放帧率，同时修正 RTP 计数观测、排查 DMA/LVGL WDT 与 JPEG 错帧；现有日志不足以认定 RTC 问题就是连续对话失败的唯一根因。
+- **2026-09-24 RTC 负载 A/B 固件（已编译，待实机）**：WebRTC 状态由 IDLE 进入 STARTING 时，显示驱动将 LVGL 实际刷新定时器由默认 30 ms 改为 80 ms（12.5 Hz），回到 IDLE 时恢复；不改变系统 tick 与 HOME/表情事件频率。视频 YUV422 路径停用私有 DMA2D 和官方 JPEG 内置 DMA2D 的首帧核对，固定为一次 JPEG YUV422 解码后用已验证的 CPU 转换；原生 YUV420 JPEG 仍直接送 H.264。观察 `DISPLAY: RTC 预览=1/0`、`VIDEO_STREAM: ...固定使用 CPU`、JPEG/YUV 平均耗时、LCD SPI DMA 分配错误及 IDLE1 WDT 是否减少。此 A/B 不等于已修复根因。
+- **2026-09-24 RTC A/B 实机结果（止崩尚未完成）**：新日志已出现 `DISPLAY: RTC 预览=1，LVGL 刷新周期=80 ms` 和 `YUV422→YUV420：...固定使用 CPU`，无官方 DMA2D 首帧比对，也未出现先前的 LCD SPI 分配错误/IDLE1 WDT；但编码/发送仍约 11–13 fps（目标 20），`YUV_CONV` 约 30–31 ms、`SEND` 约 76–80 ms，JPEG 259 偶发。DMA 空闲/最大连续块从 RTC 开始时约 `29/18 KB` 降到约 `3/1 KB`。约 73 秒时 `sdio_push_data_to_queue()` 第 862 行 `assert(pkt_rxbuff)`，随后 `rst:0xc (SW_CPU_RESET)`；调用栈显示 `mempool_alloc` 经 `hosted_malloc_align(1664,64)` 申请 `MALLOC_CAP_INTERNAL|DMA|8BIT` 失败。故此次重启是 **ESP-Hosted RX streaming 模式内部 DMA 分配失败后的断言**，不是日志中的电池欠压复位。`CONFIG_ESP_HOSTED_SDIO_OPTIMIZATION_RX_STREAMING_MODE=y`、Host 队列 20；上游文档说明 streaming 模式更耗 Host 内存，C6 侧 SDIO Tx queue 20 会放大 Host 缓冲需求。后续软件 A/B 应优先减少这条流式接收的 DMA 占用/队列压力，或验证改用 packet 模式时与 C6 固件的兼容性；不能只删断言，因为那只会把重启变成丢包。该日志没有触发唤醒：`MIC packets=0` 且 `wake_active=1`，不构成麦克风问题的复测。
+
 **待复测判据**：串口里 `esp-aes:` 一行都不再出现。注意这一条**不是**视频/语音 A/B 的根因
 ——摄像头断开那一场也有 `esp-aes` 报错，语音却是好的。但它和 A.9 是同源问题：AES 每次运算
 都从**同一块**内部 DMA 池取描述符和对齐缓冲，失败还会泄漏，是那块池子最主要的长期消耗者。
@@ -1465,3 +1731,50 @@ transfer buffer 排队、没有这条断言。当前由
 **一个同类但独立的坑**：`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384` 让 ≤16 KB 的
 `malloc()` 优先走内部 RAM。当前通过限制 FatFS 文件数和将动画中转块缩到 4 KB 控制占用；
 仍需观察日志中的 `MEM DMA=空闲/最大块`，最大块低于 2 KB 时 ESP-Hosted 仍可能分配失败。
+
+
+## 2026-09-27 双麦唤醒问题暂停及绑定码页面
+
+- 用户确认单麦方案此前较正常，切换双麦后多次呼叫才偶发唤醒。最新诊断日志中说了三次“你好小智”，wake=1，hits=0。
+- 当前 2MIC/MMR、AEC SR_HIGH_PERF、BSS、VAD、WakeNet 保持不变。feed=78~79、fetch=156~158/5秒，feed chunk=1024/ch、fetch=512，empty=0；不能再按次数比例误判欠喂。
+- MIC1 AC RMS 约762~903，MIC2约1564~1831，相关性0.922~0.993，稳定后直流偏置接近0，VAD几乎持续SPEECH。尚不能确定噪声、槽位或BSS/AEC损伤人声，不能归因于用户发音。
+- 同一时窗原始四槽+AFE录音诊断已实现，但尚未取得实机录音。按用户要求暂停麦克风排查；已停用 audio_probe_start 开机调用，避免后台录音/大量串口导出。后续可恢复入口继续，不改双麦算法配置。
+- 新增未绑定屏幕：OTA activation.code → 启动缓存 → LVGL 顶层六位数字页面，保留前导零。即使未绑定导致 MQTT 校验失败也显示。无效码显示缺失提示，不伪造绑定码。
+- 绑定状态沿用启动 OTA 查询；绑定成功后需重启恢复首页，本轮没有增加后台轮询。
+
+
+### 2026-09-27 单麦对照测试固件
+
+用户要求切回单麦进行测试。Git HEAD 的旧单麦为 ES8311 采集，不适配当前 ES7210 新板，未整份回退。当前 `xiaozhi_audio.c` 的 `XIAOZHI_SINGLE_MIC_TEST=1`：保留 ES7210 四槽、24kHz/16bit、现有 GPIO 与30dB增益，重采样只提取 SLOT0/MIC1，AFE输入由MMR改为M。现有 `wake_word_init(1)` 关闭AEC，实际算法链以启动日志为准。MIC2及参考仍被硬件采集和统计，但不参与AFE。自动录音仍关闭，绑定码页面保留。改宏为0可恢复双麦。此测试只能隔离单/双麦处理差异，不能声称恢复了此前全部采集寄存器与时序；需实机观察唤醒与对话效果。
+
+### 2026-09-27 恢复双麦对照
+用户确认更换了供电；此后原始输入 RMS 明显下降并出现两次单麦唤醒，但不能仅归因于单麦算法。按用户要求将 XIAOZHI_SINGLE_MIC_TEST 改为 0，恢复 MIC1/MIC2/REF 的 MMR 输入及 AEC，保留原有增益、引脚、绑定页面和关闭自动录音的状态。下一轮使用更换后的同一供电验证双麦唤醒及连续对话。
+
+
+### 回答结束后的音频诊断
+首轮 SPEAKING -> CONTINUOUS_LISTENING 成功后启动一次8秒 PSRAM录音：raw四槽24k、AFE单声道16k、实际提交Opus的PCM单声道16k。停止录制后等待27秒再串口导出，避免影响当前30秒监听观察窗口。每次重启只抓一次；并非开机定时录音。capture_audio_probe.py 生成 uplink_pcm.wav，并兼容旧两组录音；零样本单独警告保留。录音不证明编码/加密/服务端接收成功，只验证编码器输入。测试时回答后直接说现在几点了，保持当前供电，关闭RTC。
+
+### 2026-09-27 ES7210 原始四槽隔离诊断（当前档位13）
+
+**后续更新：当前已切回FULL档位，以 src/demo/AUDIO_STAGE_TEST.md 为准。以下为历史隔离实验记录。**
+
+当前切换 CAMERA_TEST_AUDIO_RAW，取代正常业务启动。audio_hw_init 后独占 I2S RX，直接缓存 BASE/A_MIC1/B_MIC2/C_MIC12 各8秒四槽24k PCM，不经过 MMR/重采样/AFE/Opus，不写SD。单麦隔离不调用会改变TDM模式的 codec 重新配置；仅改变通道使能/单通道电源位，保留共享bias和所有增益/滤波/时钟设置。每组实际回读ES7210和P4 I2S/时钟/GPIO matrix寄存器，检测RX溢出、短读，退出恢复寄存器。ESP-Hosted启动钩子仍可能运行，未声称完全关闭Hosted。
+
+用户暂时没有示波器/逻辑分析仪，实际时钟波形待验证。不要把寄存器设置当作物理时钟测量，也不要在取得A/B/C有效录音前确定噪声根因。执行步骤见 src/demo/RAW_ADC_TEST.md；接收 tools/capture_raw_adc.py，结果统一 logs/raw_adc_时间，离线分析 tools/analyze_raw_adc.py。原始音频尚待用户烧录采集；没有主动烧录。
+
+### 2026-09-27 后续结论与同窗口逐级dump
+
+**后续当前测试改为生命周期raw记录，见 AUDIO_LIFECYCLE_TEST.md；下面逐级dump保留为历史说明。**
+
+raw_adc_20260927_162100：用户试听BASE/C清楚无严重杂音，SLOT0音量较小；统计SLOT0 RMS约7/6、SLOT2约389/402。四组串口FNV/WAV一致，RX无溢出。A/B软件disable全部近零，不能据此判断麦克风硬件故障；暂停该隔离方法。撤回“严重杂音已确定来自ADC原始采集”的表述，但旧业务raw文件确实位于重采样前，不能仅凭不同运行环境的新直采就确定故障一定在重采样后。
+
+当前CAMERA_TEST_FULL，首次回答结束后8秒同窗口记录raw、MMR、三路before_AFE、AFE、uplink。raw/MMR同批原子提交；AFE/Opus保留块时间戳，需要延迟对齐，不能宣称各层相同下标为同源时刻。录后抽样打印100帧，PC核对WAV头、独立按通道复算24→16、MMR拆分；新增verify_audio_stages.py，接收仍用capture_audio_probe.py。保持AFE/WakeNet/VAD/AEC/BSS不变。物理映射诊断代码保留在非激活档位，不作为本轮执行步骤。
+
+### 2026-09-27 当前：生命周期切换定位
+
+用户确认170345这次slot0/slot2 raw也有杂音；重采样复算无差异，AFE→uplink全126720样本对齐一致。异常最早在完整业务raw记录点已有，不能直接等同于ADC硬件故障。
+
+新增lifecycle_probe：正常音频硬件初始化完成后先记录1秒基线，再做TX_OFF/TX_ZERO/TX_PLAY_OUTPUT启动对照，之后进入正常语音流程，首次WAKE_IDLE/LISTENING/SPEAKING/POST_TTS/CONTINUOUS_LISTENING标记后各存1秒四槽raw及异步ES7210/P4 RX/TX/时钟寄存器快照。上一轮audio_probe_start调用关闭，算法参数不变。crossed标记窗口跨状态，POST_TTS是事件而非持续状态；未出现/短读不补零。启动TX试验本身是扰动，不得把试验后状态当作未经干预的自然启动。
+
+新PCB功放CTRL无GPIO，TX正常播放而独立功放mute无法由软件实现；日志明确UNSUPPORTED，不以DAC静音冒充。接收用tools/capture_lifecycle.py，分析用tools/analyze_lifecycle.py。记录和分析在logs/lifecycle_时间。首次连续监听完成35秒后或总计3分钟超时开始导出。未主动烧录。
+

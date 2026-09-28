@@ -21,6 +21,9 @@ extern "C" {
  */
 esp_err_t person_detect_init(void);
 
+/** 等待模型加载及 JPEG 解码器初始化结束；超时返回 ESP_ERR_TIMEOUT。 */
+esp_err_t person_detect_wait_startup(uint32_t timeout_ms);
+
 /**
  * 从现有 camera handoff 任务提交一张 MJPEG 快照。
  *

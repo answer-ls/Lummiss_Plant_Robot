@@ -1,3 +1,4 @@
+#include "mem_contig.h"
 #include "wifi_manager.h"
 
 #include <stdbool.h>
@@ -140,6 +141,7 @@ esp_err_t wifi_manager_init(wifi_manager_event_callback_t callback, void *user_c
     wifi_init_config_t wifi_init_config = WIFI_INIT_CONFIG_DEFAULT();
     ESP_RETURN_ON_ERROR(esp_wifi_init(&wifi_init_config),
                         TAG, "初始化 esp_wifi_remote 失败");
+    mem_contig_log("HOSTED_WIFI_READY");
 
     ESP_RETURN_ON_ERROR(esp_event_handler_register(WIFI_EVENT,
                                                    ESP_EVENT_ANY_ID,

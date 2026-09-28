@@ -22,7 +22,10 @@
  * 6 = UVC/USB Host + JPEG/H.264 编码，不启动 WiFi/ESP-Hosted/WebSocket/UI/SD
  * 7 = UVC/USB Host + JPEG 硬件解码，不启动 YUV/H.264/WiFi/WebSocket/UI/SD
  * 8 = UVC/USB Host + JPEG 解码/YUV 转换，不启动 H.264/WiFi/WebSocket/UI/SD
- * 9 = UVC/USB Host + 按键/TTP223 触摸/WS2812 氛围灯，不启动 WiFi/WebSocket/UI/SD/音频/天气
+ * 9 = UI/LCD + 按键/限位/TTP223 + 本地麦克风/扬声器自检，
+ *     不启动 UVC/WiFi/WebSocket/SD/小智/天气
+ * 10 = SD卡 raw 1000 次写入回读压力测试，可选后续WiFi连接/DHCP测试
+ * 11 = 仅测试ESP-Hosted/C6 WiFi连接与DHCP，不访问SD卡
  */
 #define CAMERA_TEST_FULL                   0
 #define CAMERA_TEST_UVC_ONLY               1
@@ -34,11 +37,32 @@
 #define CAMERA_TEST_UVC_JPEG_ONLY          7
 #define CAMERA_TEST_UVC_YUV_ONLY           8
 #define CAMERA_TEST_PERIPH_ONLY            9
+#define CAMERA_TEST_SD_ONLY               10
+#define CAMERA_TEST_WIFI_ONLY             11
+#define CAMERA_TEST_STEPPER_ONLY          12  /* 仅电机单次往返自检 */
+#define CAMERA_TEST_AUDIO_RAW             13  /* ES7210 四槽原始采集 */
 
 /* ← 改这一行切换档位。
- * 当前临时设为 9，用于验证 GPIO20 上的 WS2812 灯带；
- * 测试完成后回到完整系统请改回 CAMERA_TEST_FULL。 */
+ * 当前运行完整系统，电机仅由 MCP 指令触发；档位12保留四档速度自检。
+ * SD 卡 raw 1000 次压力测试仍保留在档位 10，可随时切回单独复测。 */
 #define CAMERA_TEST_PROFILE                CAMERA_TEST_FULL
+
+/* 完整系统欠压排查：分阶段启动并在各阶段保持一段时间观察。
+ * 只延后后续模块启动，不禁用欠压保护，也不更改各驱动的工作参数。 */
+#define FULL_POWER_DIAG_HOLD_MS             3000
+/* SD故障定位期间暂停后续WiFi测试；置1恢复顺序联网测试。 */
+#define SD_TEST_WIFI_ENABLED               0
+
+/* 视频链路隔离测试：0 只关闭本地 YOLO 模型加载和 AI 抽帧。
+ * UVC、JPEG/YUV/H.264、WHIP、音频和 UI 仍按完整系统档位运行。
+ * 当前 YOLO 预处理仅适配 640×480；720p 视频联调期间保持为 0，
+ * 后续适配 720p 输入后才能恢复人体检测。 */
+#define CAMERA_PERSON_DETECT_ENABLED       0
+
+/* UVC 丢包诊断：完整系统启动时自动打开摄像头并持续收帧，
+ * 无需等待 RTC 预览指令；视频编码和上传仍由服务端命令开启。
+ * 诊断结束后设回 0，即恢复原来的 RTC 按需启动摄像头。 */
+#define CAMERA_UVC_AUTOSTART               0
 
 /* 视频上传采用「按需开启」：开机默认 IDLE，只建立 WebSocket 控制通道，
  * 必须等服务端下发 VIDEO_START 才编码上传；VIDEO_STOP / 断线自动停止，
@@ -52,7 +76,7 @@
  * 编译、复位开发板并让摄像头重新枚举，禁止在同一次运行中轮换分辨率。 */
 #define CAMERA_UVC_COLD_TEST_640X480        1
 #define CAMERA_UVC_COLD_TEST_1280X720       2
-#define CAMERA_UVC_COLD_TEST_MODE           CAMERA_UVC_COLD_TEST_640X480
+#define CAMERA_UVC_COLD_TEST_MODE           CAMERA_UVC_COLD_TEST_1280X720
 
 /* 功能位。档位号本身不参与任何生产代码的判断，判断只认这些位。 */
 #define TP_UVC      (1u << 0)   /* USB Host + UVC 取流（目前恒开，留位以备"无摄像头"档位） */
@@ -82,8 +106,14 @@
 #  define TP_BITS (TP_UVC | TP_UI | TP_SD | TP_WIFI)
 #elif CAMERA_TEST_PROFILE == CAMERA_TEST_UVC_UI_SD_WIFI_VIDEO
 #  define TP_BITS (TP_UVC | TP_HANDOFF | TP_UI | TP_SD | TP_WIFI)
+#elif CAMERA_TEST_PROFILE == CAMERA_TEST_SD_ONLY
+#  define TP_BITS (TP_SD | (SD_TEST_WIFI_ENABLED ? TP_WIFI : 0))
+#elif CAMERA_TEST_PROFILE == CAMERA_TEST_STEPPER_ONLY || CAMERA_TEST_PROFILE == CAMERA_TEST_AUDIO_RAW
+#  define TP_BITS (0)
+#elif CAMERA_TEST_PROFILE == CAMERA_TEST_WIFI_ONLY
+#  define TP_BITS (TP_WIFI)
 #elif CAMERA_TEST_PROFILE == CAMERA_TEST_PERIPH_ONLY
-#  define TP_BITS (TP_UVC | TP_PERIPH)
+#  define TP_BITS (TP_UI | TP_PERIPH)
 #elif CAMERA_TEST_PROFILE == CAMERA_TEST_UVC_H264_ONLY || \
       CAMERA_TEST_PROFILE == CAMERA_TEST_UVC_JPEG_ONLY || \
       CAMERA_TEST_PROFILE == CAMERA_TEST_UVC_YUV_ONLY
@@ -100,7 +130,15 @@
 
 static inline const char *test_profile_name(void)
 {
-#if   CAMERA_TEST_PROFILE == CAMERA_TEST_FULL
+#if CAMERA_TEST_PROFILE == CAMERA_TEST_AUDIO_RAW
+    return "ES7210 原始四槽 BASE/A/B/C 采集";
+#elif CAMERA_TEST_PROFILE == CAMERA_TEST_STEPPER_ONLY
+    return "仅步进电机：四档速度往返测试";
+#elif CAMERA_TEST_PROFILE == CAMERA_TEST_WIFI_ONLY
+    return "仅WiFi连接/DHCP（不访问SD卡）";
+#elif CAMERA_TEST_PROFILE == CAMERA_TEST_SD_ONLY
+    return SD_TEST_WIFI_ENABLED ? "SD卡raw CMD24 + WiFi连接测试" : "SD卡raw 1000次写读压力测试";
+#elif CAMERA_TEST_PROFILE == CAMERA_TEST_FULL
     return "完整系统";
 #elif CAMERA_TEST_PROFILE == CAMERA_TEST_UVC_ONLY
     return "仅 UVC/USB Host";
@@ -119,7 +157,7 @@ static inline const char *test_profile_name(void)
 #elif CAMERA_TEST_PROFILE == CAMERA_TEST_UVC_YUV_ONLY
     return "UVC + JPEG 解码/YUV 转换（无 H.264/WiFi/WS/UI/SD）";
 #elif CAMERA_TEST_PROFILE == CAMERA_TEST_PERIPH_ONLY
-    return "UVC + 按键/TTP223 触摸/WS2812 氛围灯（无 WiFi/WS/UI/SD/音频/天气）";
+    return "UI/LCD + 按键/限位/TTP223 + MIC/SPK 本地自检（无 UVC/WiFi/WS/SD/小智/天气）";
 #endif
 }
 

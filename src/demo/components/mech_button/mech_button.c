@@ -5,6 +5,7 @@
 #include "board_pins.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -97,10 +98,14 @@ static void button_task(void *arg)
 
     TickType_t last_wake = xTaskGetTickCount();
     while (true) {
-        const bool raw = read_raw_pressed();
+        const int raw_level = gpio_get_level(BOARD_KEY_GPIO);
+        const bool raw = raw_level == 0;
 
         if (raw != s_raw_pressed) {
-            /* 原始电平刚变化：重新开始计稳定时间。 */
+            /* 档位 9 首板测试必须能区分“GPIO 根本没变化”和“有变化但未通过
+             * 去抖”。因此任何原始边沿都立即打印，正式按键事件仍需通过去抖。 */
+            ESP_LOGI(TAG, "GPIO%d RAW edge：level=%d → %s（等待去抖）",
+                     BOARD_KEY_GPIO, raw_level, raw ? "按下候选" : "释放候选");
             s_raw_pressed = raw;
             s_stable_samples = 0;
         } else if (s_stable_samples < BUTTON_DEBOUNCE_SAMPLES) {
@@ -170,9 +175,11 @@ esp_err_t button_init(void)
                  BOARD_KEY_GPIO, level);
     }
 
-    const BaseType_t created = xTaskCreate(button_task, "button_task",
+    /* 任务仅处理 GPIO/业务状态；DMA/中断资源由底层驱动独立持有。 */
+    const BaseType_t created = xTaskCreateWithCaps(button_task, "button_task",
                                            BUTTON_TASK_STACK, NULL,
-                                           BUTTON_TASK_PRIORITY, &s_task);
+                                           BUTTON_TASK_PRIORITY, &s_task,
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (created != pdPASS) {
         ESP_LOGE(TAG, "创建采样任务失败");
         return ESP_ERR_NO_MEM;

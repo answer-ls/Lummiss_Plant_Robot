@@ -1,0 +1,19 @@
+{
+  "main/camera_driver.c": "748c2601d373b6f9a64fabd1074c0ddedef205c739eb7688b2dd0916e675b3af",
+  "main/display_driver.c": "daae15ecd5a8a47a678bb66076f5a9762fbacf7fc36b956e90f653658342b758",
+  "components/home_info/home_info.c": "d49bdf91b2743a9d67f1ceb6ad0e379e16b9c0c7044ce84bf180f404c0821ee1",
+  "components/ambient_led/ambient_led.c": "f42d863da0d48a53229e1dc2d073ddab56ab84e985b37173a362dc13270da784",
+  "components/mech_button/mech_button.c": "c00a6d4fc7ff3c1e25ca6b6d541b506be9d3267931d6eaf839dd9431cc731169",
+  "components/touch_key/touch_key.c": "0096d6453e3d2ec6e3c4a462224e9dbd1ab3d4ef803ffdc01634ea493934f0c2",
+  "components/webrtc_whip/rtc_heap_diag.c": "1a18b02190a9aa19eb469f77e2a35fe92496c51f29db3d85737afaa87dfc4edf",
+  "components/webrtc_whip/webrtc_whip.c": "0493055536207c3b2f2e2c71fd240601ba7e8e1113aa38e24d2a766d82752727",
+  "components/video_streamer/video_streamer.c": "4dcdd54b9db9f97dd8f5693555b013c58959b9cdc32261b200ef6a0371d8cff2",
+  "managed_components/espressif__esp_peer/src/esp_peer.c": "8b20df3b71bdf99fe9bc4f6b10c9f47b32734224b6446e36875180260b006860",
+  "managed_components/espressif__esp_h264/hw/src/h264_rc.c": "bc7a7781c33cb7ff8d4e82fea86f6c1f1f28cc7cbff7b41eae2d786a4ad3a9a6",
+  "managed_components/espressif__esp_h264/hw/src/esp_h264_enc_hw_param.c": "7169f211fe4a35bb5b223b8c6b32bd7cdf55a0e90ab9445b37f63dc0c681bea8",
+  "managed_components/espressif__esp_hosted/host/drivers/mempool/mempool.c": "872418eaa5bd6e252af0fee4d433b095413b545788d5de652dbe09a2021484e2",
+  "managed_components/espressif__esp_hosted/host/drivers/mempool/mempool.h": "9be6ac2c065a014f48e89ae737dec6f221104817b6b5feb7ea30e5f102c8815f",
+  "managed_components/espressif__esp_hosted/host/drivers/transport/transport_drv.c": "8ffa308426fdbdbccde88f3fa217bf69af1a02bc6b1a9da9a39556b94c8ad949",
+  "managed_components/espressif__esp_hosted/host/drivers/transport/sdio/sdio_drv.c": "fc6c3a42496021372ed28a83db663e16916c7c6506bacaff4884e937f115b4f1",
+  "build/lummiss_main.elf": "c0060cf856dc9c19f2643731e6acc11126dd0aa4eadeef0f258fcbae0d21c8a8"
+}

@@ -4,26 +4,23 @@
 #include <string.h>
 
 #include "cJSON.h"
+#include "esp_crt_bundle.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "mqtt_client.h"
 
 #include "cloud_mcp.h"
 #include "mcp_registry.h"
+#include "video_streamer.h"
 
 static const char *TAG = "CLOUD_MQTT";
 
-/* 下行 JSON 累积缓冲上限。
- * ponytail: 阶段一只有 Server Hello（几百字节），4 KiB 足够。等做 WebRTC 时
- * SDP 会超过它 —— 到那时再上调或改成动态分配，现在不需要。 */
+/* 下行 JSON 累积缓冲上限。现行文档规定单条 MQTT JSON 最大 8 KiB；
+ * WebRTC SDP/ICE 只走 WHIP HTTPS，不会进入 MQTT。当前 4 KiB 已覆盖 MCP
+ * 控制报文，若服务端实际下发超过上限会明确打印并丢弃。 */
 #define CLOUD_MQTT_DOWNLINK_MAX   4096
 
-/* 收发缓冲。文档 §2.3：单条 JSON 最大 64 KiB，**明确不能限制成 8 KiB**
- * （WebRTC SDP 较大）。16 KiB 覆盖常见 SDP 尺寸，真遇到更大的再调。 */
-/* 收发缓冲。阶段二（纯音频）下行最大只有 Server Hello ~340 B / MCP ~600 B，
- * 4 KiB 足够。**进 WebRTC 阶段（§4）必须调回 16 KiB 以上** —— 文档 §2.3 要求
- * 单条 JSON 最大 64 KiB 且不得限制成 8 KiB，SDP 才放得下。
- * （2026-09-18：16 KiB 配置曾把内部 RAM 挤到 LVGL 显示缓冲分配失败 abort，
- * 所以在真正需要大缓冲之前先缩回来。esp-mqtt 收发各一份，改这里省的是双倍。） */
+/* esp-mqtt 收发缓冲保持 4 KiB；较大的 QoS0 MCP 回执由 esp-mqtt 自动分片发送。 */
 #define CLOUD_MQTT_BUFFER_SIZE    4096
 
 #define CLOUD_MQTT_KEEPALIVE_SEC  120
@@ -44,7 +41,7 @@ static char s_hello_v3[CLOUD_MQTT_HELLO_MAX];
 
 static esp_mqtt_client_handle_t s_client;
 static cloud_mqtt_config_t s_cfg;
-static char s_uri[96];   /* "mqtt://<endpoint>"，必须在客户端生命周期内有效 */
+static char s_uri[104];  /* "mqtt[s]://<endpoint>"，必须在客户端生命周期内有效 */
 static cloud_state_t s_state = CLOUD_STATE_BOOT;
 
 static cloud_mqtt_session_t s_session;
@@ -256,6 +253,8 @@ static void parse_server_hello(cJSON *root)
             (uint16_t)json_int(audio, "frame_duration", 0);
     }
 
+    ESP_LOGI("VOICE_TRACE", "us=%lld session_id=%s event=SERVER_HELLO_RX",
+             (long long)esp_timer_get_time(), s_session.session_id);
     ESP_LOGI(TAG, "收到 Server Hello：session_id=%s",
              s_session.session_id[0] ? s_session.session_id : "(缺失)");
     ESP_LOGI(TAG,
@@ -276,15 +275,16 @@ static void parse_server_hello(cJSON *root)
     __atomic_store_n(&s_session_ready, true, __ATOMIC_SEQ_CST);
     set_state(CLOUD_STATE_AI_SESSION_READY);
     set_state(CLOUD_STATE_IDLE);
-    /* 固件云端能力状态。
-     * 注意：能力状态以本行日志为准 —— MCP 基础握手与 UDP Opus 双向音频均已在
-     * 实机验证（2026-09-19）；未实现的只剩 WebRTC（阶段四）。 */
+    /* 此处只表示服务端协商结果；UDP socket 与 GCM 上下文由音频任务随后建立，
+     * 不能在尚未调用 cloud_udp_start() 时提前宣称运行态 READY。 */
     ESP_LOGI(TAG, "===== 固件云端能力状态 =====");
     ESP_LOGI(TAG, "MQTT/AI Hello        READY");
     ESP_LOGI(TAG, "MCP basic handshake  READY（已实现工具 %u 个）",
              (unsigned)mcp_registry_ready_count());
-    ESP_LOGI(TAG, "UDP Opus             READY（双向音频实测通过）");
-    ESP_LOGI(TAG, "WebRTC               NOT IMPLEMENTED（阶段四）");
+    ESP_LOGI(TAG, "UDP Opus             NEGOTIATED（%s，等待音频任务启动）",
+             s_session.udp_encryption[0] ? s_session.udp_encryption : "参数缺失");
+    ESP_LOGI(TAG, "WebRTC WHIP          READY（%ux%u@20 单向 H264，待服务端实机联调）",
+             VIDEO_STREAM_WIDTH, VIDEO_STREAM_HEIGHT);
 }
 
 /* 下行消息分类。回调里只做长度检查 / JSON 解析 / 分类 —— 不做 HTTP、
@@ -410,10 +410,14 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
          * 该字段不存在，不要去读它。 */
         if (event->error_handle != NULL) {
             ESP_LOGE(TAG,
-                     "MQTT 错误：type=%d connect_rc=%d sock_errno=%d",
+                     "MQTT 错误：type=%d connect_rc=%d sock_errno=%d "
+                     "tls_esp=0x%x tls_stack=0x%x cert_flags=0x%x",
                      (int)event->error_handle->error_type,
                      (int)event->error_handle->connect_return_code,
-                     event->error_handle->esp_transport_sock_errno);
+                     event->error_handle->esp_transport_sock_errno,
+                     (unsigned)event->error_handle->esp_tls_last_esp_err,
+                     (unsigned)event->error_handle->esp_tls_stack_err,
+                     (unsigned)event->error_handle->esp_tls_cert_verify_flags);
         } else {
             ESP_LOGE(TAG, "MQTT 错误（无 error_handle）");
         }
@@ -439,8 +443,20 @@ esp_err_t cloud_mqtt_start(const cloud_mqtt_config_t *config)
     }
 
     s_cfg = *config;
-    /* 地址一律来自 OTA，固件里不硬编码任何公网 IP（文档 §1）。 */
-    snprintf(s_uri, sizeof(s_uri), "mqtt://%s", s_cfg.endpoint);
+    /* 地址一律来自 OTA，固件里不硬编码任何公网 IP（文档 §1）。
+     * 生产端口 8883 必须使用 TLS；旧代码固定拼 mqtt://，会把明文 MQTT
+     * 发到 TLS 端口，服务端只能立即 EOF。若服务端将来直接下发 URI，原样使用。 */
+    const bool endpoint_has_scheme = strstr(s_cfg.endpoint, "://") != NULL;
+    const size_t endpoint_len = strlen(s_cfg.endpoint);
+    const bool mqtt_tls = endpoint_has_scheme ?
+        strncmp(s_cfg.endpoint, "mqtts://", 8) == 0 :
+        (endpoint_len >= 5 && strcmp(s_cfg.endpoint + endpoint_len - 5, ":8883") == 0);
+    if (endpoint_has_scheme) {
+        snprintf(s_uri, sizeof(s_uri), "%s", s_cfg.endpoint);
+    } else {
+        snprintf(s_uri, sizeof(s_uri), "%s://%s",
+                 mqtt_tls ? "mqtts" : "mqtt", s_cfg.endpoint);
+    }
 
     /* MCP 队列与任务必须在 OTA（capability_manifest 从注册表生成）和连上之前
      * 就绪：一旦 MQTT_CONNECTED，服务端可能立刻下发 initialize，此时队列还不
@@ -460,7 +476,9 @@ esp_err_t cloud_mqtt_start(const cloud_mqtt_config_t *config)
     }
     snprintf(s_hello_v3, sizeof(s_hello_v3),
              "{\"type\":\"hello\",\"version\":3,\"transport\":\"udp\","
-             "\"features\":{\"mcp\":true,\"aec\":true},"
+             /* 正式协议声明支持 AEAD；cloud_udp 已实现 AES-128-GCM 主路径，
+              * 并保留服务端迁移期返回 AES-128-CTR 时的兼容路径。 */
+             "\"features\":{\"mcp\":true,\"aec\":true,\"udp_aead\":true},"
              "\"audio_params\":{\"format\":\"opus\",\"sample_rate\":16000,"
              "\"channels\":1,\"frame_duration\":60},"
              "\"capability_manifest\":%s}",
@@ -468,6 +486,9 @@ esp_err_t cloud_mqtt_start(const cloud_mqtt_config_t *config)
 
     const esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = s_uri,
+        /* MQTTS 复用 ESP-IDF 官方证书包并校验 www.lummiss.com 域名；
+         * 明文迁移端口不会使用该字段。 */
+        .broker.verification.crt_bundle_attach = mqtt_tls ? esp_crt_bundle_attach : NULL,
         .credentials.client_id = s_cfg.client_id,
         .credentials.username = s_cfg.username,
         .credentials.authentication.password = s_cfg.password,
@@ -500,11 +521,11 @@ esp_err_t cloud_mqtt_start(const cloud_mqtt_config_t *config)
     ESP_LOGI(TAG,
              "MQTT 启动：endpoint=%s client_id=%u 字节 username=%u 字节 "
              "password 已设置，publish=%s subscribe=%s，keepalive=%d s，"
-             "buffer=%d 字节，task 栈=%d 优先级=%d（esp-mqtt 不支持指定核）",
+             "transport=%s，buffer=%d 字节，task 栈=%d 优先级=%d（esp-mqtt 不支持指定核）",
              s_cfg.endpoint, (unsigned)strlen(s_cfg.client_id),
              (unsigned)strlen(s_cfg.username), s_cfg.publish_topic,
              s_cfg.subscribe_topic, CLOUD_MQTT_KEEPALIVE_SEC,
-             CLOUD_MQTT_BUFFER_SIZE, CLOUD_MQTT_TASK_STACK,
+             mqtt_tls ? "MQTTS" : "MQTT", CLOUD_MQTT_BUFFER_SIZE, CLOUD_MQTT_TASK_STACK,
              CLOUD_MQTT_TASK_PRIO);
 
     set_state(CLOUD_STATE_OTA_CONFIGURED);

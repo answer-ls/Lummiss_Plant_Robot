@@ -1,0 +1,9 @@
+menu "Audio lifecycle diagnostics"
+    config WAKE_CLEANUP_TRANSIENT
+        bool "Release INTERNAL cleanup task after model teardown (B)"
+        default y
+        help
+            Enable B: dynamically allocate the INTERNAL lifecycle task and
+            synchronously delete it after teardown. Disable for A: retain
+            the original static INTERNAL stack and task for comparison.
+endmenu

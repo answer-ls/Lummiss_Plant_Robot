@@ -13,8 +13,14 @@ esp_err_t anim_bin_player_init(lv_obj_t *parent);
 /* 异步打开并播放 LUM1 文件，不在调用者线程执行 SD 读取。 */
 esp_err_t anim_bin_player_play(const char *path);
 
-/* 异步停止。两个 PSRAM 帧缓冲会保留给下一次播放复用。 */
+/* 异步停止；播放器任务会释放 RGB565 三缓冲和 SD 文件读取缓存。 */
 void anim_bin_player_stop(void);
+
+/* RTC 推流期间拒绝新动画请求，任务在无请求时阻塞等待通知。 */
+void anim_bin_player_set_rtc_blocked(bool blocked);
+
+/* 等待异步 stop 完成资源释放，供 WebRTC 建链前回收连续内存。 */
+esp_err_t anim_bin_player_wait_resources_released(uint32_t timeout_ms);
 
 bool anim_bin_player_is_playing(void);
 bool anim_bin_player_is_loading(void);

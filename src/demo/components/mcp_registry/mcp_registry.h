@@ -6,7 +6,7 @@
  * tools/list、tools/call 分发、hello v3 的 capability_manifest、OTA 请求体里的
  * capability_manifest —— 全部从这张表生成，消除多处硬编码清单的漂移。
  *
- * handler == NULL 的条目是「已声明未实现」的占位（如 media.webrtc.start）：
+ * handler 与 async_handler 都为 NULL 的条目是「已声明未实现」的占位：
  * 不进 tools/list、不进 capability_manifest（不对服务端宣称 READY），
  * 但 tools/call 到达时会回明确的 NOT_IMPLEMENTED 错误而不是"未知工具"。
  *
@@ -25,11 +25,17 @@ typedef void (*mcp_tool_handler_t)(const cJSON *arguments,
                                    char *result, size_t result_size,
                                    bool *is_error);
 
+/* 异步工具在后台任务完成后自行发布 JSON-RPC 回执。
+ * 实现方在函数返回前必须复制所需数据，不能保留 cJSON 指针。 */
+typedef void (*mcp_async_tool_handler_t)(const cJSON *arguments,
+                                         const cJSON *request_id);
+
 typedef struct {
     const char *name;         /* 工具名 = 能力码，如 "motion.stop"（静态字符串） */
     const char *description;  /* LLM 可读描述（静态字符串） */
     const char *input_schema; /* JSON-Schema 文本；NULL = 无参数 */
-    mcp_tool_handler_t handler; /* NULL = 已声明未实现 */
+    mcp_tool_handler_t handler; /* NULL = 没有同步处理器 */
+    mcp_async_tool_handler_t async_handler; /* NULL = 没有异步处理器 */
 } mcp_tool_t;
 
 /* 注册工具。name/description/input_schema 必须是持久字符串（字面量即可）。
@@ -42,7 +48,7 @@ size_t mcp_registry_count(void);
 /* 取第 index 个注册项；越界返回 NULL。 */
 const mcp_tool_t *mcp_registry_get(size_t index);
 
-/* 已实现（handler != NULL）的工具数。 */
+/* 已实现（同步或异步 handler 非空）的工具数。 */
 size_t mcp_registry_ready_count(void);
 
 /* 生成 capability_manifest JSON 对象文本（**只含已实现**的工具）：

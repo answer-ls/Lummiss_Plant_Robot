@@ -10,6 +10,7 @@
 #include "device_identity.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_hosted_misc.h"
 #include "esp_random.h"
 #include "network_provisioning/manager.h"
 #include "network_provisioning/scheme_ble.h"
@@ -26,6 +27,7 @@ static provisioning_event_callback_t s_callback;
 static void *s_user_ctx;
 static bool s_active;
 static bool s_manager_initialized;
+static bool s_hosted_bt_initialized;
 static char s_service_name[24];
 static char s_pop[16];
 static char *s_salt;
@@ -117,6 +119,24 @@ static void release_security2(void)
     memset(&s_security2_params, 0, sizeof(s_security2_params));
 }
 
+static void release_hosted_bt_controller(void)
+{
+    if (!s_hosted_bt_initialized) {
+        return;
+    }
+
+    /* 配网结束后释放 C6 蓝牙控制器，Wi-Fi Remote 继续运行。 */
+    esp_err_t err = esp_hosted_bt_controller_disable();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "停用 C6 蓝牙控制器失败：%s", esp_err_to_name(err));
+    }
+    err = esp_hosted_bt_controller_deinit(false);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "释放 C6 蓝牙控制器失败：%s", esp_err_to_name(err));
+    }
+    s_hosted_bt_initialized = false;
+}
+
 static void provisioning_event_handler(void *user_data,
                                        esp_event_base_t event_base,
                                        int32_t event_id,
@@ -166,6 +186,10 @@ static void provisioning_event_handler(void *user_data,
         esp_err_t err = network_prov_mgr_deinit();
         s_manager_initialized = false;
         release_security2();
+#ifndef CONFIG_NETWORK_PROV_KEEP_BLE_ON_AFTER_PROV
+        /* 配置保留 BLE 时，不能在配网结束事件里停掉 C6 控制器。 */
+        release_hosted_bt_controller();
+#endif
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "释放配网管理器失败：%s", esp_err_to_name(err));
         }
@@ -260,6 +284,21 @@ esp_err_t provisioning_manager_start(provisioning_event_callback_t callback,
         goto fail;
     }
 
+    /* P4 只运行 NimBLE Host；广播前必须通过 ESP-Hosted 启动 C6 控制器。 */
+    err = esp_hosted_bt_controller_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "初始化 C6 蓝牙控制器失败：%s", esp_err_to_name(err));
+        goto fail;
+    }
+    s_hosted_bt_initialized = true;
+    err = esp_hosted_bt_controller_enable();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "启用 C6 蓝牙控制器失败：%s", esp_err_to_name(err));
+        release_hosted_bt_controller();
+        goto fail;
+    }
+    ESP_LOGI(TAG, "C6 蓝牙控制器已初始化并启用");
+
     err = network_prov_mgr_start_provisioning(
         NETWORK_PROV_SECURITY_2,
         &s_security2_params,
@@ -279,6 +318,7 @@ esp_err_t provisioning_manager_start(provisioning_event_callback_t callback,
     return ESP_OK;
 
 fail:
+    release_hosted_bt_controller();
     release_security2();
     network_prov_mgr_deinit();
     s_manager_initialized = false;

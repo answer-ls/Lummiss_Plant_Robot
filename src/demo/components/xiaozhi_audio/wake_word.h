@@ -20,6 +20,19 @@ typedef struct {
     uint32_t fetch_null_count;
     uint32_t feed_fail;
     uint32_t wake_detect_count;
+    uint32_t output_samples;
+    uint32_t output_drop;
+    uint32_t fetch_errors;
+    uint32_t processed_samples;
+    uint32_t processed_peak;
+    uint32_t speech_frames;
+    uint32_t silence_frames;
+    uint32_t speech_begin_count;
+    uint32_t speech_end_count;
+    bool voice_detected;
+    uint32_t feed_samples;  /* 成功送入 AFE 的每通道累计样本数 */
+    uint32_t accumulator_remaining_samples; /* 每通道余量，非字节 */
+    uint32_t ringbuffer_underflow; /* fetch 返回空/ESP_FAIL 的计数 */
 } wake_word_stats_t;
 
 /**
@@ -28,7 +41,7 @@ typedef struct {
  * 调用前需确保 SPIFFS 已挂载，"storage" 分区中存在 Wakenet 模型文件。
  * 该函数会加载模型、创建 AFE 实例并启动内部检测任务。
  *
- * @param channels      麦克风声道数（通常为 1）
+ * @param channels      1 为单麦 M；3 为双麦加播放参考 MMR。
  * @return ESP_OK 成功，否则失败
  */
 esp_err_t wake_word_init(int channels);
@@ -46,14 +59,14 @@ void wake_word_set_callback(wake_word_callback_t callback, void *user_data);
 /**
  * @brief 启动唤醒词检测。
  *
- * 调用后 feed() 的数据才会被送入检测器；重置内部缓冲。
+ * 启用 WakeNet；AFE 持续处理，由检测任务更新控制状态。
  */
 void wake_word_start(void);
 
 /**
  * @brief 停止唤醒词检测。
  *
- * feed() 的数据将被丢弃，直到再次调用 start()。
+ * 只停止 WakeNet，保留双麦 AFE 供对话上行使用。
  */
 void wake_word_stop(void);
 
@@ -71,10 +84,18 @@ size_t wake_word_get_feed_size(void);
  *
  * 内部会缓存不足一个 chunk 的剩余数据，凑满后送入 AFE。
  *
- * @param data   16-bit 单声道 PCM 样本（16 kHz）
+ * @param data   16 kHz/16-bit PCM，按初始化的 M 或 MMR 顺序交错。
  * @param count  样本数量
  */
 void wake_word_feed(const int16_t *data, size_t count);
+
+/* 与 WakeNet 独立：只控制增强 PCM 输出，不按 VAD 筛选数据。 */
+void wake_word_enable_voice_processing(bool enabled);
+bool wake_word_voice_detected(void);
+/* 旧协议兼容入口。 */
+void wake_word_set_uplink(bool enabled);
+/* 非阻塞读取完整的单声道 AFE 输出帧，不足 samples 时返回 0。 */
+size_t wake_word_read_pcm(int16_t *output, size_t samples);
 
 /** @brief 读取 AFE feed/fetch/WakeNet 诊断计数。 */
 void wake_word_get_stats(wake_word_stats_t *stats);
@@ -110,8 +131,10 @@ size_t wake_word_copy_preroll(int16_t *output, size_t max_samples);
 
 /**
  * @brief 反初始化并释放所有 AFE 资源。
+ * 调用方必须停止 feed/输出读取并串行化 init/deinit；本函数等待 INTERNAL
+ * worker 完成 fetch 退出、AFE 销毁和模型 munmap 后才返回；B 组还同步回收其栈/TCB。
  */
-void wake_word_deinit(void);
+esp_err_t wake_word_deinit(void);
 
 #ifdef __cplusplus
 }

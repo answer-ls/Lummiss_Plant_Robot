@@ -1,0 +1,14 @@
+menu "Lummiss heap diagnostics"
+    config H264_FRAGMENT_FOCUSED
+        bool "Enable bounded reserve-region owner diagnosis"
+        default y
+        help
+            Trace until first H264 open. Print at most 12 owner groups and
+            16 boundary allocations, without the complete heap dump.
+    config H264_FRAGMENT_VERBOSE
+        bool "Enable one-shot full H264 heap layout and allocation trace"
+        default n
+        help
+            Diagnostic only. Prints hundreds of heap blocks and allocation
+            callers before the first H264 open. Keep disabled for normal use.
+endmenu

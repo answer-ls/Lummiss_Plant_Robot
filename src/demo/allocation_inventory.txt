@@ -1,0 +1,96 @@
+src/demo/main\camera_driver.c:509:        s_frame_copies[i].data = heap_caps_malloc(
+src/demo/main\camera_driver.c:869:    if (xTaskCreatePinnedToCore(usb_events_task, "usb_events", 4096, NULL,
+src/demo/main\camera_driver.c:999:    s_camera_handoff_queue = xQueueCreate(
+src/demo/main\camera_driver.c:1003:        xTaskCreatePinnedToCore(camera_handoff_task, "camera_handoff",
+src/demo/main\display_driver.c:269:    uint16_t *line = heap_caps_malloc(
+src/demo/main\display_driver.c:307:    /* 当前 esp_lvgl_port 使用 xTaskCreatePinnedToCoreWithCaps 创建任务，
+src/demo/main\expression_manager.c:185:    s_queue_storage = heap_caps_malloc(EXPRESSION_QUEUE_LEN * sizeof(expression_event_t),
+src/demo/main\expression_manager.c:188:    s_queue = xQueueCreateStatic(EXPRESSION_QUEUE_LEN, sizeof(expression_event_t),
+src/demo/components\ambient_led\ambient_led.c:314:    const BaseType_t created = xTaskCreate(ambient_led_task, "ambient_led",
+src/demo/components\anim_bin_player\anim_bin_player.c:129:    s_sd_read_buffer = heap_caps_malloc(
+src/demo/components\anim_bin_player\anim_bin_player.c:136:        s_buffers[i] = heap_caps_malloc(ANIM_BUFFER_SIZE,
+src/demo/components\anim_bin_player\anim_bin_player.c:297:    anim_bin_frame_t *frames = heap_caps_malloc(
+src/demo/components\anim_bin_player\anim_bin_player.c:698:    const BaseType_t created = xTaskCreatePinnedToCoreWithCaps(
+src/demo/components\cloud_mqtt\cloud_mcp.c:187:    photo_mcp_context_t *ctx = heap_caps_calloc(
+src/demo/components\cloud_mqtt\cloud_mcp.c:288:    motion_job_t *job = heap_caps_malloc(sizeof(*job), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+src/demo/components\cloud_mqtt\cloud_mcp.c:301:    if (xTaskCreatePinnedToCore(motion_worker, "mcp_stepper", 3072, job,
+src/demo/components\cloud_mqtt\cloud_mcp.c:474:    webrtc_whip_credential_t *credential = heap_caps_calloc(
+src/demo/components\cloud_mqtt\cloud_mcp.c:862:    mcp_message_t *msg = heap_caps_malloc(sizeof(*msg),
+src/demo/components\cloud_mqtt\cloud_mcp.c:882:    s_queue_storage = heap_caps_malloc(CLOUD_MCP_QUEUE_DEPTH * sizeof(mcp_message_t),
+src/demo/components\cloud_mqtt\cloud_mcp.c:885:        s_queue = xQueueCreateStatic(CLOUD_MCP_QUEUE_DEPTH, sizeof(mcp_message_t),
+src/demo/components\cloud_mqtt\cloud_mcp.c:901:    if (xTaskCreatePinnedToCoreWithCaps(cloud_mcp_task, "cloud_mcp",
+src/demo/main\main.c:309:    if (xTaskCreatePinnedToCoreWithCaps(camera_task, "camera_task", 8192,
+src/demo/main\main.c:674:        result = xTaskCreatePinnedToCoreWithCaps(ui_task, "ui_task", 8192, NULL, 6,
+src/demo/main\main.c:679:        result = xTaskCreatePinnedToCoreWithCaps(ui_task, "ui_task", 8192, NULL, 6,
+src/demo/main\main.c:703:                result = xTaskCreatePinnedToCoreWithCaps(camera_task, "camera_task", 8192,
+src/demo/main\main.c:820:    result = xTaskCreatePinnedToCoreWithCaps(ui_task, "ui_task", 8192, NULL, 6,
+src/demo/main\main.c:827:    result = xTaskCreatePinnedToCoreWithCaps(camera_task, "camera_task", 8192, NULL, 7,
+src/demo/main\main.c:840:    if (xTaskCreatePinnedToCoreWithCaps(idle_stable_diag_task,
+src/demo/components\camera_photo\camera_photo.c:225:    s_request_queue = xQueueCreate(1, sizeof(photo_request_t));
+src/demo/components\camera_photo\camera_photo.c:227:        xTaskCreatePinnedToCoreWithCaps(photo_task, "photo_task", PHOTO_TASK_STACK,
+src/demo/components\cloud_udp\cloud_udp.c:57: * malloc/free，也不占用紧张的 INTERNAL/DMA 堆。 */
+src/demo/components\cloud_udp\cloud_udp.c:245:    s_gcm_tx = heap_caps_calloc(1, sizeof(*s_gcm_tx),
+src/demo/components\cloud_udp\cloud_udp.c:247:    s_gcm_rx = heap_caps_calloc(1, sizeof(*s_gcm_rx),
+src/demo/components\cloud_udp\cloud_udp.c:606:    if (xTaskCreatePinnedToCoreWithCaps(cloud_udp_rx_task, "cloud_udp_rx",
+src/demo/main\peripheral_test.c:136:    if (xTaskCreate(limit_input_task, "limit_input", LIMIT_TASK_STACK, NULL,
+src/demo/main\peripheral_test.c:393:    } else if (xTaskCreatePinnedToCore(
+src/demo/main\peripheral_test.c:451:    const BaseType_t created = xTaskCreate(peripheral_test_task, "periph_test",
+src/demo/main\peripheral_test.c:463:    const BaseType_t quiet_created = xTaskCreate(quiet_check_task, "periph_quiet",
+src/demo/main\screen_carousel.c:247:    const BaseType_t created = xTaskCreatePinnedToCore(
+src/demo/components\home_info\home_info.c:367:    BaseType_t result = xTaskCreatePinnedToCore(
+src/demo/components\esp_driver_sdspi\src\sdspi_host.c:288:        slot->block_buf = heap_caps_malloc(SDSPI_BLOCK_BUF_SIZE, MALLOC_CAP_DMA);
+src/demo/components\esp_driver_sdspi\src\sdspi_host.c:483:    slot_info_t* slot = (slot_info_t*)malloc(sizeof(slot_info_t));
+src/demo/components\mech_button\mech_button.c:177:    const BaseType_t created = xTaskCreate(button_task, "button_task",
+src/demo/components\person_detect\person_detect.cpp:473:    s_model_rgb565 = static_cast<uint8_t *>(heap_caps_malloc(
+src/demo/components\person_detect\person_detect.cpp:503:    s_queue = xQueueCreate(1, sizeof(queued_frame_t));
+src/demo/components\person_detect\person_detect.cpp:511:    if (s_queue == nullptr || xTaskCreatePinnedToCoreWithCaps(
+src/demo/components\touch_key\touch_key.c:291:    const BaseType_t created = xTaskCreate(touch_key_task, "touch_key_task",
+src/demo/components\sd_card\sd_card_spi.c:282:    sdmmc_card_t *card = calloc(1, sizeof(*card));
+src/demo/components\video_streamer\dma2d_yuv.c:152:    s_dma2d_yuv.tx_desc = heap_caps_aligned_calloc(
+src/demo/components\video_streamer\dma2d_yuv.c:155:    s_dma2d_yuv.rx_desc = heap_caps_aligned_calloc(
+src/demo/components\video_streamer\dma2d_yuv.c:158:    s_dma2d_yuv.trans_placeholder = heap_caps_calloc(
+src/demo/components\xiaozhi_audio\wake_word.c:57: * 因而不需要额外锁，也不会在每个音频块上 malloc/free。 */
+src/demo/components\xiaozhi_audio\wake_word.c:229:    s_ww.feed_buffer = (int16_t *)heap_caps_malloc(
+src/demo/components\xiaozhi_audio\wake_word.c:233:    s_ww.preroll_buffer = (int16_t *)heap_caps_malloc(
+src/demo/components\xiaozhi_audio\wake_word.c:249:    BaseType_t task_ok = xTaskCreatePinnedToCore(
+src/demo/components\video_streamer\video_streamer.c:1988:    uint8_t *h264_input = esp_h264_aligned_calloc(
+src/demo/components\video_streamer\video_streamer.c:2054:    s_out_free = xQueueCreate(VIDEO_OUT_SLOT_COUNT, sizeof(unsigned));
+src/demo/components\video_streamer\video_streamer.c:2055:    s_out_ready = xQueueCreate(VIDEO_OUT_SLOT_COUNT, sizeof(unsigned));
+src/demo/components\video_streamer\video_streamer.c:2057:    s_agent_audio_queue_storage = heap_caps_calloc(
+src/demo/components\video_streamer\video_streamer.c:2062:        s_agent_audio_queue = xQueueCreateStatic(
+src/demo/components\video_streamer\video_streamer.c:2082:        out_buffers[i] = esp_h264_aligned_calloc(
+src/demo/components\video_streamer\video_streamer.c:2098:    BaseType_t created = xTaskCreatePinnedToCoreWithCaps(video_upload_task,
+src/demo/components\video_streamer\video_streamer.c:2113:    if (xTaskCreatePinnedToCoreWithCaps(video_report_task, "video_report", 4096, NULL,
+src/demo/components\video_streamer\video_streamer.c:2673:    s_ctrl_queue = xQueueCreate(VIDEO_CTRL_QUEUE_DEPTH, sizeof(video_ctrl_cmd_t));
+src/demo/components\video_streamer\video_streamer.c:2683:    if (xTaskCreatePinnedToCoreWithCaps(
+src/demo/components\video_streamer\video_streamer.c:2703:    s_input_queue = xQueueCreate(VIDEO_SLOT_COUNT, sizeof(unsigned));
+src/demo/components\video_streamer\video_streamer.c:2760:     * 普通 xTaskCreate 会先从内部堆取 8 KB 栈，把 USB 安装后约 100 KB 的
+src/demo/components\video_streamer\video_streamer.c:2763:    BaseType_t created = xTaskCreatePinnedToCoreWithCaps(
+src/demo/components\xiaozhi_audio\xiaozhi_audio.c:430:    int16_t *pcm = heap_caps_malloc(available * sizeof(int16_t),
+src/demo/components\xiaozhi_audio\xiaozhi_audio.c:1051:    s_audio.capture_raw = heap_caps_malloc(
+src/demo/components\xiaozhi_audio\xiaozhi_audio.c:1055:    s_audio.capture_pcm = heap_caps_malloc(
+src/demo/components\xiaozhi_audio\xiaozhi_audio.c:1058:    s_audio.capture_opus = heap_caps_malloc(
+src/demo/components\xiaozhi_audio\xiaozhi_audio.c:1065:        s_audio.playback_pcm[i] = heap_caps_malloc(
+src/demo/components\xiaozhi_audio\xiaozhi_audio.c:1819:    s_playback_queue_storage = heap_caps_calloc(
+src/demo/components\xiaozhi_audio\xiaozhi_audio.c:1828:    s_playback_queue = xQueueCreateStatic(
+src/demo/components\xiaozhi_audio\xiaozhi_audio.c:1839:    s_pcm_free_queue = xQueueCreateStatic(
+src/demo/components\xiaozhi_audio\xiaozhi_audio.c:1844:    s_pcm_ready_queue = xQueueCreateStatic(
+src/demo/components\xiaozhi_audio\xiaozhi_audio.c:1863:    BaseType_t task_result = xTaskCreatePinnedToCoreWithCaps(
+src/demo/components\xiaozhi_audio\xiaozhi_audio.c:1868:        task_result = xTaskCreatePinnedToCoreWithCaps(
+src/demo/components\xiaozhi_audio\xiaozhi_audio.c:1876:        task_result = xTaskCreatePinnedToCoreWithCaps(
+src/demo/components\xiaozhi_audio\xiaozhi_audio.c:1882:        task_result = xTaskCreatePinnedToCoreWithCaps(
+src/demo/components\xiaozhi_audio\xiaozhi_audio.c:2308:    s_hardware_test_mic_buffer = heap_caps_malloc(
+src/demo/components\xiaozhi_audio\xiaozhi_audio.c:2310:    s_hardware_test_tone_buffer = heap_caps_malloc(
+src/demo/components\xiaozhi_audio\xiaozhi_audio.c:2342:    BaseType_t created = xTaskCreatePinnedToCoreWithCaps(
+src/demo/components\xiaozhi_audio\xiaozhi_audio.c:2348:        created = xTaskCreatePinnedToCoreWithCaps(
+src/demo/components\xiaozhi_audio\xiaozhi_audio.c:2425:    BaseType_t result = xTaskCreatePinnedToCoreWithCaps(
+src/demo/components\xiaozhi_audio\xiaozhi_audio.c:2449:    if (xTaskCreatePinnedToCoreWithCaps(expression_selftest_task, "expr_selftest",
+src/demo/components\webrtc_whip\rtc_heap_diag.c:97:    s_records = heap_caps_calloc(PEER_TRACE_RECORD_MAX, sizeof(*s_records),
+src/demo/components\webrtc_whip\webrtc_whip.c:611:    s_offer = heap_caps_malloc(WHIP_SDP_CAPACITY, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+src/demo/components\webrtc_whip\webrtc_whip.c:799:    char *url = heap_caps_malloc(url_capacity,
+src/demo/components\webrtc_whip\webrtc_whip.c:801:    char *body = heap_caps_calloc(1, WHIP_CREDENTIAL_BODY_CAPACITY,
+src/demo/components\webrtc_whip\webrtc_whip.c:1116:    char *answer = heap_caps_malloc(WHIP_SDP_CAPACITY,
+src/demo/components\webrtc_whip\webrtc_whip.c:1189:        snapshot = heap_caps_calloc(64, sizeof(*snapshot),
+src/demo/components\webrtc_whip\webrtc_whip.c:1413:    s_commands_storage = heap_caps_malloc(2U * sizeof(control_command_t),
+src/demo/components\webrtc_whip\webrtc_whip.c:1416:        s_commands = xQueueCreateStatic(2, sizeof(control_command_t),
+src/demo/components\webrtc_whip\webrtc_whip.c:1490:    if (xTaskCreatePinnedToCoreWithCaps(controller_task, "webrtc_whip", 12288,

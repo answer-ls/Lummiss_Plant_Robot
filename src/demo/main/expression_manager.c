@@ -7,9 +7,12 @@
 #include "anim_bin_player.h"
 #include "ambient_led.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "esp_lvgl_port.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 
 static const char *TAG = "EXPRESSION";
 #define EXPRESSION_QUEUE_LEN 8
@@ -18,11 +21,15 @@ static const char *TAG = "EXPRESSION";
 typedef enum { EVENT_STATE, EVENT_EMOTION } event_type_t;
 typedef struct { event_type_t type; char value[20]; } expression_event_t;
 static QueueHandle_t s_queue;
+static StaticQueue_t s_queue_control;
+static uint8_t *s_queue_storage;
 static lv_obj_t *s_home;
 static lv_obj_t *s_screen;
 static lv_timer_t *s_timer;
+static SemaphoreHandle_t s_webrtc_prepare_done;
 static int64_t s_emotion_deadline;
 static bool s_initialized;
+static bool s_rtc_active;
 
 /* ===================== 情绪词 -> 表情素材映射 =====================
  *
@@ -132,20 +139,35 @@ static void expression_timer(lv_timer_t *timer)
             ambient_led_clear_emotion();
             ambient_led_set_state(AMBIENT_LED_STATE_THINKING);
             play_file(EXPRESSION_DIR "/exp_05.bin", 0);
+        } else if (strcmp(event.value, "webrtc") == 0) {
+            /* WebRTC 建链需要立即归还动画的 4 KB 文件读取缓存。该内部事件
+             * 不等待情绪保持时长，且先切 HOME 再释放图片 Buffer。 */
+            s_emotion_deadline = 0;
+            ambient_led_clear_emotion();
+            ambient_led_set_state(AMBIENT_LED_STATE_WAKE_IDLE);
+            lv_scr_load(s_home);
+            anim_bin_player_stop();
+            /* HOME 切换完成后停止 50ms 表情轮询，RTC STOP 时恢复。 */
+            lv_timer_pause(timer);
+            if (s_webrtc_prepare_done != NULL) {
+                xSemaphoreGive(s_webrtc_prepare_done);
+            }
         } else if (strcmp(event.value, "home") == 0 ||
                    strcmp(event.value, "tts_stop") == 0) {
             ambient_led_clear_emotion();
             ambient_led_set_state(AMBIENT_LED_STATE_WAKE_IDLE);
             if (s_emotion_deadline == 0 || esp_timer_get_time() >= s_emotion_deadline) {
-                anim_bin_player_stop();
+                /* 先让 LVGL 离开图片对象，再通知播放器释放其 data Buffer。 */
                 lv_scr_load(s_home);
+                anim_bin_player_stop();
             }
         }
     }
     if (s_emotion_deadline != 0 && esp_timer_get_time() >= s_emotion_deadline) {
         s_emotion_deadline = 0;
-        anim_bin_player_stop();
+        /* LVGL 不再引用描述符后，播放器任务才可以安全释放按需 Buffer。 */
         lv_scr_load(s_home);
+        anim_bin_player_stop();
     }
 }
 
@@ -159,8 +181,14 @@ esp_err_t expression_manager_init(void)
     lv_obj_set_style_bg_opa(s_screen, LV_OPA_COVER, 0);
     esp_err_t err = anim_bin_player_init(s_screen);
     if (err != ESP_OK) { lv_obj_del(s_screen); s_screen = NULL; return err; }
-    s_queue = xQueueCreate(EXPRESSION_QUEUE_LEN, sizeof(expression_event_t));
-    if (s_queue == NULL) return ESP_ERR_NO_MEM;
+    /* 表情事件仅由任务 CPU 拷贝；队列控制块留内部，载荷放 PSRAM。 */
+    s_queue_storage = heap_caps_malloc(EXPRESSION_QUEUE_LEN * sizeof(expression_event_t),
+                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_queue_storage == NULL) return ESP_ERR_NO_MEM;
+    s_queue = xQueueCreateStatic(EXPRESSION_QUEUE_LEN, sizeof(expression_event_t),
+                                 s_queue_storage, &s_queue_control);
+    s_webrtc_prepare_done = xSemaphoreCreateBinary();
+    if (s_queue == NULL || s_webrtc_prepare_done == NULL) return ESP_ERR_NO_MEM;
     s_timer = lv_timer_create(expression_timer, 50, NULL);
     if (s_timer == NULL) return ESP_ERR_NO_MEM;
     s_initialized = true;
@@ -171,6 +199,7 @@ esp_err_t expression_manager_init(void)
 static void post(event_type_t type, const char *value)
 {
     if (!s_initialized || value == NULL) return;
+    if (__atomic_load_n(&s_rtc_active, __ATOMIC_ACQUIRE)) return;
     expression_event_t event = { .type = type };
     strncpy(event.value, value, sizeof(event.value) - 1);
     (void)xQueueSend(s_queue, &event, 0);
@@ -178,3 +207,49 @@ static void post(event_type_t type, const char *value)
 
 void expression_manager_post_state(const char *state) { post(EVENT_STATE, state); }
 void expression_manager_post_emotion(const char *emotion) { post(EVENT_EMOTION, emotion); }
+
+esp_err_t expression_manager_prepare_for_webrtc(uint32_t timeout_ms)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const expression_event_t event = {
+        .type = EVENT_STATE,
+        .value = "webrtc",
+    };
+    /* 丢弃尚未显示的旧情绪事件，确保 HOME/stop 是下一次 LVGL timer
+     * 必定处理的事件；随后等待 UI 确认，不能仅凭 Buffer 当前为空返回。 */
+    xQueueReset(s_queue);
+    (void)xSemaphoreTake(s_webrtc_prepare_done, 0);
+    if (xQueueSendToFront(s_queue, &event, 0) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    /* 阻止建链等待期间的新情绪事件排到 HOME/stop 后面。 */
+    __atomic_store_n(&s_rtc_active, true, __ATOMIC_RELEASE);
+    if (xSemaphoreTake(s_webrtc_prepare_done,
+                       pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    /* expression_timer 在 LVGL 线程切回 HOME 后调用 stop；这里仅在 WHIP
+     * 控制任务等待资源释放，不直接访问任何 LVGL API。 */
+    const esp_err_t released = anim_bin_player_wait_resources_released(timeout_ms);
+    if (released == ESP_OK) {
+        /* 资源已释放且 LVGL 不再引用帧；从此到 RTC STOP，播放器任务
+         * 没有新请求，只在通知上阻塞。 */
+        anim_bin_player_set_rtc_blocked(true);
+        __atomic_store_n(&s_rtc_active, true, __ATOMIC_RELEASE);
+    }
+    return released;
+}
+
+void expression_manager_set_rtc_active(bool active)
+{
+    if (!s_initialized) return;
+    anim_bin_player_set_rtc_blocked(active);
+    if (lvgl_port_lock(0)) {
+        if (active) lv_timer_pause(s_timer);
+        else lv_timer_resume(s_timer);
+        lvgl_port_unlock();
+    }
+    __atomic_store_n(&s_rtc_active, active, __ATOMIC_RELEASE);
+}

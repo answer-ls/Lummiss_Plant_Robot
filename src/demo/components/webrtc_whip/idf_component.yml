@@ -1,0 +1,5 @@
+dependencies:
+  idf: ">=5.5.3,<6.0"
+  # 1.5.3 在合法 SDP Answer 上可能把 video_mid/audio_mid 解析为 255，
+  # 本轮只升级 peer_default 做 A/B，对 Camera/H264/WHIP HTTP 保持不变。
+  espressif/esp_peer: "=1.5.5"

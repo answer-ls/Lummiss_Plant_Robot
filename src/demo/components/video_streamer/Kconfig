@@ -1,0 +1,7 @@
+menu "RTC 内存诊断"
+    config RTC_MEM_DIAG_640P
+        bool "RTC A/B：使用 640x480@15、900 kbps"
+        default n
+        help
+            仅用于与默认 1280x720@20 比较 H264 reference 和 DMA 内存。
+endmenu

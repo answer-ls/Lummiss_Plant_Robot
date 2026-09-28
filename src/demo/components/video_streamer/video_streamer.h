@@ -53,7 +53,7 @@ typedef struct {
  * 摄像头侧"可编码帧"门控三处共用此常量，改动实时预览分辨率只需改这里。
  * 约束：宽高必须是偶数（YUV 重排按像素对处理）。
  * 注意：目前仍是编译期常量，改分辨率要重新构建；运行期下发改分辨率尚未实现。 */
-/* 800×600。2026-09-10 试过 1280×720，结论是**不值得**，别轻易再切回去。
+/* 历史对照：2026-09-10 的 1280×720 测试曾出现以下性能和稳定性问题。
  *
  * 两方面实测代价：
  *  1. 帧率：编解码链 800×600 约 31.3ms/帧（J 6.7 + Y 16.4 + H 8.2）→ 约 25 fps；
@@ -68,8 +68,18 @@ typedef struct {
  *     那只是更早一次短跑没撞上。降分辨率买不到帧完整性，得去查 EoF 检测与 URB 参数。
  *
  * 另外摄像头（LRCPG720p）实测声明最高只有 1280×960，**没有 1920×1080**。 */
+/* 本轮 WHIP 联调改为 1280×720；采集请求仍是摄像头声明的 MJPEG 30 FPS，
+ * H.264 输出目标保持 20 FPS，实际帧率需以实机统计为准。 */
+#ifndef CONFIG_RTC_MEM_DIAG_640P
+#define CONFIG_RTC_MEM_DIAG_640P 0
+#endif
+#if CONFIG_RTC_MEM_DIAG_640P
 #define VIDEO_STREAM_WIDTH   640
 #define VIDEO_STREAM_HEIGHT  480
+#else
+#define VIDEO_STREAM_WIDTH   1280
+#define VIDEO_STREAM_HEIGHT  720
+#endif
 /* 单个 MJPEG 压缩帧的上限。这个值同时是 UVC 帧缓冲大小、视频输入环槽大小，
  * 以及 camera_driver 里"过大帧"的丢弃门限，三处必须保持一致。
  *
@@ -153,6 +163,7 @@ typedef enum {
     VIDEO_STATE_STARTING,      /* 正在进入上传：清积压帧 + 请求 IDR */
     VIDEO_STATE_STREAMING,     /* 正在编码并上传 */
     VIDEO_STATE_STOPPING,      /* 正在退出上传：丢弃积压帧 */
+    VIDEO_STATE_ERROR,         /* 编码资源不足等不可继续错误，等待 stop 或显式重试 */
 } video_state_t;
 
 /* 开启 / 关闭 H.264 上传，两者都幂等：
@@ -165,6 +176,8 @@ typedef enum {
  * MCP 接收任务改用下面的 request_* 系列，把动作交给视频控制任务执行。 */
 esp_err_t video_streamer_start(void);
 esp_err_t video_streamer_stop(void);
+/* 新 WebRTC 会话或 RTCP PLI/FIR 到来时，请求编码器下一帧输出 IDR。 */
+void video_streamer_force_idr(void);
 bool video_streamer_is_active(void);
 video_state_t video_streamer_get_state(void);
 const char *video_streamer_state_name(video_state_t state);

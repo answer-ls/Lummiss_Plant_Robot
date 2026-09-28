@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 
 #include "esp_heap_caps.h"
+#include "esp_lvgl_port.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -70,7 +71,10 @@ static lv_obj_t *s_image;
 static lv_timer_t *s_ui_timer;
 static uint8_t *s_buffers[ANIM_BUFFER_COUNT];
 static uint8_t *s_sd_read_buffer;
+static bool s_rtc_blocked;
 static lv_img_dsc_t s_descriptors[ANIM_BUFFER_COUNT];
+static bool s_resources_allocated;
+static bool s_release_request;
 
 static bool s_initialized;
 static bool s_play_request;
@@ -112,6 +116,65 @@ static void set_run_state(uint32_t generation, bool loading, bool playing,
         s_last_error = error;
     }
     xSemaphoreGive(s_state_mutex);
+}
+
+/* 三帧 RGB565 与 SD 文件读取用户缓冲只在实际播放期间存在。所有申请和
+ * 释放都由 player_task 串行执行，避免 stop 与 fread 并发释放。 */
+static esp_err_t allocate_play_resources(void)
+{
+    if (s_resources_allocated) {
+        return ESP_OK;
+    }
+
+    s_sd_read_buffer = heap_caps_malloc(
+        ANIM_SD_READ_CHUNK,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_sd_read_buffer == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    for (int i = 0; i < (int)ANIM_BUFFER_COUNT; ++i) {
+        s_buffers[i] = heap_caps_malloc(ANIM_BUFFER_SIZE,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_buffers[i] == NULL) {
+            for (int j = 0; j < i; ++j) {
+                heap_caps_free(s_buffers[j]);
+                s_buffers[j] = NULL;
+            }
+            heap_caps_free(s_sd_read_buffer);
+            s_sd_read_buffer = NULL;
+            return ESP_ERR_NO_MEM;
+        }
+        memset(s_buffers[i], 0, ANIM_BUFFER_SIZE);
+    }
+
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_resources_allocated = true;
+    s_release_request = false;
+    xSemaphoreGive(s_state_mutex);
+    ESP_LOGI(TAG, "动画资源已按需申请：RGB565=%u KB PSRAM，SD_READ=%u KB PSRAM",
+             (unsigned)(ANIM_BUFFER_COUNT * ANIM_BUFFER_SIZE / 1024U),
+             (unsigned)(ANIM_SD_READ_CHUNK / 1024U));
+    return ESP_OK;
+}
+
+static void release_play_resources(void)
+{
+    for (int i = 0; i < (int)ANIM_BUFFER_COUNT; ++i) {
+        heap_caps_free(s_buffers[i]);
+        s_buffers[i] = NULL;
+        s_descriptors[i].data = NULL;
+        s_descriptors[i].data_size = 0;
+    }
+    heap_caps_free(s_sd_read_buffer);
+    s_sd_read_buffer = NULL;
+
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_active_buffer = -1;
+    s_frame_pending = false;
+    s_resources_allocated = false;
+    s_release_request = false;
+    xSemaphoreGive(s_state_mutex);
+    ESP_LOGI(TAG, "动画资源已释放：RGB565 三缓冲与 SD DMA 读缓存");
 }
 
 static void ui_frame_switch_timer(lv_timer_t *timer)
@@ -232,7 +295,7 @@ static esp_err_t validate_file(FILE *file, size_t file_size,
     }
 
     anim_bin_frame_t *frames = heap_caps_malloc(
-        table_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        table_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (frames == NULL) {
         return ESP_ERR_NO_MEM;
     }
@@ -568,7 +631,29 @@ static void player_task(void *arg)
     for (;;) {
         uint32_t generation = 0;
         if (!take_play_request(path, &generation)) {
+            bool release_requested;
+            xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+            release_requested = s_release_request && s_resources_allocated;
+            xSemaphoreGive(s_state_mutex);
+            if (release_requested) {
+                release_play_resources();
+                continue;
+            }
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            continue;
+        }
+
+        const esp_err_t alloc_result = allocate_play_resources();
+        if (alloc_result != ESP_OK) {
+            set_run_state(generation, false, false, alloc_result);
+            ESP_LOGE(TAG, "动画按需 Buffer 分配失败：%s",
+                     esp_err_to_name(alloc_result));
+            continue;
+        }
+        /* stop 可能恰好发生在按需分配期间；此时 stop 尚未看到
+         * resources_allocated。分配完成后再次核对 generation，避免资源滞留。 */
+        if (!generation_is_current(generation)) {
+            release_play_resources();
             continue;
         }
 
@@ -600,23 +685,6 @@ esp_err_t anim_bin_player_init(lv_obj_t *parent)
         goto no_memory;
     }
 
-    s_sd_read_buffer = heap_caps_malloc(
-        ANIM_SD_READ_CHUNK,
-        MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-    if (s_sd_read_buffer == NULL) {
-        goto no_memory;
-    }
-
-    for (int i = 0; i < (int)ANIM_BUFFER_COUNT; i++) {
-        s_buffers[i] = heap_caps_malloc(
-            ANIM_BUFFER_SIZE,
-            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (s_buffers[i] == NULL) {
-            goto no_memory;
-        }
-        memset(s_buffers[i], 0, ANIM_BUFFER_SIZE);
-    }
-
     s_image = lv_img_create(parent);
     if (s_image == NULL) {
         goto no_memory;
@@ -627,20 +695,18 @@ esp_err_t anim_bin_player_init(lv_obj_t *parent)
         goto no_memory;
     }
 
-    const BaseType_t created = xTaskCreatePinnedToCore(
+    const BaseType_t created = xTaskCreatePinnedToCoreWithCaps(
         player_task, "anim_player", ANIM_TASK_STACK, NULL,
-        ANIM_TASK_PRIORITY, &s_player_task, ANIM_TASK_CORE);
+        ANIM_TASK_PRIORITY, &s_player_task, ANIM_TASK_CORE,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (created != pdPASS) {
         goto no_memory;
     }
 
     s_initialized = true;
     ESP_LOGI(TAG,
-             "播放器已初始化：三 Buffer A/B/C，各 %u bytes，PSRAM 常驻 %u KB，"
-             "SD 内部读缓存 %u KB，任务 CPU%u/P%u",
-             ANIM_BUFFER_SIZE,
-             (ANIM_BUFFER_COUNT * ANIM_BUFFER_SIZE) / 1024U,
-             ANIM_SD_READ_CHUNK / 1024U,
+             "播放器已初始化：RGB565 三缓冲和 SD 读缓存均按需申请，"
+             "任务栈位于 PSRAM，CPU%u/P%u",
              ANIM_TASK_CORE, ANIM_TASK_PRIORITY);
     return ESP_OK;
 
@@ -681,9 +747,14 @@ esp_err_t anim_bin_player_play(const char *path)
     }
 
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    if (s_rtc_blocked) {
+        xSemaphoreGive(s_state_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
     s_generation++;
     memcpy(s_requested_path, path, path_len + 1U);
     s_play_request = true;
+    s_release_request = false;
     s_loading = true;
     s_playing = false;
     s_last_error = ESP_OK;
@@ -706,9 +777,48 @@ void anim_bin_player_stop(void)
     s_playing = false;
     s_last_error = ESP_OK;
     s_frame_pending = false;
+    s_release_request = s_resources_allocated;
     xSemaphoreGive(s_state_mutex);
 
     xTaskNotifyGive(s_player_task);
+}
+
+void anim_bin_player_set_rtc_blocked(bool blocked)
+{
+    if (!s_initialized) return;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_rtc_blocked = blocked;
+    xSemaphoreGive(s_state_mutex);
+    /* 调用方已切回首页并等待资源释放；暂停帧定时器，消除 5ms 空唤醒。
+     * 不持状态锁等待 LVGL 锁，避免与帧回调的锁顺序相反。 */
+    if (lvgl_port_lock(0)) {
+        if (blocked) lv_timer_pause(s_ui_timer);
+        else lv_timer_resume(s_ui_timer);
+        lvgl_port_unlock();
+    }
+    /* 解除阻塞不会自动播放旧请求；新表情必须重新提交。 */
+}
+
+esp_err_t anim_bin_player_wait_resources_released(uint32_t timeout_ms)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const TickType_t start = xTaskGetTickCount();
+    const TickType_t timeout = pdMS_TO_TICKS(timeout_ms);
+    for (;;) {
+        bool released;
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        released = !s_resources_allocated;
+        xSemaphoreGive(s_state_mutex);
+        if (released) {
+            return ESP_OK;
+        }
+        if (xTaskGetTickCount() - start >= timeout) {
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
 }
 
 bool anim_bin_player_is_playing(void)

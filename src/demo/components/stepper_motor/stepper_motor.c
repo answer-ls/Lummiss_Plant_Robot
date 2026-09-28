@@ -7,10 +7,13 @@
 #include "driver/gpio.h"
 #include <stddef.h>
 
+#include "esp_log.h"
 #include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+
+static const char *TAG = "STEPPER";
 
 /* 四列顺序严格对应 AIN1、AIN2、BIN2、BIN1。 */
 static const gpio_num_t s_input_pins[] = {
@@ -139,15 +142,6 @@ static void fault_gpio_isr(void *arg)
     }
 }
 
-static void clear_fault_latch(void)
-{
-    if (gpio_get_level(BOARD_STEPPER_FAULT) != 0) {
-        portENTER_CRITICAL(&s_state_lock);
-        s_fault_latched = false;
-        portEXIT_CRITICAL(&s_state_lock);
-    }
-}
-
 static void release_move_mutex(void)
 {
     portENTER_CRITICAL(&s_state_lock);
@@ -186,7 +180,8 @@ esp_err_t stepper_motor_init(void)
         (1ULL << BOARD_STEPPER_SLEEP);
     const gpio_config_t output_config = {
         .pin_bit_mask = output_mask,
-        .mode = GPIO_MODE_OUTPUT,
+        /* 同时启用输入读取，诊断实际管脚电平而非只打印相序表。 */
+        .mode = GPIO_MODE_INPUT_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
@@ -253,24 +248,41 @@ esp_err_t stepper_motor_enable(void)
         return ESP_FAIL;
     }
 
-    if (gpio_get_level(BOARD_STEPPER_FAULT) == 0) {
-        /* 故障已存在时也要确保桥臂输入和 nSLEEP 都处于关闭状态。 */
-        disable_hardware();
-        xSemaphoreGive(s_move_mutex);
-        return ESP_FAIL;
+    /* nFAULT 在 nSLEEP 为低、芯片尚未完成唤醒时不能作为最终故障判据。
+     * 先保证四个桥臂输入全低，再唤醒芯片；等待 2 ms 后才读取 nFAULT。
+     * 如果届时仍为低，立即恢复安全关闭状态，绝不输出任何相序。 */
+    ESP_LOGI(TAG, "WAKE_BEFORE GPIO%d=%d latched=%d",
+             BOARD_STEPPER_FAULT, gpio_get_level(BOARD_STEPPER_FAULT), fault_latched());
+    /* 桥臂全低的唤醒窗口暂不锁存下降沿，避免把休眠状态带入本次动作。
+     * 唤醒结束仍检查实际电平，重新启用中断后不再清除任何故障。 */
+    esp_err_t err = gpio_intr_disable(BOARD_STEPPER_FAULT);
+    if (err == ESP_OK) {
+        err = set_all_inputs_low();
     }
-    clear_fault_latch();
-
-    esp_err_t err = set_all_inputs_low();
     if (err == ESP_OK) {
         err = gpio_set_level(BOARD_STEPPER_SLEEP, 1);
     }
+    int settled_level = -1;
+    bool old_latch = false;
     if (err == ESP_OK) {
         /* nSLEEP 拉高后留出芯片唤醒时间，再允许后续步进。 */
         esp_rom_delay_us(2000);
-        if (fault_active()) {
-            err = ESP_FAIL;
-        }
+        portENTER_CRITICAL(&s_state_lock);
+        settled_level = gpio_get_level(BOARD_STEPPER_FAULT);
+        old_latch = s_fault_latched;
+        s_fault_latched = (settled_level == 0);
+        portEXIT_CRITICAL(&s_state_lock);
+    }
+    const esp_err_t intr_err = gpio_intr_enable(BOARD_STEPPER_FAULT);
+    ESP_LOGI(TAG, "WAKE_SETTLED GPIO%d=%d latched_before=%d latched_after=%d",
+             BOARD_STEPPER_FAULT, settled_level, old_latch, fault_latched());
+    if (err == ESP_OK) {
+        err = intr_err;
+    }
+    if (err == ESP_OK && fault_active()) {
+        ESP_LOGE(TAG, "WAKE_FAULT GPIO%d=%d latched=%d，关闭 H 桥",
+                 BOARD_STEPPER_FAULT, gpio_get_level(BOARD_STEPPER_FAULT), fault_latched());
+        err = ESP_FAIL;
     }
 
     if (err == ESP_OK) {
@@ -323,7 +335,7 @@ esp_err_t stepper_motor_move_steps(
         return ESP_ERR_INVALID_STATE;
     }
 
-    clear_fault_latch();
+    /* 运行前及运行期间都保留唤醒后捕获的故障，禁止再次清锁存。 */
     portENTER_CRITICAL(&s_state_lock);
     s_moving = true;
     s_stop_requested = false;
@@ -358,6 +370,22 @@ esp_err_t stepper_motor_move_steps(
         if (result != ESP_OK) {
             disable_hardware();
             break;
+        }
+
+        /* 仅慢速诊断逐相打印，正常 MCP 步速不增加串口负担。
+         * GPIO 回读只能确认主控管脚，不能证明 H 桥输出或机械位移。 */
+        if (step_interval_us >= 500000U) {
+            const uint8_t *phase = s_full_step_phase[s_phase_index];
+            ESP_LOGI(TAG,
+                     "PHASE step=%u/%u dir=%s phase=%u expected=%u%u%u%u "
+                     "GPIO10/11/12/13=%d%d%d%d SLEEP=%d FAULT=%d latched=%d",
+                     (unsigned)(step + 1), (unsigned)steps,
+                     direction == STEPPER_DIR_CW ? "cw" : "ccw", s_phase_index,
+                     phase[0], phase[1], phase[2], phase[3],
+                     gpio_get_level(s_input_pins[0]), gpio_get_level(s_input_pins[1]),
+                     gpio_get_level(s_input_pins[2]), gpio_get_level(s_input_pins[3]),
+                     gpio_get_level(BOARD_STEPPER_SLEEP),
+                     gpio_get_level(BOARD_STEPPER_FAULT), fault_latched());
         }
 
         result = esp_timer_start_once(s_step_timer, step_interval_us);

@@ -1,4 +1,7 @@
 #include "sd_card.h"
+#include "board_pins.h"
+
+#if !BOARD_USE_NEW_PCB
 
 #include <string.h>
 
@@ -195,3 +198,6 @@ bool sd_card_is_mounted(void)
 {
     return s_mounted;
 }
+esp_err_t sd_card_get_write_error(void) { return ESP_OK; }
+esp_err_t sd_card_raw_diagnostic(void) { return sd_card_self_test(); }
+#endif

@@ -5,6 +5,7 @@ idf_component_register(
         "time_service.c"
     INCLUDE_DIRS "."
     REQUIRES
+        board
         esp_event
         esp_netif
         esp_timer

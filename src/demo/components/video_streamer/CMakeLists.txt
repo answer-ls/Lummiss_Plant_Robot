@@ -2,12 +2,14 @@ idf_component_register(
     SRCS "video_streamer.c" "dma2d_yuv.c"
     INCLUDE_DIRS "."
     REQUIRES
+        board
         esp_websocket_client
         esp_driver_jpeg
         esp_hw_support
         esp_timer
         esp_h264
         network
+        webrtc_whip
         json)
 
 # YUV422 转 YUV420 是当前流水线中耗时最大的逐像素循环。仅对本组件启用

@@ -1,3 +1,4 @@
+#include "mem_contig.h"
 #include <assert.h>
 #include <inttypes.h>
 #include <math.h>
@@ -16,7 +17,9 @@
 #include "esp_private/uvc_stream.h"
 
 #include "camera_driver.h"
+#include "camera_photo.h"
 #include "video_streamer.h"
+#include "webrtc_whip.h"
 #include "person_detect.h"
 
 static const char *TAG = "CAMERA";
@@ -27,7 +30,7 @@ static const char *TAG = "CAMERA";
 #define MAX_CAMERA_FORMATS  32
 #define CAMERA_STALL_LIMIT  1
 #define CAMERA_SAME_FORMAT_RETRY_LIMIT 1
-#define CAMERA_HANDOFF_COPY_SIZE  (256U * 1024U)
+#define CAMERA_HANDOFF_COPY_SIZE  VIDEO_STREAM_JPEG_MAX_SIZE
 #define CAMERA_HANDOFF_COPY_COUNT 3
 #define CAMERA_HANDOFF_QUEUE_LENGTH CAMERA_HANDOFF_COPY_COUNT
 #define CAMERA_HANDOFF_TASK_PRIORITY 18
@@ -82,10 +85,6 @@ static uvc_host_frame_info_t s_camera_formats[MAX_CAMERA_FORMATS];
 static size_t s_camera_format_count;
 static uint8_t s_camera_device_address;
 static uint8_t s_camera_stream_index;
-/* 是否从真实摄像头连接回调里读到过格式列表。
- * 只有从未读到过时才允许用“已知格式”兜底；一旦确认过真实设备，
- * 之后的断开只能靠真实的重新接入事件恢复，避免对空总线反复探测。 */
-static bool s_saw_real_formats;
 static volatile bool s_usb_events_running;
 static TaskHandle_t s_usb_events_task;
 
@@ -126,6 +125,21 @@ static void camera_log_memory(const char *stage)
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
 }
 
+/* 断线、传输错误和主动重建都使旧流的首帧证明失效。
+ * 下一条流必须重新收到有效 MJPEG 帧，RTC 才能开始建链。 */
+static void camera_mark_unready(void)
+{
+    const bool was_ready = __atomic_exchange_n(&s_camera_ready_announced,
+                                                false, __ATOMIC_ACQ_REL);
+    if (s_camera_ready_events != NULL) {
+        xEventGroupClearBits(s_camera_ready_events, CAMERA_READY_BIT);
+    }
+    webrtc_whip_notify_camera_unready();
+    if (was_ready) {
+        ESP_LOGW(TAG, "CAMERA_READY 已清除：当前 UVC 流失效");
+    }
+}
+
 esp_err_t camera_driver_prepare_ready_event(void)
 {
     if (s_camera_ready_events == NULL) {
@@ -135,8 +149,7 @@ esp_err_t camera_driver_prepare_ready_event(void)
             return ESP_ERR_NO_MEM;
         }
     }
-    s_camera_ready_announced = false;
-    xEventGroupClearBits(s_camera_ready_events, CAMERA_READY_BIT);
+    camera_mark_unready();
     return ESP_OK;
 }
 
@@ -176,7 +189,15 @@ static camera_stats_t camera_stats_snapshot(void)
  * an actual target MJPEG frame before treating the start as successful. This
  * distinguishes a live stream from a ring that only receives empty ISOC
  * packets during a failed first start. */
-static bool camera_wait_first_frame(uint32_t timeout_ms, uint32_t *elapsed_ms)
+typedef enum {
+    CAMERA_FIRST_FRAME_READY,
+    CAMERA_FIRST_FRAME_TIMEOUT,
+    CAMERA_FIRST_FRAME_DISCONNECTED,
+    CAMERA_FIRST_FRAME_TRANSFER_ERROR,
+} camera_first_frame_result_t;
+
+static camera_first_frame_result_t camera_wait_first_frame(uint32_t timeout_ms,
+                                                           uint32_t *elapsed_ms)
 {
     const int64_t started_us = esp_timer_get_time();
     const int64_t deadline_us = started_us + (int64_t)timeout_ms * 1000;
@@ -184,7 +205,11 @@ static bool camera_wait_first_frame(uint32_t timeout_ms, uint32_t *elapsed_ms)
     while (esp_timer_get_time() < deadline_us) {
         const EventBits_t bits = xEventGroupGetBits(s_camera_events);
         if (bits & (CAMERA_DISCONNECTED | CAMERA_ERROR)) {
-            return false;
+            if (elapsed_ms != NULL) {
+                *elapsed_ms = (uint32_t)((esp_timer_get_time() - started_us) / 1000);
+            }
+            return (bits & CAMERA_DISCONNECTED) ? CAMERA_FIRST_FRAME_DISCONNECTED :
+                                                  CAMERA_FIRST_FRAME_TRANSFER_ERROR;
         }
 
         const camera_stats_t current = camera_stats_snapshot();
@@ -192,7 +217,7 @@ static bool camera_wait_first_frame(uint32_t timeout_ms, uint32_t *elapsed_ms)
             if (elapsed_ms != NULL) {
                 *elapsed_ms = (uint32_t)((esp_timer_get_time() - started_us) / 1000);
             }
-            return true;
+            return CAMERA_FIRST_FRAME_READY;
         }
         vTaskDelay(pdMS_TO_TICKS(CAMERA_FIRST_FRAME_POLL_MS));
     }
@@ -200,13 +225,29 @@ static bool camera_wait_first_frame(uint32_t timeout_ms, uint32_t *elapsed_ms)
     if (elapsed_ms != NULL) {
         *elapsed_ms = timeout_ms;
     }
-    return false;
+    return CAMERA_FIRST_FRAME_TIMEOUT;
+}
+
+/* 断开回调会把格式数清零；此时绝不能用它做取模，也不能继续轮转旧描述符。
+ * 只有仍连接且格式列表有效时，才允许尝试设备声明的下一种模式。 */
+static bool camera_advance_format(unsigned *candidate, unsigned *same_format_retries)
+{
+    *same_format_retries = 0;
+    const size_t format_count = s_camera_format_count;
+    if ((xEventGroupGetBits(s_camera_events) & CAMERA_DISCONNECTED) != 0 ||
+        format_count == 0) {
+        *candidate = 0;
+        ESP_LOGW(TAG, "摄像头已断开或格式列表失效，等待重新枚举后从首选模式重试");
+        return false;
+    }
+    *candidate = (*candidate + 1) % format_count;
+    return true;
 }
 
 typedef struct {
     uint8_t *data;
     size_t data_len;
-    bool in_use;
+    uint32_t ref_count; /* video/photo 共享同一 MJPEG 副本，各自归还引用 */
 } camera_frame_copy_t;
 
 typedef struct {
@@ -317,41 +358,6 @@ static void camera_log_target_intervals(const uvc_host_frame_info_t *frame_info)
     }
 }
 
-/* LRCPG720p 已实测支持以下 MJPEG 模式（当前 H.264 链路只吃
- * VIDEO_STREAM_WIDTH×VIDEO_STREAM_HEIGHT）。顺序即轮转时的偏好顺序，
- * 目标分辨率放最前，若设备连接回调暂时没有给出格式列表，使用该列表避免再次传入 0 FPS。 */
-static void camera_load_known_formats(void)
-{
-    static const struct {
-        enum uvc_host_stream_format format;
-        unsigned width;
-        unsigned height;
-    } known_sizes[] = {
-        {UVC_VS_FORMAT_MJPEG, CAMERA_CAPTURE_WIDTH, CAMERA_CAPTURE_HEIGHT},
-        {UVC_VS_FORMAT_MJPEG, 640, 480},
-        {UVC_VS_FORMAT_MJPEG, 1280, 720},
-        {UVC_VS_FORMAT_MJPEG, 1280, 960},
-        {UVC_VS_FORMAT_MJPEG, 800, 600},
-        {UVC_VS_FORMAT_MJPEG, 720, 960},
-        {UVC_VS_FORMAT_MJPEG, 640, 360},
-    };
-
-    s_camera_format_count = sizeof(known_sizes) / sizeof(known_sizes[0]);
-    for (size_t i = 0; i < s_camera_format_count; ++i) {
-        s_camera_formats[i] = (uvc_host_frame_info_t) {
-            .format = known_sizes[i].format,
-            .h_res = known_sizes[i].width,
-            .v_res = known_sizes[i].height,
-            .default_interval = 333333,
-        };
-    }
-    s_camera_device_address = UVC_HOST_ANY_DEV_ADDR;
-    s_camera_stream_index = 0;
-    ESP_LOGW(TAG, "暂未收到格式回调，使用  已知格式，优先 %ux%u MJPEG 30 FPS",
-             CAMERA_CAPTURE_WIDTH, CAMERA_CAPTURE_HEIGHT);
-    xEventGroupSetBits(s_camera_events, CAMERA_FORMATS_READY);
-}
-
 /* 摄像头接入后读取设备真实声明的格式，不根据产品名称猜测分辨率。 */
 static void camera_driver_event_cb(const uvc_host_driver_event_data_t *event, void *ctx)
 {
@@ -380,7 +386,6 @@ static void camera_driver_event_cb(const uvc_host_driver_event_data_t *event, vo
     s_camera_device_address = event->device_connected.dev_addr;
     s_camera_stream_index = event->device_connected.uvc_stream_index;
     s_camera_format_count = count;
-    s_saw_real_formats = true;
 
     /* 将本档位的目标 MJPEG 稳定移动到首位，同时保持其余格式原有顺序。
      * 纯 UVC 诊断只会使用这个首选项，不会在本次运行中轮转。 */
@@ -458,8 +463,8 @@ static camera_frame_copy_t *camera_acquire_frame_copy(size_t data_len)
     camera_frame_copy_t *copy = NULL;
     portENTER_CRITICAL(&s_frame_copy_lock);
     for (unsigned i = 0; i < CAMERA_HANDOFF_COPY_COUNT; ++i) {
-        if (!s_frame_copies[i].in_use && s_frame_copies[i].data != NULL) {
-            s_frame_copies[i].in_use = true;
+        if (s_frame_copies[i].ref_count == 0 && s_frame_copies[i].data != NULL) {
+            s_frame_copies[i].ref_count = 1;
             s_frame_copies[i].data_len = data_len;
             copy = &s_frame_copies[i];
             break;
@@ -467,6 +472,19 @@ static camera_frame_copy_t *camera_acquire_frame_copy(size_t data_len)
     }
     portEXIT_CRITICAL(&s_frame_copy_lock);
     return copy;
+}
+
+static bool camera_retain_frame_copy(camera_frame_copy_t *copy)
+{
+    bool retained = false;
+    if (copy == NULL) return false;
+    portENTER_CRITICAL(&s_frame_copy_lock);
+    if (copy->ref_count > 0 && copy->data != NULL) {
+        copy->ref_count++;
+        retained = true;
+    }
+    portEXIT_CRITICAL(&s_frame_copy_lock);
+    return retained;
 }
 
 static void camera_release_frame_copy(void *release_ctx)
@@ -477,8 +495,12 @@ static void camera_release_frame_copy(void *release_ctx)
     }
 
     portENTER_CRITICAL(&s_frame_copy_lock);
-    copy->data_len = 0;
-    copy->in_use = false;
+    if (copy->ref_count > 0) {
+        copy->ref_count--;
+        if (copy->ref_count == 0) {
+            copy->data_len = 0;
+        }
+    }
     portEXIT_CRITICAL(&s_frame_copy_lock);
 }
 
@@ -497,7 +519,7 @@ static bool camera_frame_copy_pool_init(void)
             return false;
         }
         s_frame_copies[i].data_len = 0;
-        s_frame_copies[i].in_use = false;
+        s_frame_copies[i].ref_count = 0;
     }
     ESP_LOGI(TAG, "MJPEG handoff 复制池已就绪：%u x %u KB",
              CAMERA_HANDOFF_COPY_COUNT,
@@ -507,11 +529,33 @@ static bool camera_frame_copy_pool_init(void)
 
 static void camera_frame_copy_pool_deinit(void)
 {
+    /* photo_task 可能正在把共享槽写入 SD。等待它归还引用后再释放，避免
+     * 摄像头异常退出时留下悬空 JPEG 指针。 */
+    const TickType_t started = xTaskGetTickCount();
+    for (;;) {
+        bool all_idle = true;
+        portENTER_CRITICAL(&s_frame_copy_lock);
+        for (unsigned i = 0; i < CAMERA_HANDOFF_COPY_COUNT; ++i) {
+            if (s_frame_copies[i].ref_count != 0) {
+                all_idle = false;
+                break;
+            }
+        }
+        portEXIT_CRITICAL(&s_frame_copy_lock);
+        if (all_idle || xTaskGetTickCount() - started >= pdMS_TO_TICKS(5000)) {
+            if (!all_idle) {
+                ESP_LOGW(TAG, "handoff 共享槽仍被占用，跳过释放以避免悬空指针");
+                return;
+            }
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
     for (unsigned i = 0; i < CAMERA_HANDOFF_COPY_COUNT; ++i) {
         heap_caps_free(s_frame_copies[i].data);
         s_frame_copies[i].data = NULL;
         s_frame_copies[i].data_len = 0;
-        s_frame_copies[i].in_use = false;
+        s_frame_copies[i].ref_count = 0;
     }
 }
 
@@ -537,9 +581,11 @@ static void camera_handoff_task(void *arg)
                                                __ATOMIC_ACQUIRE);
         bool retained = false;
         if (accepting) {
+#if CAMERA_PERSON_DETECT_ENABLED
             /* AI 只在 handoff 任务中抽取快照，绝不在 UVC 回调中运行或阻塞。
              * person_detect 内部每秒最多复制一帧，忙时直接丢弃旧画面。 */
             (void)person_detect_submit_mjpeg(item.copy->data, item.copy->data_len);
+#endif
             retained = video_streamer_submit_jpeg_owned(
                 item.copy->data, item.copy->data_len,
                 camera_release_frame_copy, item.copy);
@@ -641,7 +687,11 @@ static bool camera_frame_cb(const uvc_host_frame_t *frame, void *ctx)
     }
 #endif
     if (candidate_frame) {
-        if (!__atomic_load_n(&s_camera_handoff_accepting, __ATOMIC_ACQUIRE)) {
+        const bool video_accepting =
+            __atomic_load_n(&s_camera_handoff_accepting, __ATOMIC_ACQUIRE);
+        const bool photo_waiting =
+            camera_photo_get_state() == PHOTO_WAIT_FRAME;
+        if (!video_accepting && !photo_waiting) {
             CAMERA_FRAME_CB_RETURN(true);
         }
         camera_frame_copy_t *copy = camera_acquire_frame_copy(frame->data_len);
@@ -656,6 +706,23 @@ static bool camera_frame_cb(const uvc_host_frame_t *frame, void *ctx)
          * 缓冲由 handoff/编解码链路独立持有。memcpy 的耗时会被 callback
          * 统计覆盖，用于确认它没有重新成为 USB 等时瓶颈。 */
         memcpy(copy->data, frame->data, frame->data_len);
+
+        /* Photo 与 Video 共享这一个已经脱离 UVC 生命周期的副本。Photo
+         * 接管额外引用后可异步写 SD，不会阻塞回调，也不会二次复制整帧。 */
+        if (photo_waiting && camera_retain_frame_copy(copy)) {
+            const bool photo_retained = camera_photo_submit_mjpeg_owned(
+                copy->data, copy->data_len,
+                frame->vs_format.h_res, frame->vs_format.v_res,
+                camera_release_frame_copy, copy);
+            if (!photo_retained) {
+                camera_release_frame_copy(copy);
+            }
+        }
+
+        if (!video_accepting) {
+            camera_release_frame_copy(copy);
+            CAMERA_FRAME_CB_RETURN(true);
+        }
         const camera_frame_handoff_item_t item = {
             .copy = copy,
         };
@@ -680,12 +747,14 @@ static void camera_stream_event_cb(const uvc_host_stream_event_data_t *event, vo
     switch (event->type) {
     case UVC_HOST_DEVICE_DISCONNECTED:
         ESP_LOGW(TAG, "摄像头已断开");
+        camera_mark_unready();
         s_camera_format_count = 0;
         xEventGroupClearBits(s_camera_events, CAMERA_FORMATS_READY);
         xEventGroupSetBits(s_camera_events, CAMERA_DISCONNECTED);
         break;
     case UVC_HOST_TRANSFER_ERROR:
         ESP_LOGE(TAG, "USB 传输错误：%s", esp_err_to_name(event->transfer_error.error));
+        camera_mark_unready();
         xEventGroupSetBits(s_camera_events, CAMERA_ERROR);
         break;
     case UVC_HOST_FRAME_BUFFER_OVERFLOW:
@@ -791,6 +860,7 @@ static esp_err_t camera_usb_events_drain_pending(void)
 
 static esp_err_t camera_usb_stack_install(void)
 {
+    mem_contig_log("USB_INIT_BEFORE");
     esp_err_t err = usb_host_install(&s_usb_host_config);
     if (err != ESP_OK) {
         return err;
@@ -812,6 +882,8 @@ static esp_err_t camera_usb_stack_install(void)
         usb_host_uninstall();
         return err;
     }
+
+    mem_contig_log("USB_UVC_INIT_AFTER");
 
     /* UVC must be installed before power is applied, otherwise the first
      * enumeration event can arrive before the UVC client is registered. */
@@ -851,9 +923,8 @@ static esp_err_t camera_usb_force_disconnect(void)
  * layers so the next open starts with a fresh client/device state. */
 static esp_err_t camera_usb_stack_rebuild(void)
 {
-    ESP_LOGW(TAG, "停止视频流失败，执行 USB Host/UVC 完整重建");
+    ESP_LOGW(TAG, "执行 USB Host/UVC 完整重建，等待摄像头重新枚举");
     s_camera_format_count = 0;
-    s_saw_real_formats = false;
     xEventGroupClearBits(s_camera_events, CAMERA_FORMATS_READY | CAMERA_DISCONNECTED | CAMERA_ERROR);
 
     esp_err_t err = uvc_host_uninstall();
@@ -920,30 +991,6 @@ void camera_driver_run(void)
     ESP_LOGI(TAG, "使用 ESP32-P4 高速 USB Host，当前 PSRAM 可用：%u 字节",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
-    /* UVC-only 隔离阶段不初始化视频流水线，避免 H.264/WebSocket 影响 USB。 */
-#if !TP_HAS(HANDOFF)
-    ESP_LOGI(TAG, "测试档位=%d（%s）：跳过 H.264/JPEG/WebSocket 视频流水线",
-             CAMERA_TEST_PROFILE, test_profile_name());
-#else
-    /* 实时流初始化失败不影响本地 UVC 采集，错误会保留在串口日志中。 */
-    esp_err_t streamer_error = video_streamer_init(NULL);
-    if (streamer_error != ESP_OK) {
-        ESP_LOGE(TAG, "初始化 H.264 实时流失败：%s",
-                 esp_err_to_name(streamer_error));
-    } else {
-        /* 这里只初始化，不开启上传：开机默认 IDLE，必须等服务端下发
-         * VIDEO_START（见 video_streamer.h 的「按需视频流」说明）。
-         * UVC 采集照常运行，只是帧不再进入 H.264 流水线。
-         * 调试时可以打开 CAMERA_VIDEO_STREAM_AUTOSTART 跳过服务端命令。 */
-#if CAMERA_VIDEO_STREAM_AUTOSTART
-        video_streamer_start();
-        ESP_LOGI(TAG, "视频编码与上传：调试开关强制开启");
-#else
-        ESP_LOGI(TAG, "视频编码与上传：关闭，等待服务端 VIDEO_START（UVC 采集保持运行）");
-#endif
-    }
-#endif
-
     s_camera_events = xEventGroupCreate();
     assert(s_camera_events != NULL);
 
@@ -955,11 +1002,12 @@ void camera_driver_run(void)
 
     s_camera_handoff_queue = xQueueCreate(
         CAMERA_HANDOFF_QUEUE_LENGTH, sizeof(camera_frame_handoff_item_t));
+    TaskHandle_t handoff_task = NULL;
     if (s_camera_handoff_queue == NULL ||
-        xTaskCreatePinnedToCore(camera_handoff_task, "camera_handoff",
+        xTaskCreatePinnedToCoreWithCaps(camera_handoff_task, "camera_handoff",
                                 CAMERA_HANDOFF_TASK_STACK, NULL,
-                                CAMERA_HANDOFF_TASK_PRIORITY, NULL,
-                                CAMERA_USB_CORE) != pdPASS) {
+                                CAMERA_HANDOFF_TASK_PRIORITY, &handoff_task,
+                                CAMERA_USB_CORE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
         ESP_LOGE(TAG, "创建 camera handoff 任务失败");
         if (s_camera_handoff_queue != NULL) {
             vQueueDelete(s_camera_handoff_queue);
@@ -969,8 +1017,45 @@ void camera_driver_run(void)
         return;
     }
 
-    /* ESP32-P4 外设映射 BIT0 对应内部高速 USB PHY。 */
-    ESP_ERROR_CHECK(camera_usb_stack_install());
+    /* 先安装 USB HCD，再初始化 JPEG/H.264；HCD 的帧表必须占用内部 DMA RAM。
+     * 720p 编解码器会挤碎内部堆，若让它先启动，HCD 偶发 ESP_ERR_NO_MEM。 */
+    camera_log_memory("USB_INSTALL_BEFORE");
+    const esp_err_t usb_error = camera_usb_stack_install();
+    if (usb_error != ESP_OK) {
+        ESP_LOGE(TAG, "USB Host/UVC 安装失败：%s；本次停止摄像头任务，不触发重启",
+                 esp_err_to_name(usb_error));
+        /* WithCaps 任务必须使用配对释放接口，包括启动失败路径。 */
+        vTaskDeleteWithCaps(handoff_task);
+        vQueueDelete(s_camera_handoff_queue);
+        s_camera_handoff_queue = NULL;
+        camera_frame_copy_pool_deinit();
+        vEventGroupDelete(s_camera_events);
+        s_camera_events = NULL;
+        return;
+    }
+    camera_log_memory("USB_INSTALL_AFTER");
+
+    /* UVC-only 隔离阶段不初始化视频流水线，避免 H.264/WebSocket 影响 USB。 */
+#if !TP_HAS(HANDOFF)
+    ESP_LOGI(TAG, "测试档位=%d（%s）：跳过 H.264/JPEG/WebSocket 视频流水线",
+             CAMERA_TEST_PROFILE, test_profile_name());
+#else
+    /* USB 已经占到必需的内部 DMA RAM；后续编解码尽量使用 PSRAM。 */
+    esp_err_t streamer_error = video_streamer_init(NULL);
+    if (streamer_error != ESP_OK) {
+        ESP_LOGE(TAG, "初始化 H.264 实时流失败：%s",
+                 esp_err_to_name(streamer_error));
+    } else {
+        /* 开机默认 IDLE，收到服务端 media.webrtc.start 后才开启编码。 */
+#if CAMERA_VIDEO_STREAM_AUTOSTART
+        video_streamer_start();
+        ESP_LOGI(TAG, "视频编码与上传：调试开关强制开启");
+#else
+        ESP_LOGI(TAG, "视频编码与上传：关闭，等待服务端推流命令（UVC 采集保持运行）");
+#endif
+    }
+#endif
+    camera_log_memory("VIDEO_INIT_AFTER");
     /* 新摄像头上电后需要时间完成传感器和 UVC 状态机初始化。 */
     ESP_LOGI(TAG, "等待摄像头上电稳定 %u ms", CAMERA_POWER_ON_DELAY_MS);
     vTaskDelay(pdMS_TO_TICKS(CAMERA_POWER_ON_DELAY_MS));
@@ -981,18 +1066,17 @@ void camera_driver_run(void)
         ESP_LOGI(TAG, "等待 UVC 摄像头及格式列表");
         EventBits_t ready = xEventGroupWaitBits(s_camera_events, CAMERA_FORMATS_READY,
                                                 pdFALSE, pdTRUE, pdMS_TO_TICKS(3000));
-        if (!(ready & CAMERA_FORMATS_READY) && !s_saw_real_formats) {
-            camera_load_known_formats();
-        }
-        if (s_camera_format_count == 0) {
+        /* USB 枚举失败或摄像头已拔出时不能拿猜测的描述符继续 open。 */
+        const size_t format_count = s_camera_format_count;
+        if (!(ready & CAMERA_FORMATS_READY) || format_count == 0) {
             continue;
         }
 
 #if CAMERA_TEST_PROFILE == CAMERA_TEST_UVC_ONLY
         /* 冷启动测试只选择编译期指定的 MJPEG 模式，找不到就终止本次测试，
          * 绝不在同一次枚举中退到其他分辨率。 */
-        candidate = (unsigned)s_camera_format_count;
-        for (size_t i = 0; i < s_camera_format_count; ++i) {
+        candidate = (unsigned)format_count;
+        for (size_t i = 0; i < format_count; ++i) {
             if (s_camera_formats[i].format == UVC_VS_FORMAT_MJPEG &&
                 s_camera_formats[i].h_res == CAMERA_CAPTURE_WIDTH &&
                 s_camera_formats[i].v_res == CAMERA_CAPTURE_HEIGHT) {
@@ -1000,13 +1084,13 @@ void camera_driver_run(void)
                 break;
             }
         }
-        if (candidate == s_camera_format_count) {
+        if (candidate == format_count) {
             ESP_LOGE(TAG, "摄像头未声明固定测试模式 %ux%u MJPEG@30，本次冷启动测试结束",
                      CAMERA_CAPTURE_WIDTH, CAMERA_CAPTURE_HEIGHT);
             return;
         }
 #else
-        candidate %= s_camera_format_count;
+        candidate %= format_count;
 #endif
         const uvc_host_frame_info_t selected = s_camera_formats[candidate];
         const float stream_fps = camera_select_stream_fps(&selected);
@@ -1069,7 +1153,7 @@ void camera_driver_run(void)
         };
 
         ESP_LOGI(TAG, "尝试摄像头格式 %u/%u：%ux%u %s @ %.2f FPS",
-                 candidate + 1, (unsigned)s_camera_format_count,
+                 candidate + 1, (unsigned)format_count,
                  stream_config.vs_format.h_res, stream_config.vs_format.v_res,
                  camera_format_name(stream_config.vs_format.format),
                  stream_config.vs_format.fps);
@@ -1082,9 +1166,11 @@ void camera_driver_run(void)
                      esp_err_to_name(err));
             return;
 #else
-            ESP_LOGW(TAG, "打开视频流失败：%s，尝试设备声明的下一个格式", esp_err_to_name(err));
-            same_format_retries = 0;
-            candidate = (candidate + 1) % s_camera_format_count;
+            ESP_LOGW(TAG, "打开视频流失败：%s", esp_err_to_name(err));
+            if (camera_advance_format(&candidate, &same_format_retries)) {
+                ESP_LOGW(TAG, "下次尝试设备声明的格式 %u/%u",
+                         candidate + 1, (unsigned)s_camera_format_count);
+            }
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
 #endif
@@ -1103,36 +1189,71 @@ void camera_driver_run(void)
         /* 将 UVC 诊断窗口与本次视频流绑定，后面的报告均为本次流的增量。 */
         uvc_isoc_diag_reset();
         bool first_frame_ok = false;
+        camera_first_frame_result_t first_frame_result = CAMERA_FIRST_FRAME_TIMEOUT;
         __atomic_store_n(&s_camera_handoff_accepting, true, __ATOMIC_RELEASE);
         err = camera_start(stream);
         if (err == ESP_OK) {
             ESP_LOGI(TAG, "Stream started；等待首个有效 MJPEG 帧（超时 %u ms）",
                      CAMERA_FIRST_FRAME_TIMEOUT_MS);
             uint32_t first_frame_elapsed_ms = 0;
-            first_frame_ok = camera_wait_first_frame(
+            first_frame_result = camera_wait_first_frame(
                 CAMERA_FIRST_FRAME_TIMEOUT_MS, &first_frame_elapsed_ms);
+            first_frame_ok = first_frame_result == CAMERA_FIRST_FRAME_READY;
             if (first_frame_ok) {
                 ESP_LOGI(TAG, "UVC 本次启动成功：首帧耗时 %u ms",
                          first_frame_elapsed_ms);
-                if (!s_camera_ready_announced) {
-                    s_camera_ready_announced = true;
-                    camera_log_memory("CAM_READY");
+                if (!__atomic_exchange_n(&s_camera_ready_announced, true,
+                                         __ATOMIC_ACQ_REL)) {
+                    camera_log_memory("CAMERA_READY");
                     ESP_LOGI(TAG, "CAMERA_READY：UVC stream open 成功且已收到第一帧有效 MJPEG");
                     if (s_camera_ready_events != NULL) {
                         xEventGroupSetBits(s_camera_ready_events, CAMERA_READY_BIT);
                     }
+                    webrtc_whip_notify_camera_ready();
+                    /* USB 事件回调可能与首帧通知并发：若断线已经撤销就绪，
+                     * 立即再清一次，不能让迟到的首帧通知把状态写回 true。 */
+                    if (!__atomic_load_n(&s_camera_ready_announced,
+                                         __ATOMIC_ACQUIRE) ||
+                        (xEventGroupGetBits(s_camera_events) &
+                         (CAMERA_DISCONNECTED | CAMERA_ERROR)) != 0) {
+                        camera_mark_unready();
+                    }
                 }
             } else {
-                /* 首帧失败只保留一条摘要；详细 UVC 测试计数暂不刷屏。 */
-                ESP_LOGW(TAG, "UVC 本次启动失败：%u ms 内没有有效帧",
-                         CAMERA_FIRST_FRAME_TIMEOUT_MS);
+                /* 断开/传输错误会提前终止等待，不能误写成 5 秒超时。 */
+                if (first_frame_result == CAMERA_FIRST_FRAME_DISCONNECTED) {
+                    ESP_LOGW(TAG, "UVC 首帧前摄像头断开：等待了 %u ms", first_frame_elapsed_ms);
+                } else if (first_frame_result == CAMERA_FIRST_FRAME_TRANSFER_ERROR) {
+                    ESP_LOGW(TAG, "UVC 首帧前 USB 传输错误：等待了 %u ms", first_frame_elapsed_ms);
+                } else {
+                    ESP_LOGW(TAG, "UVC 首帧超时：%u ms 内没有有效 MJPEG 帧",
+                             first_frame_elapsed_ms);
+                }
+                /* 一次性保留失败现场：区分 USB 等时包缺失和组帧错误。 */
+                uvc_isoc_diag_stats_t first_diag = {0};
+                uvc_isoc_diag_get(&first_diag);
+                ESP_LOGW(TAG,
+                         "UVC 首帧诊断：packet_timeout=%" PRIu32
+                         " skipped=%" PRIu32 " error=%" PRIu32
+                         " empty=%" PRIu32 " invalid_header=%" PRIu32
+                         " frame_dropped=%" PRIu32 " max_gap=%" PRIu32 "ms",
+                         first_diag.packet_timeout, first_diag.packet_skipped,
+                         first_diag.packet_error, first_diag.empty_packet,
+                         first_diag.invalid_header, first_diag.frame_dropped,
+                         first_diag.max_callback_gap_ms);
 
 #if CAMERA_TEST_PROFILE != CAMERA_TEST_UVC_ONLY
-                /* 生产档位保留原有自动恢复；纯 UVC 冷启动测试禁止轮转。 */
-                candidate = (candidate + 1) % s_camera_format_count;
-                same_format_retries = 0;
-                ESP_LOGW(TAG, "首帧超时，下次改试摄像头格式 %u/%u",
-                         candidate + 1, (unsigned)s_camera_format_count);
+                /* 断开或传输错误先等设备重新枚举；只有真正超时才轮转格式。 */
+                if (first_frame_result == CAMERA_FIRST_FRAME_TIMEOUT) {
+                    if (camera_advance_format(&candidate, &same_format_retries)) {
+                        ESP_LOGW(TAG, "首帧超时，下次改试摄像头格式 %u/%u",
+                                 candidate + 1, (unsigned)s_camera_format_count);
+                    }
+                } else {
+                    candidate = 0;
+                    same_format_retries = 0;
+                    ESP_LOGW(TAG, "等待摄像头重新枚举后从首选 MJPEG 模式重试");
+                }
 #else
                 ESP_LOGW(TAG, "固定模式测试失败，本次运行不再切换格式；请断电/复位后重试");
 #endif
@@ -1191,6 +1312,26 @@ void camera_driver_run(void)
                          CAMERA_FRAME_BUFFER_COUNT);
                  ESP_LOGI(TAG, "[VIDEO] handoff rejected=%" PRIu32,
                           handoff_rejected_delta);
+                if (CAMERA_UVC_AUTOSTART || candidate_delta < 5 ||
+                    dropped_delta > target_delta) {
+                    /* 开机 UVC 诊断每 5 秒打印一次等时包增量；
+                     * 不按包逐条打印，避免串口输出影响 USB 实时调度。 */
+                    ESP_LOGW(TAG,
+                             "[UVC_DIAG] timeout=%" PRIu32 " skipped=%" PRIu32
+                             " error=%" PRIu32 " empty=%" PRIu32
+                             " bad_header=%" PRIu32 " frame_drop=%" PRIu32
+                             " drop_err=%" PRIu32 " drop_overflow=%" PRIu32
+                             " max_gap=%" PRIu32 "ms",
+                             diag_current.packet_timeout - diag_previous.packet_timeout,
+                             diag_current.packet_skipped - diag_previous.packet_skipped,
+                             diag_current.packet_error - diag_previous.packet_error,
+                             diag_current.empty_packet - diag_previous.empty_packet,
+                             diag_current.invalid_header - diag_previous.invalid_header,
+                             dropped_delta,
+                             diag_current.drop_by_err - diag_previous.drop_by_err,
+                             diag_current.drop_by_overflow - diag_previous.drop_by_overflow,
+                             diag_current.max_callback_gap_ms);
+                }
                 /* 以“候选帧”判定停顿：非目标分辨率 MJPEG（如 1280×960）即便一直在
                  * 收帧，也不能喂 H.264，继续驻留只会无声无息没有视频，故同样计入
                  * 停顿轮转。这里只能数候选帧——结构校验已经搬到下游任务，本函数
@@ -1223,13 +1364,11 @@ void camera_driver_run(void)
                         ESP_LOGW(TAG,
                                  "%ux%u MJPEG 原地重试仍未恢复，改试设备声明的下一个格式",
                                  CAMERA_CAPTURE_WIDTH, CAMERA_CAPTURE_HEIGHT);
-                        same_format_retries = 0;
-                        candidate = (candidate + 1) % s_camera_format_count;
+                        camera_advance_format(&candidate, &same_format_retries);
                     } else {
                         ESP_LOGW(TAG,
                                  "当前格式连续 10 秒没有可编码帧，继续轮转下一个格式");
-                        same_format_retries = 0;
-                        candidate = (candidate + 1) % s_camera_format_count;
+                        camera_advance_format(&candidate, &same_format_retries);
                     }
                     break;
                 }
@@ -1237,12 +1376,12 @@ void camera_driver_run(void)
         } else {
             ESP_LOGE(TAG, "UVC 本次启动失败：uvc_stream_start 返回 %s",
                      esp_err_to_name(err));
-            same_format_retries = 0;
-            candidate = (candidate + 1) % s_camera_format_count;
+            camera_advance_format(&candidate, &same_format_retries);
         }
 
         /* 摄像头已拔出时驱动会处理停止；其他情况下由主任务主动停止。 */
         __atomic_store_n(&s_camera_handoff_accepting, false, __ATOMIC_RELEASE);
+        camera_mark_unready();
         const bool camera_disconnected =
             (xEventGroupGetBits(s_camera_events) & CAMERA_DISCONNECTED) != 0;
         /* 首帧超时不是格式不支持：旧流必须安全排空后重建整个 USB/UVC 栈，
@@ -1293,11 +1432,11 @@ void camera_driver_run(void)
         unsigned copies_in_use = 0;
         portENTER_CRITICAL(&s_frame_copy_lock);
         for (unsigned i = 0; i < CAMERA_HANDOFF_COPY_COUNT; ++i) {
-            copies_in_use += s_frame_copies[i].in_use ? 1U : 0U;
+            copies_in_use += s_frame_copies[i].ref_count != 0 ? 1U : 0U;
         }
         portEXIT_CRITICAL(&s_frame_copy_lock);
         if (copies_in_use != 0) {
-            ESP_LOGI(TAG, "USB stream 关闭时仍有 %u 个独立 MJPEG 复制槽由编解码任务使用",
+            ESP_LOGI(TAG, "USB stream 关闭时仍有 %u 个共享 MJPEG 槽由视频/拍照任务使用",
                      copies_in_use);
         }
 

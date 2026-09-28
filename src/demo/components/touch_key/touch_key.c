@@ -5,6 +5,7 @@
 #include "board_pins.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -288,9 +289,11 @@ esp_err_t touch_key_init(void)
         }
     }
 
-    const BaseType_t created = xTaskCreate(touch_key_task, "touch_key_task",
+    /* 任务仅处理 GPIO/业务状态；DMA/中断资源由底层驱动独立持有。 */
+    const BaseType_t created = xTaskCreateWithCaps(touch_key_task, "touch_key_task",
                                            TOUCH_KEY_TASK_STACK, NULL,
-                                           TOUCH_KEY_TASK_PRIORITY, &s_task);
+                                           TOUCH_KEY_TASK_PRIORITY, &s_task,
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (created != pdPASS) {
         ESP_LOGE(TAG, "创建采样任务失败");
         return ESP_ERR_NO_MEM;

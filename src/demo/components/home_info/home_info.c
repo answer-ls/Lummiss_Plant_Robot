@@ -7,6 +7,7 @@
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -26,6 +27,11 @@ static const char *TAG = "HOME_INFO";
 #define HOME_INFO_LOCATION_SECONDS  (6 * 60 * 60)
 #define HOME_INFO_RETRY_MIN_SECONDS 5U
 #define HOME_INFO_RETRY_MAX_SECONDS 60U
+
+/* RTC 公网联调阶段暂时关闭第三方定位/天气 HTTPS。
+ * 保留 home_info 任务与 NTP 时间快照，首页时间、日期和星期仍可正常刷新；
+ * 恢复天气时只需将此开关改为 1。 */
+#define HOME_INFO_REMOTE_HTTP_ENABLED 0
 
 /* 默认时区：中国全境统一 UTC+8 且不使用夏令时。
  * 时钟只在 NTP 校时成功后就该显示，不能再等第三方定位 / 天气接口——
@@ -102,6 +108,15 @@ static esp_err_t http_get_json(const char *label, const char *url,
 
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "%s接口请求失败：%s", label, esp_err_to_name(err));
+        /* TLS 建连失败时记录连续内存，区分网络故障和本地内存不足。 */
+        ESP_LOGW(TAG,
+                 "HTTP_MEM DMA=%u/%u INT=%u/%u PSRAM=%u/%u bytes",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
         return err;
     }
     if (status != 200 || response->overflow || response->length == 0) {
@@ -273,6 +288,14 @@ static void home_info_task(void *arg)
             xSemaphoreGive(s_snapshot_mutex);
         }
 
+        /* WebRTC 联调期间不创建定位/天气 TLS 连接，避免它与 ICE/DTLS/WHIP
+         * 同时争用已经很紧张的 INTERNAL/DMA 内存。这里只暂停远端请求，
+         * home_info_get_snapshot() 仍会基于 NTP 和默认 UTC+8 生成本地时间。 */
+        if (!HOME_INFO_REMOTE_HTTP_ENABLED) {
+            vTaskDelay(pdMS_TO_TICKS(HOME_INFO_RETRY_SECONDS * 1000U));
+            continue;
+        }
+
         const TickType_t now = xTaskGetTickCount();
         const bool location_due = !location_valid ||
             (now - last_location_tick) >= pdMS_TO_TICKS(HOME_INFO_LOCATION_SECONDS * 1000U);
@@ -341,9 +364,11 @@ esp_err_t home_info_start(void)
     /* 天气/定位属于最低优先级后台任务，固定在 CPU0。使用与 IDLE 同级的
      * 优先级，让 CPU0 空闲任务在 TLS 大数运算期间仍能获得时间片，避免
      * 任务看门狗只看到 IDLE0 长时间无法运行。请求完成后任务始终进入延时。 */
-    BaseType_t result = xTaskCreatePinnedToCore(
+    /* 时间/HTTP 控制任务不向硬件提交栈地址，栈迁到 PSRAM。 */
+    BaseType_t result = xTaskCreatePinnedToCoreWithCaps(
         home_info_task, "home_info", HOME_INFO_TASK_STACK, NULL,
-        HOME_INFO_TASK_PRIORITY, NULL, HOME_INFO_TASK_CORE);
+        HOME_INFO_TASK_PRIORITY, NULL, HOME_INFO_TASK_CORE,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (result != pdPASS) {
         vSemaphoreDelete(s_snapshot_mutex);
         s_snapshot_mutex = NULL;
@@ -351,7 +376,11 @@ esp_err_t home_info_start(void)
     }
 
     s_started = true;
-    ESP_LOGI(TAG, "首页时间与天气服务已启动");
+    if (HOME_INFO_REMOTE_HTTP_ENABLED) {
+        ESP_LOGI(TAG, "首页时间与天气服务已启动");
+    } else {
+        ESP_LOGW(TAG, "RTC 联调模式：定位/天气 HTTPS 已暂停，仅保留首页本地时间");
+    }
     return ESP_OK;
 }
 

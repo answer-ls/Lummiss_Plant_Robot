@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "xiaozhi_audio.c" "wake_word.c"
+    SRCS "capture_diag.c" "lifecycle_probe.c" "raw_adc_probe.c" "audio_probe.c" "xiaozhi_audio.c" "wake_word.c"
     INCLUDE_DIRS "."
     REQUIRES
         board
@@ -15,4 +15,5 @@ idf_component_register(
         esp_driver_i2c
         esp_driver_i2s
         esp-sr
+        mbedtls
         freertos)

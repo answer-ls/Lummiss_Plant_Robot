@@ -6,6 +6,7 @@
 
 #include "board_pins.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -311,9 +312,11 @@ esp_err_t ambient_led_init(void)
     s_manual_deadline_mask = 0;
     s_refresh_error_logged = false;
 
-    const BaseType_t created = xTaskCreate(ambient_led_task, "ambient_led",
+    /* 任务仅处理 GPIO/业务状态；DMA/中断资源由底层驱动独立持有。 */
+    const BaseType_t created = xTaskCreateWithCaps(ambient_led_task, "ambient_led",
                                            AMBIENT_LED_TASK_STACK, NULL,
-                                           AMBIENT_LED_TASK_PRIORITY, &s_task);
+                                           AMBIENT_LED_TASK_PRIORITY, &s_task,
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (created != pdPASS) {
         ESP_LOGE(TAG, "创建灯效任务失败");
         for (size_t i = 0; i < AMBIENT_LED_COUNT; ++i) {
