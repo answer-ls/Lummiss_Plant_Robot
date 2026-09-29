@@ -1,3 +1,4 @@
+#include "jpeg_frame_trace.h"
 #ifndef LUMMISS_VIDEO_STREAMER_H
 #define LUMMISS_VIDEO_STREAMER_H
 
@@ -147,7 +148,7 @@ bool video_streamer_submit_jpeg_owned(
     const uint8_t *data,
     size_t data_len,
     video_streamer_input_release_cb_t release_cb,
-    void *release_ctx);
+    void *release_ctx, const jpeg_frame_trace_t *trace);
 
 /* ==================== 按需视频流：运行状态与启停 ====================
  *

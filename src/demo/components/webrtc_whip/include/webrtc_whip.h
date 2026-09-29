@@ -55,6 +55,8 @@ void webrtc_whip_notify_storage_init_done(void);
 esp_err_t webrtc_whip_request_start(const webrtc_whip_credential_t *credential);
 esp_err_t webrtc_whip_request_stop(const char *session_id);
 webrtc_whip_state_t webrtc_whip_get_state(void);
+/* 仅停止预览后分块导出诊断，不在发送期间打印码流。 */
+void webrtc_whip_export_h264_probe_step(void);
 
 /* 由 video_upload 任务提交纯 Annex-B 帧；内部 esp_peer 负责 RTP/SRTP。 */
 esp_err_t webrtc_whip_send_h264(const uint8_t *annex_b, size_t length,

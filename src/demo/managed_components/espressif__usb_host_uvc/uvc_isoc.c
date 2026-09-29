@@ -15,6 +15,7 @@
 
 #include "uvc_stream.h" // For uvc_host_stream_pause()
 #include "esp_private/uvc_isoc_diag.h"
+#include "esp_private/uvc_frame_audit.h"
 #include "uvc_types_priv.h"
 #include "uvc_check_priv.h"
 #include "uvc_frame_priv.h"
@@ -323,6 +324,82 @@ static int16_t isoc_diag_marker_offset(const uint8_t *data, size_t data_len, uin
     return offset == SIZE_MAX ? ISOC_DIAG_OFFSET_NONE : (int16_t)offset;
 }
 
+/* 当前工程只有一条 UVC 流；用 owner 和交付指针防止快照误归属。 */
+static uvc_frame_audit_t s_frame_audit, s_delivered_audit;
+static const void *s_delivered_frame;
+static uvc_stream_t *s_audit_owner;
+static uint32_t s_audit_serial;
+static uint32_t s_audit_transfer;
+static uint32_t s_audit_error_base, s_audit_timeout_base, s_audit_skip_base;
+static uint32_t s_audit_invalid_base, s_audit_camera_base;
+
+bool uvc_frame_audit_get(const void *frame, uvc_frame_audit_t *out)
+{
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    if (!frame || frame != s_delivered_frame) return false;
+    *out = s_delivered_audit;
+    return out->valid;
+}
+
+static void frame_audit_begin(uvc_stream_t *stream, bool fid, bool soi, bool old_skip,
+                              const uvc_payload_header_t *header)
+{
+    s_audit_owner = stream;
+    s_frame_audit = (uvc_frame_audit_t){
+        .valid = true, .frame_id = ++s_audit_serial,
+        .packet_first = s_diag_packet_index, .fid = header->bmHeaderInfo.frame_id,
+        .start_fid = fid, .start_soi = soi,
+        .start_skip_cleared = old_skip && !header->bmHeaderInfo.error,
+        .start_error = header->bmHeaderInfo.error,
+    };
+    s_audit_error_base = s_diag_packet_error;
+    s_audit_timeout_base = s_diag_packet_timeout;
+    s_audit_skip_base = s_diag_packet_skipped;
+    s_audit_invalid_base = s_diag_invalid_header;
+    s_audit_camera_base = s_diag_frame_error;
+    uvc_payload_trace_init(&s_frame_audit.payload);
+}
+
+static void frame_audit_pts(const uvc_payload_header_t *header, uint32_t pts,
+                            const uint8_t *data, size_t len, uint32_t actual, uint16_t slot)
+{
+    /* 变化前滚动保留三包，首次变化后冻结前三包并补齐后三包。 */
+    uvc_pts_packet_t event = {
+        .packet = s_diag_packet_index, .transfer = s_audit_transfer,
+        .pts = pts, .offset = s_frame_audit.appended_bytes,
+        .actual_bytes = actual, .payload_bytes = len, .transfer_slot = slot,
+        .header_bytes = header->bHeaderLength, .flags = ((const uint8_t *)header)[1],
+    };
+    for (size_t j = 0; j < len && j < 4; ++j) {
+        event.prefix = (event.prefix << 8) | data[j];
+        event.suffix = (event.suffix << 8) | data[len - (len < 4 ? len : 4) + j];
+    }
+    const bool changed = header->bmHeaderInfo.presentation_time && header->bHeaderLength >= 6 &&
+        s_frame_audit.pts_valid && s_frame_audit.pts_last != pts;
+    uint32_t *count = &s_frame_audit.pts_packet_count;
+    if (!s_frame_audit.pts_changes && !changed) {
+        if (*count == 3) {
+            memmove(s_frame_audit.pts_packets, s_frame_audit.pts_packets + 1,
+                    2 * sizeof(event));
+            --*count;
+        }
+        s_frame_audit.pts_packets[(*count)++] = event;
+    } else {
+        if (!s_frame_audit.pts_changes) s_frame_audit.pts_trigger_index = *count;
+        if (*count < s_frame_audit.pts_trigger_index + 4)
+            s_frame_audit.pts_packets[(*count)++] = event;
+    }
+    if (!header->bmHeaderInfo.presentation_time || header->bHeaderLength < 6) return;
+    if (!s_frame_audit.pts_valid) s_frame_audit.pts_first = pts;
+    else if (s_frame_audit.pts_last != pts) {
+        if (!s_frame_audit.pts_changes) s_frame_audit.pts_change_offset = s_frame_audit.appended_bytes;
+        ++s_frame_audit.pts_changes;
+    }
+    s_frame_audit.pts_valid = 1;
+    s_frame_audit.pts_last = pts;
+}
+
 typedef enum {
     ISOC_FINISH_EOF,
     ISOC_FINISH_FID,
@@ -377,12 +454,27 @@ static void isoc_finish_frame(uvc_stream_t *uvc_stream, isoc_finish_reason_t rea
         if (s_diag_first_complete_frame_ms == ISOC_DIAG_TIME_UNSET) {
             s_diag_first_complete_frame_ms = isoc_diag_elapsed_ms();
         }
+        /* 在回调期间公开本帧快照，回调返回后立即撤销指针。 */
+        s_delivered_audit = s_frame_audit;
+        s_delivered_audit.valid = s_audit_owner == uvc_stream && s_frame_audit.valid;
+        s_delivered_audit.packet_last = s_diag_packet_index;
+        s_delivered_audit.finish_reason = reason;
+        s_delivered_audit.final_skip = frame_skipped;
+        s_delivered_audit.delivered_bytes = this_frame->data_len;
+        s_delivered_audit.packet_error = s_diag_packet_error - s_audit_error_base;
+        s_delivered_audit.timeout = s_diag_packet_timeout - s_audit_timeout_base;
+        s_delivered_audit.skipped = s_diag_packet_skipped - s_audit_skip_base;
+        s_delivered_audit.invalid_header = s_diag_invalid_header - s_audit_invalid_base;
+        s_delivered_audit.camera_error = s_diag_frame_error - s_audit_camera_base;
+        s_delivered_frame = this_frame;
         return_frame = uvc_stream->constant.frame_cb(this_frame, uvc_stream->constant.cb_arg);
+        s_delivered_frame = NULL;
     }
     if (this_frame && return_frame) {
         uvc_host_frame_return(uvc_stream, this_frame);
     }
     s_diag_current_frame_len = 0;
+    if (s_audit_owner == uvc_stream) s_frame_audit.valid = false;
 }
 
 /**
@@ -428,6 +520,7 @@ void isoc_transfer_callback(usb_transfer_t *transfer)
     }
 
     const uint8_t *payload = transfer->data_buffer;
+    ++s_audit_transfer;
     for (int i = 0; i < transfer->num_isoc_packets; i++) {
         usb_isoc_packet_desc_t *isoc_desc = &transfer->isoc_packet_desc[i];
         s_diag_packet_index++;
@@ -554,6 +647,13 @@ void isoc_transfer_callback(usb_transfer_t *transfer)
         const bool frame_active_before = isoc_frame_active(uvc_stream);
 
         if (payload_data_len == 0) {
+            if (s_audit_owner == uvc_stream && s_frame_audit.valid) {
+                s_frame_audit.eof_seen += payload_header->bmHeaderInfo.end_of_frame;
+                /* 只把相同 FID 的纯包头 PTS 归给当前帧。 */
+                if (uvc_stream->single_thread.current_frame_id == payload_header->bmHeaderInfo.frame_id)
+                    frame_audit_pts(payload_header, pts, payload_data, payload_data_len,
+                                    isoc_desc->actual_num_bytes, i);
+            }
             /* 有些摄像头用仅含 UVC header 的包携带 FID/EOF/ERR。不能因为
              * 没有图像字节就跳过边界，否则完整 JPEG 会一直挂在 assembler。 */
             const bool header_fid_changed =
@@ -662,6 +762,8 @@ void isoc_transfer_callback(usb_transfer_t *transfer)
         const bool start_of_frame = fid_changed ||
                                     (has_local_soi && uvc_stream->dynamic.current_frame == NULL);
         if (start_of_frame) {
+            frame_audit_begin(uvc_stream, fid_changed, has_local_soi,
+                              uvc_stream->single_thread.skip_current_frame, payload_header);
             uvc_stream->single_thread.skip_current_frame = payload_header->bmHeaderInfo.error;
             uvc_stream->single_thread.frame_in_progress = true;
 
@@ -708,6 +810,15 @@ void isoc_transfer_callback(usb_transfer_t *transfer)
             }
         }
 
+        /* 只累加当前组帧内的包信息，不在实时收包路径打印。 */
+        if (s_audit_owner == uvc_stream && s_frame_audit.valid) {
+            s_frame_audit.soi_hits += has_soi;
+            s_frame_audit.eoi_hits += has_eoi;
+            s_frame_audit.eof_seen += payload_header->bmHeaderInfo.end_of_frame;
+            frame_audit_pts(payload_header, pts, payload_data, payload_data_len,
+                            isoc_desc->actual_num_bytes, i);
+        }
+
         // Add received data to frame buffer
         if (!uvc_stream->single_thread.skip_current_frame) {
             uvc_host_frame_t *current_frame = UVC_ATOMIC_LOAD(uvc_stream->dynamic.current_frame);
@@ -717,8 +828,15 @@ void isoc_transfer_callback(usb_transfer_t *transfer)
                 goto next_isoc_packet;
             }
 
+            /* 对照实验保留长度检查，停用逐字节 payload 指纹扫描。 */
+            const bool audit_payload = s_audit_owner == uvc_stream && s_frame_audit.valid;
+            if (audit_payload) {
+                if (current_frame->data_len != s_frame_audit.appended_bytes)
+                    ++s_frame_audit.append_offset_error;
+            }
             esp_err_t ret = uvc_frame_add_data(current_frame, payload_data, payload_data_len);
             if (ret != ESP_OK) {
+                if (s_audit_owner == uvc_stream) ++s_frame_audit.append_fail;
                 // Release the broken frame immediately so it cannot consume a buffer until the next FID.
                 uvc_stream->single_thread.skip_current_frame = true;
                 s_diag_drop_by_overflow++;
@@ -740,6 +858,12 @@ void isoc_transfer_callback(usb_transfer_t *transfer)
                     stream_cb(&event, uvc_stream->constant.cb_arg);
                 }
                 goto next_isoc_packet;
+            }
+            if (s_audit_owner == uvc_stream && s_frame_audit.valid) {
+                ++s_frame_audit.appended_packets;
+                s_frame_audit.appended_bytes += payload_data_len;
+                if (current_frame->data_len != s_frame_audit.appended_bytes)
+                    ++s_frame_audit.append_offset_error;
             }
             s_diag_current_frame_len = (uint32_t)current_frame->data_len;
             if (s_diag_current_frame_len > s_diag_max_frame_len) {

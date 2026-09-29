@@ -1,9 +1,10 @@
 idf_component_register(
-    SRCS "video_streamer.c" "dma2d_yuv.c"
+    SRCS "video_streamer.c" "dma2d_yuv.c" "jpeg_failure_probe.c" "jpeg_integrity.c"
     INCLUDE_DIRS "."
     REQUIRES
         board
         esp_websocket_client
+        espressif__usb_host_uvc
         esp_driver_jpeg
         esp_hw_support
         esp_timer

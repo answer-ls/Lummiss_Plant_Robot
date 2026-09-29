@@ -247,6 +247,7 @@ static bool camera_advance_format(unsigned *candidate, unsigned *same_format_ret
 typedef struct {
     uint8_t *data;
     size_t data_len;
+    jpeg_frame_trace_t trace;
     uint32_t ref_count; /* video/photo 共享同一 MJPEG 副本，各自归还引用 */
 } camera_frame_copy_t;
 
@@ -588,7 +589,7 @@ static void camera_handoff_task(void *arg)
 #endif
             retained = video_streamer_submit_jpeg_owned(
                 item.copy->data, item.copy->data_len,
-                camera_release_frame_copy, item.copy);
+                camera_release_frame_copy, item.copy, &item.copy->trace);
         }
         if (!retained) {
             camera_release_frame_copy(item.copy);
@@ -705,6 +706,10 @@ static bool camera_frame_cb(const uvc_host_frame_t *frame, void *ctx)
         /* 复制后立即返回 true，UVC 可以马上复用其 frame buffer；复制的
          * 缓冲由 handoff/编解码链路独立持有。memcpy 的耗时会被 callback
          * 统计覆盖，用于确认它没有重新成为 USB 等时瓶颈。 */
+        /* 对照实验只记录元数据，不在 USB 回调遍历整帧计算指纹。 */
+        static uint32_t trace_id;
+        copy->trace = (jpeg_frame_trace_t){.id = ++trace_id, .bytes = frame->data_len};
+        uvc_frame_audit_get(frame, &copy->trace.assembly);
         memcpy(copy->data, frame->data, frame->data_len);
 
         /* Photo 与 Video 共享这一个已经脱离 UVC 生命周期的副本。Photo

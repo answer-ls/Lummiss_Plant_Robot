@@ -1,6 +1,8 @@
 #include "mem_contig.h"
 #include "video_streamer.h"
 #include "dma2d_yuv.h"
+#include "jpeg_failure_probe.h"
+#include "jpeg_integrity.h"
 
 #include <inttypes.h>
 #include <stdbool.h>
@@ -270,15 +272,16 @@ typedef struct {
     bool busy;
     video_streamer_input_release_cb_t release_cb;
     void *release_ctx;
+    jpeg_frame_trace_t trace;
 } video_input_slot_t;
 
 /* H.264 输出槽：编码任务写入码流后连同元数据交给发送任务。
- * data_len/sequence/pts/frame_type 由编码任务填写，发送任务只读。 */
+ * data_len/sequence/pts_ms/frame_type 由编码任务填写，发送任务只读。 */
 typedef struct {
     uint8_t *data;
     size_t data_len;
     uint32_t sequence;
-    uint32_t pts;
+    uint32_t pts_ms;
     int frame_type;
     int64_t ready_us;
 } video_out_slot_t;
@@ -1728,7 +1731,7 @@ static void video_upload_task(void *arg)
             const int64_t begin_us = esp_timer_get_time();
             const esp_err_t err = webrtc_whip_send_h264(
                 slot->data + VIDEO_WS_ALIGN, slot->data_len,
-                slot->pts / 90U, slot->frame_type == 0);
+                slot->pts_ms, slot->frame_type == 0);
             const uint32_t elapsed_us = (uint32_t)(esp_timer_get_time() - begin_us);
             portENTER_CRITICAL(&s_lock);
             s_stats.upload_received++;
@@ -1994,12 +1997,25 @@ static void video_upload_task(void *arg)
 static void video_codec_task(void *arg)
 {
     (void)arg;
+    /* 工作区整个 codec 生命周期复用，纯软件访问，不消耗 INTERNAL/DMA。 */
+    jpeg_integrity_workspace_t *integrity = heap_caps_calloc(
+        1, sizeof(*integrity), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    bool prefer_latest = false, integrity_first_error = true;
+    uint32_t checked = 0, rejected = 0, stale = 0, hw_failed = 0, check_max_us = 0;
+    /* 放行条件只改变填充位；RST、MCU 和额外数据仍严格拒绝。 */
+    const bool allow_padding_only = true;
+    uint32_t reject_kinds[JPEG_CHECK_COUNT] = {0};
+    uint32_t padding_passed = 0, padding_hw_failed = 0;
+    uint64_t check_total_us = 0;
+    int64_t integrity_log_us = esp_timer_get_time();
     mem_contig_log("VIDEO_TASK_QUEUE_BEFORE");
 #if !VIDEO_STREAM_JPEG_ONLY_TEST
     uint32_t aligned_input_size = VIDEO_H264_INPUT_SIZE;
     uint8_t *h264_input = esp_h264_aligned_calloc(
         VIDEO_WS_ALIGN, 1, VIDEO_H264_INPUT_SIZE, &aligned_input_size, ESP_H264_MEM_SPIRAM);
     esp_h264_enc_handle_t encoder = NULL;
+    /* 使用本次会话首个编码输入的交付时间为起点，不按目标帧率合成时间轴。 */
+    int64_t pts_origin_us = -1;
     /* 编码器参数句柄：重新开启视频后用它请求 IDR，见 s_force_idr 的说明。 */
     esp_h264_enc_param_hw_handle_t encoder_param = NULL;
     /* 0=尚未核对，1=官方直出已验证，-1=本次运行回退 CPU。 */
@@ -2015,6 +2031,10 @@ static void video_codec_task(void *arg)
     bool upload_started = false;
     bool jpeg_sampling_known = false;
     jpeg_down_sampling_type_t jpeg_sampling = JPEG_DOWN_SAMPLING_YUV422;
+    if (integrity == NULL) {
+        ESP_LOGE(TAG, "JPEG 完整性工作区分配失败，禁止无校验运行");
+        goto codec_fail;
+    }
 
 #if !VIDEO_STREAM_JPEG_ONLY_TEST
     if (h264_input == NULL) {
@@ -2157,6 +2177,27 @@ static void video_codec_task(void *arg)
     __atomic_store_n(&s_codec_ready, true, __ATOMIC_RELEASE);
     unsigned slot_index;
     while (true) {
+        const int64_t integrity_now = esp_timer_get_time();
+        if (integrity_now - integrity_log_us >= 5000000) {
+            if (checked || stale || hw_failed) {
+                ESP_LOGI("JPEG_FILTER", "5s checked=%" PRIu32 " passed=%" PRIu32
+                    " rejected=%" PRIu32 " stale_drop=%" PRIu32 " hw_fail=%" PRIu32
+                    " check_avg/max_us=%" PRIu64 "/%" PRIu32,
+                    checked, checked-rejected, rejected, stale, hw_failed,
+                    checked ? check_total_us/checked : 0, check_max_us);
+                ESP_LOGI("JPEG_FILTER", "REASONS rst=%" PRIu32 " mcu=%" PRIu32
+                    " extra=%" PRIu32 " header=%" PRIu32 " padding_reject=%" PRIu32
+                    " padding_pass=%" PRIu32 " padding_hw_fail=%" PRIu32 " allow_padding=%d",
+                    reject_kinds[JPEG_CHECK_RST], reject_kinds[JPEG_CHECK_MCU],
+                    reject_kinds[JPEG_CHECK_EXTRA], reject_kinds[JPEG_CHECK_HEADER],
+                    reject_kinds[JPEG_CHECK_PADDING], padding_passed, padding_hw_failed,
+                    allow_padding_only);
+            }
+            checked = rejected = stale = hw_failed = check_max_us = 0;
+            check_total_us = 0; integrity_log_us = integrity_now;
+            memset(reject_kinds, 0, sizeof(reject_kinds));
+            padding_passed = padding_hw_failed = 0;
+        }
         /* STARTING 状态通过 notification 请求一次 encoder open。创建、参数句柄
          * 获取和后续编码都在同一个任务中完成，杜绝跨任务并发操作硬件句柄。 */
 #if !VIDEO_STREAM_JPEG_ONLY_TEST && !VIDEO_STREAM_YUV_ONLY_TEST
@@ -2164,6 +2205,7 @@ static void video_codec_task(void *arg)
             const bool open_requested = __atomic_exchange_n(
                 &s_encoder_open_requested, false, __ATOMIC_ACQ_REL);
             if (open_requested) {
+                pts_origin_us = -1;
                 esp_err_t open_result = ESP_OK;
                 if (encoder == NULL) {
                     open_result = video_encoder_create(&encoder);
@@ -2199,11 +2241,28 @@ static void video_codec_task(void *arg)
                 video_log_memory("AFTER_H264_FREE");
             }
 #endif
+            /* 停流且参考内存回收后才导出，每轮只打印一块，保留任务调度点。 */
+            if (video_streamer_get_state() == VIDEO_STATE_IDLE) {
+                jpeg_failure_probe_export_step();
+                webrtc_whip_export_h264_probe_step();
+            }
             continue;
         }
         /* 输入队列持续非空时，阻塞式 receive 不会让 CPU1 的 IDLE 运行。
          * 每帧留出一个 tick；taskYIELD 只让出给同优先级任务，不能解 IDLE WDT。 */
         vTaskDelay(1);
+        if (prefer_latest) {
+            /* 仅归还还没解码的旧 JPEG；限制循环次数，生产者持续提交也不会忙等。 */
+            unsigned newer;
+            UBaseType_t pending = uxQueueMessagesWaiting(s_input_queue);
+            for (UBaseType_t i = 0; i < pending; ++i) {
+                if (xQueueReceive(s_input_queue, &newer, 0) != pdTRUE) break;
+                video_input_slot_release(&s_slots[slot_index]);
+                slot_index = newer;
+                ++stale;
+            }
+            prefer_latest = false;
+        }
         video_input_slot_t *slot = &s_slots[slot_index];
         const int64_t codec_started_us = esp_timer_get_time();
         const int64_t input_queue_us = slot->submitted_us != 0 ?
@@ -2212,8 +2271,12 @@ static void video_codec_task(void *arg)
         s_stats.input_queue_us += input_queue_us;
         portEXIT_CRITICAL(&s_lock);
         const uint32_t sequence = slot->sequence;
+        /* 输入槽稍后会归还并复用，先保存同一帧的交付时间；不是传感器曝光时间。 */
+        const int64_t submitted_us = slot->submitted_us;
         const uint8_t *jpeg_data = slot->input;
         const size_t frame_data_len = slot->data_len;
+        /* 同一槽自带 UVC 快照；按完整交付长度比较，避免 EOI 裁尾造成假差异。 */
+        jpeg_failure_probe_compare(&slot->trace, jpeg_data, frame_data_len, sequence);
         const int64_t validation_started_us = esp_timer_get_time();
         const size_t jpeg_size = video_jpeg_find_eoi(jpeg_data, frame_data_len);
         const video_jpeg_validate_result_t invalid_reason =
@@ -2240,8 +2303,35 @@ static void video_codec_task(void *arg)
             s_stats.invalid_reason[invalid_reason]++;
             portEXIT_CRITICAL(&s_lock);
             video_input_slot_release(slot);
+            prefer_latest = true;
             continue;
         }
+
+        jpeg_integrity_result_t integrity_result;
+        const int64_t check_begin = esp_timer_get_time();
+        const bool complete = jpeg_integrity_check(integrity, jpeg_data, jpeg_size,
+                                                   allow_padding_only, &integrity_result);
+        const uint32_t check_us = (uint32_t)(esp_timer_get_time() - check_begin);
+        ++checked; check_total_us += check_us;
+        if (check_us > check_max_us) check_max_us = check_us;
+        if (!complete) {
+            ++rejected;
+            ++reject_kinds[integrity_result.kind];
+            if (integrity_first_error) {
+                ESP_LOGW("JPEG_FILTER", "FIRST_REJECT seq=%" PRIu32 " reason=%s segment=%" PRIu32
+                    " MCU=%" PRIu32 "/%" PRIu32 " offset=%" PRIu32,
+                    sequence, integrity_result.reason, integrity_result.segment,
+                    integrity_result.mcus, integrity_result.expected, integrity_result.offset);
+                integrity_first_error = false;
+            }
+            portENTER_CRITICAL(&s_lock);
+            s_stats.input_invalid++;
+            portEXIT_CRITICAL(&s_lock);
+            video_input_slot_release(slot);
+            prefer_latest = true;
+            continue;
+        }
+        if (integrity_result.kind == JPEG_CHECK_PADDING) ++padding_passed;
 
 #if !VIDEO_STREAM_JPEG_ONLY_TEST && !VIDEO_STREAM_YUV_ONLY_TEST
         if (encoder == NULL) {
@@ -2296,10 +2386,10 @@ static void video_codec_task(void *arg)
         };
         uint32_t decoded_size = 0;
         const int64_t decode_started_us = esp_timer_get_time();
-        esp_err_t decode_error = jpeg_decoder_process(
+        esp_err_t decode_error = jpeg_failure_probe_process(
             jpeg_decoder, &decode_cfg,
             (uint8_t *)jpeg_data, (uint32_t)jpeg_size,
-            jpeg_yuv, (uint32_t)jpeg_yuv_size, &decoded_size);
+            jpeg_yuv, (uint32_t)jpeg_yuv_size, &decoded_size, sequence);
 #if !VIDEO_STREAM_JPEG_ONLY_TEST
         if (try_official_direct &&
             (decode_error != ESP_OK || decoded_size != VIDEO_H264_INPUT_SIZE)) {
@@ -2311,10 +2401,10 @@ static void video_codec_task(void *arg)
             expected_decode_size = VIDEO_YUV422_SIZE;
             decode_cfg.output_format = JPEG_DECODE_OUT_FORMAT_YUV422;
             decoded_size = 0;
-            decode_error = jpeg_decoder_process(
+            decode_error = jpeg_failure_probe_process(
                 jpeg_decoder, &decode_cfg,
                 (uint8_t *)jpeg_data, (uint32_t)jpeg_size,
-                jpeg_yuv, (uint32_t)jpeg_yuv_size, &decoded_size);
+                jpeg_yuv, (uint32_t)jpeg_yuv_size, &decoded_size, sequence);
         }
         if (!direct_yuv420 && official_yuv420_state == 0 &&
             jpeg_sampling_known && decode_error == ESP_OK &&
@@ -2328,10 +2418,10 @@ static void video_codec_task(void *arg)
             jpeg_decode_cfg_t direct_cfg = decode_cfg;
             direct_cfg.output_format = JPEG_DECODE_OUT_FORMAT_YUV420;
             uint32_t direct_size = 0;
-            const esp_err_t direct_err = jpeg_decoder_process(
+            const esp_err_t direct_err = jpeg_failure_probe_process(
                 jpeg_decoder, &direct_cfg,
                 (uint8_t *)jpeg_data, (uint32_t)jpeg_size,
-                jpeg_yuv, (uint32_t)jpeg_yuv_size, &direct_size);
+                jpeg_yuv, (uint32_t)jpeg_yuv_size, &direct_size, sequence);
             size_t mismatch = VIDEO_H264_INPUT_SIZE;
             if (direct_err == ESP_OK && direct_size == VIDEO_H264_INPUT_SIZE) {
                 mismatch = 0;
@@ -2356,6 +2446,9 @@ static void video_codec_task(void *arg)
         }
 
         if (decode_error != ESP_OK || decoded_size != expected_decode_size) {
+            ++hw_failed;
+            if (integrity_result.kind == JPEG_CHECK_PADDING) ++padding_hw_failed;
+            prefer_latest = true;
             video_stream_log_error_limited("JPEG 解码失败", decode_error);
             continue;
         }
@@ -2445,12 +2538,17 @@ static void video_codec_task(void *arg)
 #endif
 
 #if !VIDEO_STREAM_YUV_ONLY_TEST
+        if (pts_origin_us < 0) {
+            pts_origin_us = submitted_us;
+        }
+        /* 丢帧和处理变慢时仍保留真实时间间隔；毫秒独立传递，避免90kHz回绕后再除90。 */
+        const uint32_t pts_ms = (uint32_t)((submitted_us - pts_origin_us) / 1000);
         esp_h264_enc_in_frame_t input_frame = {
             .raw_data = {
                 .buffer = h264_frame,
                 .len = direct_yuv420 ? h264_frame_len : aligned_input_size,
             },
-            .pts = sequence * (90000 / VIDEO_ENCODE_FPS),
+            .pts = (uint32_t)((uint64_t)pts_ms * 90U),
         };
         /* 码流写进槽内偏移 +128 处（见 VIDEO_WS_ALIGN 处的对齐说明），
          * 帧头放在其前 16 字节的 +112 处，发送时原地补齐。 */
@@ -2490,7 +2588,7 @@ static void video_codec_task(void *arg)
                                        sequence, output_frame.frame_type);
             out_slot->data_len = output_frame.length;
             out_slot->sequence = sequence;
-            out_slot->pts = input_frame.pts;
+            out_slot->pts_ms = pts_ms;
             out_slot->frame_type = output_frame.frame_type;
             out_slot->ready_us = esp_timer_get_time();
             portENTER_CRITICAL(&s_lock);
@@ -2529,6 +2627,7 @@ static void video_codec_task(void *arg)
     }
 
 codec_fail:
+    heap_caps_free(integrity);
     __atomic_store_n(&s_codec_ready, false, __ATOMIC_RELEASE);
     ESP_LOGE(TAG, "编解码任务初始化失败，H.264 实时流不可用");
     if (upload_started) {
@@ -2807,7 +2906,7 @@ static bool video_streamer_submit_jpeg_internal(
     const uint8_t *data,
     size_t data_len,
     video_streamer_input_release_cb_t release_cb,
-    void *release_ctx)
+    void *release_ctx, const jpeg_frame_trace_t *trace)
 {
     if (!s_initialized || !video_streamer_is_enabled() || data == NULL ||
         data_len == 0 || data_len > VIDEO_STREAM_JPEG_MAX_SIZE) {
@@ -2868,6 +2967,7 @@ static bool video_streamer_submit_jpeg_internal(
         slot->input = data;
     }
     slot->data_len = data_len;
+    slot->trace = trace ? *trace : (jpeg_frame_trace_t){0};
     slot->sequence = ++s_next_sequence;
     slot->submitted_us = now_us;
     slot->release_cb = release_cb;
@@ -2898,17 +2998,17 @@ static bool video_streamer_submit_jpeg_internal(
 bool video_streamer_submit_jpeg(const uint8_t *data,
                                 size_t data_len)
 {
-    return video_streamer_submit_jpeg_internal(data, data_len, NULL, NULL);
+    return video_streamer_submit_jpeg_internal(data, data_len, NULL, NULL, NULL);
 }
 
 bool video_streamer_submit_jpeg_owned(
     const uint8_t *data,
     size_t data_len,
     video_streamer_input_release_cb_t release_cb,
-    void *release_ctx)
+    void *release_ctx, const jpeg_frame_trace_t *trace)
 {
     if (release_cb == NULL) {
         return false;
     }
-    return video_streamer_submit_jpeg_internal(data, data_len, release_cb, release_ctx);
+    return video_streamer_submit_jpeg_internal(data, data_len, release_cb, release_ctx, trace);
 }

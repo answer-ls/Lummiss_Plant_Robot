@@ -1,5 +1,6 @@
 #include "mem_contig.h"
 #include "webrtc_whip.h"
+#include "h264_send_probe.h"
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -1584,7 +1585,11 @@ esp_err_t webrtc_whip_send_h264(const uint8_t *annex_b, size_t length,
             .data = (uint8_t *)annex_b,
             .size = (int)length,
         };
-        err = esp_peer_send_video(s_peer, &frame) == ESP_PEER_ERR_NONE ? ESP_OK : ESP_FAIL;
+        /* 此处已完成SPS处理，保存真正传给esp_peer的完整访问单元。 */
+        h264_send_probe_before(annex_b, length, pts_ms, idr);
+        const int peer_result = esp_peer_send_video(s_peer, &frame);
+        h264_send_probe_after(peer_result);
+        err = peer_result == ESP_PEER_ERR_NONE ? ESP_OK : ESP_FAIL;
     }
     xSemaphoreGive(s_guard);
     if (err == ESP_OK) {
@@ -1595,4 +1600,11 @@ esp_err_t webrtc_whip_send_h264(const uint8_t *annex_b, size_t length,
         __atomic_add_fetch(&s_send_fail, 1U, __ATOMIC_RELAXED);
     }
     return err;
+}
+
+void webrtc_whip_export_h264_probe_step(void)
+{
+    if (!s_guard || xSemaphoreTake(s_guard, 0) != pdTRUE) return;
+    if (s_state == WEBRTC_WHIP_IDLE) h264_send_probe_export_step();
+    xSemaphoreGive(s_guard);
 }
