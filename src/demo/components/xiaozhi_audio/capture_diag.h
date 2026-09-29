@@ -14,5 +14,5 @@ void capture_diag_metric(cd_metric_t metric, int64_t elapsed);
 bool capture_diag_sink(size_t bytes);
 void capture_diag_udp_result(int result, size_t bytes);
 
-/* 本轮专用诊断：避免旧探针只在A侧复制/导出大量录音，污染单变量对照。 */
-#define CAPTURE_UPLINK_AB_DIAGNOSTIC 1
+/* 正常固件关闭主动A/B窗口，禁止把真实UDP上传替换为本地计数。 */
+#define CAPTURE_UPLINK_AB_DIAGNOSTIC 0

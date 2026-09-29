@@ -28,19 +28,16 @@ static const char *TAG = "HOME_INFO";
 #define HOME_INFO_RETRY_MIN_SECONDS 5U
 #define HOME_INFO_RETRY_MAX_SECONDS 60U
 
-/* RTC 公网联调阶段暂时关闭第三方定位/天气 HTTPS。
- * 保留 home_info 任务与 NTP 时间快照，首页时间、日期和星期仍可正常刷新；
- * 恢复天气时只需将此开关改为 1。 */
-#define HOME_INFO_REMOTE_HTTP_ENABLED 0
+/* 首页联网后启用 IP 定位与 Open-Meteo 天气查询。 */
+#define HOME_INFO_REMOTE_HTTP_ENABLED 1
 
 /* 默认时区：中国全境统一 UTC+8 且不使用夏令时。
  * 时钟只在 NTP 校时成功后就该显示，不能再等第三方定位 / 天气接口——
  * 否则接口一旦不通，屏幕会一直停在 "--:--"。定位或天气返回真实偏移后再覆盖它。 */
 #define HOME_INFO_DEFAULT_UTC_OFFSET_SECONDS  (8 * 3600)
 
-/* IP 定位不需要 API Key，用于自动取得经纬度和时区。天气接口同样不需要 Key。 */
-#define HOME_INFO_LOCATION_URL \
-    "https://ipwho.is/?fields=success,city,latitude,longitude,timezone"
+/* IP 定位使用可通过 IPv4 访问的公开接口；天气接口无需 API Key。 */
+#define HOME_INFO_LOCATION_URL "https://ipinfo.io/json"
 #define HOME_INFO_WEATHER_URL \
     "https://api.open-meteo.com/v1/forecast?latitude=%.6f&longitude=%.6f" \
     "&current=temperature_2m,weather_code&timezone=auto&forecast_days=1"
@@ -163,23 +160,12 @@ static esp_err_t fetch_location(double *latitude, double *longitude)
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    const cJSON *success = cJSON_GetObjectItemCaseSensitive(root, "success");
+    const cJSON *location = cJSON_GetObjectItemCaseSensitive(root, "loc");
     double lat = 0.0;
     double lon = 0.0;
-    bool valid = cJSON_IsTrue(success) &&
-                 json_number(root, "latitude", &lat) &&
-                 json_number(root, "longitude", &lon);
-
-    const cJSON *timezone = cJSON_GetObjectItemCaseSensitive(root, "timezone");
-    double offset = 0.0;
-    if (valid && cJSON_IsObject(timezone) && json_number(timezone, "offset", &offset)) {
-        xSemaphoreTake(s_snapshot_mutex, portMAX_DELAY);
-        s_timezone_offset_seconds = (int32_t)offset;
-        s_timezone_valid = true;
-        xSemaphoreGive(s_snapshot_mutex);
-    } else {
-        valid = false;
-    }
+    const bool valid = cJSON_IsString(location) && location->valuestring != NULL &&
+                       sscanf(location->valuestring, "%lf,%lf", &lat, &lon) == 2 &&
+                       lat >= -90.0 && lat <= 90.0 && lon >= -180.0 && lon <= 180.0;
 
     if (valid) {
         *latitude = lat;
@@ -189,13 +175,13 @@ static esp_err_t fetch_location(double *latitude, double *longitude)
     cJSON_Delete(root);
 
     if (!valid) {
-        ESP_LOGW(TAG, "定位 API 缺少经纬度或时区字段");
+        ESP_LOGW(TAG, "定位 API 缺少有效坐标");
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    ESP_LOGI(TAG, "自动定位成功：%s，坐标 %.4f, %.4f，UTC 偏移 %ld 秒",
+    ESP_LOGI(TAG, "自动定位成功：%s，坐标 %.4f, %.4f；时区等待天气响应确认",
              s_snapshot.city[0] != '\0' ? s_snapshot.city : "未知城市",
-             lat, lon, (long)s_timezone_offset_seconds);
+             lat, lon);
     return ESP_OK;
 }
 

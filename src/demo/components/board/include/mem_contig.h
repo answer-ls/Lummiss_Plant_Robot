@@ -22,3 +22,4 @@ static inline void mem_contig_log(const char *tag)
 /* 首次启动至首次编码器创建的诊断窗口；不改变业务资源顺序。 */
 void mem_fragment_begin(void);
 void mem_fragment_dump_once(void);
+void mem_fragment_dump_retry_neighbors(void);

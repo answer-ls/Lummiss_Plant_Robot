@@ -15,6 +15,7 @@
 #include "driver/i2s_tdm.h"
 #include "esp_audio_enc.h"
 #include "esp_audio_types.h"
+#include "esp_ae_rate_cvt.h"
 #include "esp_check.h"
 #include "esp_codec_dev.h"
 #include "esp_codec_dev_defaults.h"
@@ -64,15 +65,17 @@ extern void expression_manager_post_emotion(const char *emotion) __attribute__((
 /* 采集节奏独立于 Opus 60ms 帧。双麦 AFE 每次需 64ms，60ms 读取会
  * 周期性积累到 120ms 才 feed；改成 10ms 读取后，feed 间隔为 60/70ms。 */
 #define XIAOZHI_CAPTURE_SAMPLES_16K   160U
+#define XIAOZHI_CAPTURE_INPUT_SAMPLES \
+    (XIAOZHI_CAPTURE_SAMPLES_16K * XIAOZHI_CODEC_SAMPLE_RATE / XIAOZHI_UPLINK_SAMPLE_RATE)
 #define XIAOZHI_CODEC_INPUT_GAIN_DB   30.0f
-/* 本轮单麦对照：保留新 PCB 四槽采集，只把 MIC1 送入 M 型 AFE。
- * 改回 0 即恢复双麦 MMR；不回退旧板 ES8311 采集引脚和驱动。 */
-#define XIAOZHI_SINGLE_MIC_TEST 0
-/* 保留四槽物理帧；单麦测试不向 AFE 输入 MIC2 和播放参考。 */
+/* 单麦对照使用实测清晰的 MIC2（SLOT2）和播放参考（SLOT1）；保留四槽采集和原有增益。
+ * 改回 0 即恢复双麦 MMR。 */
+#define XIAOZHI_SINGLE_MIC_TEST 1
+/* 保留四槽物理帧；单麦测试向 AFE 输入 MIC2 和播放参考。 */
 #if BOARD_AUDIO_HAS_ES7210
 #define XIAOZHI_CAPTURE_CHANNELS 4U
 #if XIAOZHI_SINGLE_MIC_TEST
-#define XIAOZHI_AFE_CHANNELS     1U
+#define XIAOZHI_AFE_CHANNELS     2U
 #else
 #define XIAOZHI_AFE_CHANNELS     3U
 #endif
@@ -172,6 +175,11 @@ typedef struct {
     uint8_t *capture_raw;
     uint8_t *capture_pcm;
     uint8_t *capture_opus;
+    /* 每个 AFE 输入通道各自保留重采样相位，避免交错多通道相互串扰。 */
+    esp_ae_rate_cvt_handle_t input_resamplers[XIAOZHI_AFE_CHANNELS];
+    int16_t *resample_input;
+    int16_t *resample_output;
+    uint32_t resample_max_output_samples;
     uint8_t *playback_pcm[XIAOZHI_PCM_POOL_SIZE];
 } xiaozhi_audio_context_t;
 
@@ -1053,6 +1061,17 @@ static void stop_worker_tasks(void)
 
 static void audio_hw_cleanup(void)
 {
+    for (size_t i = 0; i < XIAOZHI_AFE_CHANNELS; ++i) {
+        if (s_audio.input_resamplers[i] != NULL) {
+            esp_ae_rate_cvt_close(s_audio.input_resamplers[i]);
+            s_audio.input_resamplers[i] = NULL;
+        }
+    }
+    heap_caps_free(s_audio.resample_input);
+    heap_caps_free(s_audio.resample_output);
+    s_audio.resample_input = NULL;
+    s_audio.resample_output = NULL;
+    s_audio.resample_max_output_samples = 0;
     heap_caps_free(s_audio.capture_pcm);
     heap_caps_free(s_audio.capture_raw);
     heap_caps_free(s_audio.capture_opus);
@@ -1355,7 +1374,7 @@ static esp_err_t audio_hw_init(void)
                           0.0f) == ESP_CODEC_DEV_OK,
                       ESP_FAIL, fail, TAG, "设置 AEC 参考增益失败");
 #if XIAOZHI_SINGLE_MIC_TEST
-    ESP_LOGW(TAG, "MIC_ROUTE SINGLE_MIC_TEST=1 MIC1=SLOT0 -> AFE=M; gain=30dB; MIC2/REF excluded from AFE");
+    ESP_LOGW(TAG, "MIC_ROUTE SINGLE_MIC_TEST=1 MIC2=SLOT2 REF=SLOT1 -> AFE=MR; gain=30dB; MIC1 excluded from AFE");
 #else
     ESP_LOGI(TAG, "MIC_ROUTE slots=MIC1,REF,MIC2,unused -> AFE=MMR; gain=30/30/0dB; uplink=AFE mono");
 #endif
@@ -1457,8 +1476,7 @@ static esp_err_t audio_work_buffers_init(void)
     /* esp_codec_dev_read() 经 I2S 驱动从其 DMA ring memcpy 到用户缓冲，
      * capture_raw 不由 DMA 控制器直接访问，放 PSRAM 保留内部连续块。 */
     const size_t capture_raw_size =
-        XIAOZHI_CAPTURE_SAMPLES_16K * sizeof(int16_t) *
-        XIAOZHI_CODEC_SAMPLE_RATE / XIAOZHI_UPLINK_SAMPLE_RATE * XIAOZHI_CAPTURE_CHANNELS;
+        XIAOZHI_CAPTURE_INPUT_SAMPLES * sizeof(int16_t) * XIAOZHI_CAPTURE_CHANNELS;
     s_audio.capture_raw = heap_caps_malloc(
         capture_raw_size,
         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -1472,6 +1490,35 @@ static esp_err_t audio_work_buffers_init(void)
     s_audio.capture_opus = heap_caps_malloc(
         (size_t)s_audio.encoder_output_size,
         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_audio.resample_input = heap_caps_malloc(
+        XIAOZHI_CAPTURE_INPUT_SAMPLES * XIAOZHI_AFE_CHANNELS * sizeof(int16_t),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    esp_ae_rate_cvt_cfg_t resample_config = {
+        .src_rate = XIAOZHI_CODEC_SAMPLE_RATE,
+        .dest_rate = XIAOZHI_UPLINK_SAMPLE_RATE,
+        .channel = ESP_AUDIO_MONO,
+        .bits_per_sample = ESP_AUDIO_BIT16,
+        .complexity = 2,
+        .perf_type = ESP_AE_RATE_CVT_PERF_TYPE_SPEED,
+    };
+    esp_ae_err_t resample_err = ESP_AE_ERR_OK;
+    for (size_t ch = 0; ch < XIAOZHI_AFE_CHANNELS; ++ch) {
+        resample_err = esp_ae_rate_cvt_open(&resample_config, &s_audio.input_resamplers[ch]);
+        uint32_t channel_max = 0;
+        if (resample_err != ESP_AE_ERR_OK || s_audio.input_resamplers[ch] == NULL ||
+            esp_ae_rate_cvt_get_max_out_sample_num(
+                s_audio.input_resamplers[ch], XIAOZHI_CAPTURE_INPUT_SAMPLES, &channel_max) != ESP_AE_ERR_OK ||
+            channel_max == 0 ||
+            (s_audio.resample_max_output_samples != 0 && channel_max != s_audio.resample_max_output_samples)) {
+            ESP_LOGE(TAG, "esp_ae_rate_cvt 初始化失败：channel=%u err=%d max=%u",
+                     (unsigned)ch, (int)resample_err, (unsigned)channel_max);
+            return ESP_FAIL;
+        }
+        s_audio.resample_max_output_samples = channel_max;
+    }
+    s_audio.resample_output = heap_caps_malloc(
+        s_audio.resample_max_output_samples * XIAOZHI_AFE_CHANNELS * sizeof(int16_t),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     ESP_LOGI(TAG, "AUDIO_USER_PSRAM raw=%u pcm=%u opus=%u bytes",
              (unsigned)capture_raw_size, (unsigned)pcm_bytes,
              (unsigned)s_audio.encoder_output_size);
@@ -1481,10 +1528,14 @@ static esp_err_t audio_work_buffers_init(void)
             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     }
     if (s_audio.capture_raw == NULL || s_audio.capture_pcm == NULL ||
-        s_audio.capture_opus == NULL) {
+        s_audio.capture_opus == NULL || s_audio.resample_input == NULL ||
+        s_audio.resample_output == NULL) {
         ESP_LOGE(TAG, "小智音频工作缓冲分配失败");
         return ESP_ERR_NO_MEM;
     }
+    ESP_LOGI(TAG, "输入重采样器已就绪：%uHz->%uHz channels=%u max_out=%u samples/channel",
+             XIAOZHI_CODEC_SAMPLE_RATE, XIAOZHI_UPLINK_SAMPLE_RATE,
+             (unsigned)XIAOZHI_AFE_CHANNELS, (unsigned)s_audio.resample_max_output_samples);
     for (size_t i = 0; i < XIAOZHI_PCM_POOL_SIZE; i++) {
         if (s_audio.playback_pcm[i] == NULL) {
             ESP_LOGE(TAG, "小智 PCM 缓冲池分配失败：%u/%u",
@@ -1495,25 +1546,45 @@ static esp_err_t audio_work_buffers_init(void)
     return ESP_OK;
 }
 
-static void resample_mic_24k_to_16k(const int16_t *input,
-                                    int16_t *output,
-                                    size_t output_samples)
+static esp_err_t resample_mic_24k_to_16k(const int16_t *input,
+                                         int16_t *output,
+                                         size_t *output_samples)
 {
-    /* 所有通道使用同一 3:2 相位重采样，保持麦克风与参考同步。
-     * 历史软件按槽0/2/1重排为MMR，物理对应关系仍待定位测试确认。 */
-    const size_t pairs = output_samples / 2U;
-    for (size_t pair = 0; pair < pairs; pair++) {
-        const size_t in_pos = pair * 3U;
-        const size_t out_pos = pair * 2U;
-        for (size_t ch = 0; ch < XIAOZHI_AFE_CHANNELS; ch++) {
-            const size_t slot = ch == 1 ? 2 : (ch == 2 ? 1 : 0);
-            output[out_pos * XIAOZHI_AFE_CHANNELS + ch] =
-                input[in_pos * XIAOZHI_CAPTURE_CHANNELS + slot];
-            output[(out_pos + 1U) * XIAOZHI_AFE_CHANNELS + ch] = (int16_t)(
-                ((int32_t)input[(in_pos + 1U) * XIAOZHI_CAPTURE_CHANNELS + slot] +
-                 input[(in_pos + 2U) * XIAOZHI_CAPTURE_CHANNELS + slot]) / 2);
+    const size_t input_frames = XIAOZHI_CAPTURE_INPUT_SAMPLES;
+    size_t channel_output_samples = 0;
+    for (size_t ch = 0; ch < XIAOZHI_AFE_CHANNELS; ++ch) {
+        /* 板级物理槽保持实测映射：单麦 MIC2=SLOT2、REF=SLOT1；双麦 MMR=SLOT0/2/1。 */
+        const size_t slot = XIAOZHI_SINGLE_MIC_TEST ? (ch == 0 ? 2 : 1) :
+                            (ch == 0 ? 0 : (ch == 1 ? 2 : 1));
+        int16_t *mono_input = s_audio.resample_input + ch * input_frames;
+        int16_t *mono_output = s_audio.resample_output + ch * s_audio.resample_max_output_samples;
+        for (size_t frame = 0; frame < input_frames; ++frame) {
+            mono_input[frame] = input[frame * XIAOZHI_CAPTURE_CHANNELS + slot];
+        }
+        uint32_t produced = s_audio.resample_max_output_samples;
+        esp_ae_err_t err = esp_ae_rate_cvt_process(
+            s_audio.input_resamplers[ch], (esp_ae_sample_t)mono_input,
+            input_frames, (esp_ae_sample_t)mono_output, &produced);
+        if (err != ESP_AE_ERR_OK || produced == 0 || produced > s_audio.resample_max_output_samples ||
+            (channel_output_samples != 0 && produced != channel_output_samples)) {
+            ESP_LOGE(TAG, "esp_ae_rate_cvt 处理失败：channel=%u err=%d samples=%u",
+                     (unsigned)ch, (int)err, (unsigned)produced);
+            /* 任一声道失败后清空全部相位，避免下次处理时通道间时间错位。 */
+            for (size_t reset_ch = 0; reset_ch < XIAOZHI_AFE_CHANNELS; ++reset_ch) {
+                (void)esp_ae_rate_cvt_reset(s_audio.input_resamplers[reset_ch]);
+            }
+            return ESP_FAIL;
+        }
+        channel_output_samples = produced;
+    }
+    for (size_t frame = 0; frame < channel_output_samples; ++frame) {
+        for (size_t ch = 0; ch < XIAOZHI_AFE_CHANNELS; ++ch) {
+            output[frame * XIAOZHI_AFE_CHANNELS + ch] =
+                s_audio.resample_output[ch * s_audio.resample_max_output_samples + frame];
         }
     }
+    *output_samples = channel_output_samples;
+    return ESP_OK;
 }
 
 static void capture_task(void *arg)
@@ -1579,13 +1650,18 @@ static void capture_task(void *arg)
         }
 
         diag_ts = esp_timer_get_time();
-        resample_mic_24k_to_16k(
+        size_t output_samples = 0;
+        if (resample_mic_24k_to_16k(
             (const int16_t *)raw,
             (int16_t *)pcm,
-            XIAOZHI_CAPTURE_SAMPLES_16K);
+            &output_samples) != ESP_OK || output_samples != XIAOZHI_CAPTURE_SAMPLES_16K) {
+            capture_diag_metric(CD_RESAMPLE, esp_timer_get_time() - diag_ts);
+            xSemaphoreGive(s_capture_guard);
+            continue;
+        }
         capture_diag_metric(CD_RESAMPLE, esp_timer_get_time() - diag_ts);
         audio_probe_input((const int16_t *)raw, (size_t)raw_size,
-                          (const int16_t *)pcm, XIAOZHI_CAPTURE_SAMPLES_16K);
+                          (const int16_t *)pcm, output_samples);
 
         EventBits_t bits = xEventGroupGetBits(s_events);
         const bool uplink = (bits & (XIAOZHI_EVENT_CHANNEL_ACTIVE |
@@ -2158,8 +2234,11 @@ static void abort_audio_service(void)
 static void service_task(void *arg)
 {
     (void)arg;
+    ESP_LOGI(TAG, "AUDIO_DIAGNOSTICS udp_ab=%d lifecycle_tx=%d recording=%d",
+             CAPTURE_UPLINK_AB_DIAGNOSTIC, AUDIO_LIFECYCLE_DIAGNOSTIC,
+             AUDIO_RECORDING_DIAGNOSTIC);
     if (audio_hw_init() != ESP_OK ||
-        (!CAPTURE_UPLINK_AB_DIAGNOSTIC && lifecycle_prepare(s_audio.input_ctrl_if, s_audio.rx_channel, s_audio.tx_channel) != ESP_OK) ||
+        (AUDIO_LIFECYCLE_DIAGNOSTIC && !CAPTURE_UPLINK_AB_DIAGNOSTIC && lifecycle_prepare(s_audio.input_ctrl_if, s_audio.rx_channel, s_audio.tx_channel) != ESP_OK) ||
         audio_codec_init() != ESP_OK ||
         audio_work_buffers_init() != ESP_OK ||
         capture_diag_init() != ESP_OK) {
@@ -2255,7 +2334,7 @@ static void service_task(void *arg)
              XIAOZHI_WAKE_PROCESS_CORE, XIAOZHI_WAKE_PROCESS_PRIORITY,
              XIAOZHI_PCM_QUEUE_DEPTH);
 
-    lifecycle_start();
+    if (AUDIO_LIFECYCLE_DIAGNOSTIC) lifecycle_start();
 
     /* 初始化已完成；收发由 MIC、SPK 和 WebSocket 任务负责，无需保留空转任务。 */
     s_service_task = NULL;

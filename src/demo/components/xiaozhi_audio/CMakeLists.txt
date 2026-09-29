@@ -11,6 +11,7 @@ idf_component_register(
         ambient_led
         esp_audio_codec
         esp_codec_dev
+        esp_audio_effects
         esp_driver_gpio
         esp_driver_i2c
         esp_driver_i2s

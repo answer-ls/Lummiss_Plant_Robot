@@ -19,4 +19,8 @@ esp_err_t camera_driver_prepare_ready_event(void);
  * 超时或摄像头异常时返回 false。 */
 bool camera_driver_wait_ready(uint32_t timeout_ms);
 
+/* 停止当前 UVC 视频流；任务保留，下一次预览请求时可重新打开流。 */
+esp_err_t camera_driver_request_stop(uint32_t timeout_ms);
+esp_err_t camera_driver_request_start(void);
+
 #endif /* LUMMISS_CAMERA_DRIVER_H */

@@ -1,6 +1,7 @@
 #include "ambient_led.h"
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <string.h>
 #include <strings.h>
 
@@ -221,6 +222,8 @@ static void refresh_frame(void)
     render_snapshot_t snapshot[AMBIENT_LED_COUNT];
     const int64_t now = esp_timer_get_time();
     uint32_t tick;
+    bool manual_expired = false;
+    bool off_expired = false;
 
     portENTER_CRITICAL(&s_lock);
     if (s_manual_deadline_us != 0 && now >= s_manual_deadline_us) {
@@ -231,18 +234,26 @@ static void refresh_frame(void)
         }
         s_manual_deadline_us = 0;
         s_manual_deadline_mask = 0;
-        ESP_LOGI(TAG, "临时灯效到期，恢复当前情绪/系统状态灯效");
+        manual_expired = true;
     }
     if (s_off_deadline_us != 0 && now >= s_off_deadline_us) {
         s_manual_off = true;
         s_off_deadline_us = 0;
-        ESP_LOGI(TAG, "定时关灯到期");
+        off_expired = true;
     }
     for (size_t i = 0; i < AMBIENT_LED_COUNT; ++i) {
         resolve_snapshot_locked(&snapshot[i], i);
     }
     tick = s_tick++;
     portEXIT_CRITICAL(&s_lock);
+
+    /* 日志会获取 newlib 锁，必须在临界区外打印。 */
+    if (manual_expired) {
+        ESP_LOGI(TAG, "临时灯效到期，恢复当前情绪/系统状态灯效");
+    }
+    if (off_expired) {
+        ESP_LOGI(TAG, "定时关灯到期");
+    }
 
     for (size_t i = 0; i < AMBIENT_LED_COUNT; ++i) {
         render_channel(&snapshot[i], tick);

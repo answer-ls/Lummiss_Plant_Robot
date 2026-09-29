@@ -137,7 +137,7 @@ static void probe_task(void *arg)
 void audio_probe_start(void)
 {
     /* A/B窗口使用独立raw缓存；禁止旧探针只在首轮额外占用采集和串口时间。 */
-    if (CAPTURE_UPLINK_AB_DIAGNOSTIC) return;
+    if (!AUDIO_RECORDING_DIAGNOSTIC || CAPTURE_UPLINK_AB_DIAGNOSTIC) return;
     if (started) return;
     started = true;
     /* 回答播放后再读一次真实RX格式，避免把运行时变更的格式误标为四槽16bit。 */

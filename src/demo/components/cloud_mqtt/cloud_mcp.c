@@ -234,6 +234,8 @@ typedef struct {
     uint32_t steps;
     uint32_t interval_us;
     stepper_direction_t direction;
+    bool angle_mode;
+    uint32_t requested_degrees;
     cJSON *request_id; /* 独立副本，由工作任务在最终回执后释放。 */
 } motion_job_t;
 
@@ -243,7 +245,8 @@ static void motion_worker(void *arg)
 {
     const motion_job_t job = *(motion_job_t *)arg;
     heap_caps_free(arg);
-    ESP_LOGI(TAG, "motion.move_steps 开始：steps=%u direction=%s interval_us=%u",
+    ESP_LOGI(TAG, "%s 开始：steps=%u direction=%s interval_us=%u",
+             job.angle_mode ? "motion.rotate_by" : "motion.move_steps",
              (unsigned)job.steps, job.direction == STEPPER_DIR_CW ? "cw" : "ccw",
              (unsigned)job.interval_us);
     /* 电机只在收到工具调用时初始化和上电，动作结束后关闭线圈。 */
@@ -260,15 +263,25 @@ static void motion_worker(void *arg)
     }
     mcp_tool_result_t reply = { .is_error = err != ESP_OK };
     /* 这里只确认驱动执行结果；没有编码器，不能声称已验证机械位移。 */
-    snprintf(reply.text, sizeof(reply.text),
-             "{\"completed\":%s,\"requestedSteps\":%u,\"direction\":\"%s\",\"result\":\"%s\"}",
-             err == ESP_OK ? "true" : "false", (unsigned)job.steps,
-             job.direction == STEPPER_DIR_CW ? "cw" : "ccw", esp_err_to_name(err));
+    if (job.angle_mode) {
+        snprintf(reply.text, sizeof(reply.text),
+                 "{\"completed\":%s,\"requestedDegrees\":%u,\"commandedSteps\":%u,"
+                 "\"direction\":\"%s\",\"positionMeasured\":false,\"result\":\"%s\"}",
+                 err == ESP_OK ? "true" : "false", (unsigned)job.requested_degrees,
+                 (unsigned)job.steps, job.direction == STEPPER_DIR_CW ? "cw" : "ccw",
+                 esp_err_to_name(err));
+    } else {
+        snprintf(reply.text, sizeof(reply.text),
+                 "{\"completed\":%s,\"requestedSteps\":%u,\"direction\":\"%s\",\"result\":\"%s\"}",
+                 err == ESP_OK ? "true" : "false", (unsigned)job.steps,
+                 job.direction == STEPPER_DIR_CW ? "cw" : "ccw", esp_err_to_name(err));
+    }
     /* 线圈已关闭，先结束忙状态，再回执，避免后续指令被误报 MOTOR_BUSY。 */
     __atomic_store_n(&s_motion_busy, false, __ATOMIC_RELEASE);
     publish_tool_result(job.request_id, &reply);
     cJSON_Delete(job.request_id);
-    ESP_LOGI(TAG, "motion.move_steps 完成：steps=%u direction=%s result=%s",
+    ESP_LOGI(TAG, "%s 完成：steps=%u direction=%s result=%s",
+             job.angle_mode ? "motion.rotate_by" : "motion.move_steps",
              (unsigned)job.steps,
              job.direction == STEPPER_DIR_CW ? "cw" : "ccw",
              esp_err_to_name(err));
@@ -321,6 +334,7 @@ static void tool_motion_move_steps(const cJSON *args, const cJSON *request_id)
     *job = (motion_job_t){
         .request_id = id_copy,
         .steps = (uint32_t)steps->valueint,
+        .angle_mode = false,
         .direction = strcmp(direction->valuestring, "cw") == 0
                          ? STEPPER_DIR_CW : STEPPER_DIR_CCW,
         /* 使用实测范围10～100ms，默认20ms；不自动提高到未验证的步速。 */
@@ -337,6 +351,69 @@ static void tool_motion_move_steps(const cJSON *args, const cJSON *request_id)
     }
     /* 不提前回 accepted，最终成功/失败由 motion_worker 统一回执。
      * MCP 分发任务仍可继续接收 motion.stop。 */
+}
+
+static void tool_motion_rotate_by(const cJSON *args, const cJSON *request_id)
+{
+    mcp_tool_result_t reply = { .is_error = true };
+    const cJSON *degrees = cJSON_GetObjectItem(args, "degrees");
+    const cJSON *direction = cJSON_GetObjectItem(args, "direction");
+    const cJSON *interval = cJSON_GetObjectItem(args, "stepIntervalUs");
+    if (!cJSON_IsNumber(degrees) || degrees->valuedouble < 1 ||
+        degrees->valuedouble > 360 || degrees->valuedouble != degrees->valueint ||
+        !cJSON_IsString(direction) || direction->valuestring == NULL ||
+        (strcmp(direction->valuestring, "cw") != 0 &&
+         strcmp(direction->valuestring, "ccw") != 0) ||
+        (interval != NULL && (!cJSON_IsNumber(interval) ||
+          interval->valuedouble < 10000 || interval->valuedouble > 100000 ||
+          interval->valuedouble != interval->valueint))) {
+        snprintf(reply.text, sizeof(reply.text), "{\"error\":\"INVALID_MOTION_ARGUMENTS\"}");
+        publish_tool_result((cJSON *)request_id, &reply);
+        return;
+    }
+
+    /* 当前电机为1.8°全步进；将请求角度就近量化到整步，最大360°即200步。 */
+    const uint32_t requested_degrees = (uint32_t)degrees->valueint;
+    const uint32_t steps = (requested_degrees * 5U + 4U) / 9U;
+    bool expected = false;
+    if (!__atomic_compare_exchange_n(&s_motion_busy, &expected, true, false,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        snprintf(reply.text, sizeof(reply.text), "{\"error\":\"MOTOR_BUSY\"}");
+        publish_tool_result((cJSON *)request_id, &reply);
+        return;
+    }
+    motion_job_t *job = heap_caps_malloc(sizeof(*job), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (job == NULL) {
+        __atomic_store_n(&s_motion_busy, false, __ATOMIC_RELEASE);
+        snprintf(reply.text, sizeof(reply.text), "{\"error\":\"NO_MEMORY\"}");
+        publish_tool_result((cJSON *)request_id, &reply);
+        return;
+    }
+    cJSON *id_copy = request_id != NULL ? cJSON_Duplicate(request_id, true) : NULL;
+    if (id_copy == NULL) {
+        heap_caps_free(job);
+        __atomic_store_n(&s_motion_busy, false, __ATOMIC_RELEASE);
+        snprintf(reply.text, sizeof(reply.text), "{\"error\":\"REQUEST_ID_COPY_FAILED\"}");
+        publish_tool_result((cJSON *)request_id, &reply);
+        return;
+    }
+    *job = (motion_job_t){
+        .request_id = id_copy,
+        .steps = steps,
+        .angle_mode = true,
+        .requested_degrees = requested_degrees,
+        .direction = strcmp(direction->valuestring, "cw") == 0
+                         ? STEPPER_DIR_CW : STEPPER_DIR_CCW,
+        .interval_us = interval == NULL ? 20000U : (uint32_t)interval->valueint,
+    };
+    if (xTaskCreatePinnedToCore(motion_worker, "mcp_stepper", 3072, job,
+                                4, NULL, 1) != pdPASS) {
+        cJSON_Delete(id_copy);
+        heap_caps_free(job);
+        __atomic_store_n(&s_motion_busy, false, __ATOMIC_RELEASE);
+        snprintf(reply.text, sizeof(reply.text), "{\"error\":\"TASK_CREATE_FAILED\"}");
+        publish_tool_result((cJSON *)request_id, &reply);
+    }
 }
 
 #endif
@@ -643,6 +720,15 @@ static void register_builtin_tools(void)
               "\"direction\":{\"type\":\"string\",\"enum\":[\"cw\",\"ccw\"]},"
               "\"stepIntervalUs\":{\"type\":\"integer\",\"minimum\":10000,\"maximum\":100000,\"default\":20000}}}",
           .async_handler = tool_motion_move_steps },
+        { .name = "motion.rotate_by",
+          .description = "Rotate the stepper by a relative angle in degrees. Uses open-loop 1.8-degree full steps, rounded to the nearest step; no encoder, so actual position is not measured. Use motion.stop to interrupt.",
+          .input_schema =
+              "{\"type\":\"object\",\"additionalProperties\":false,"
+              "\"required\":[\"degrees\",\"direction\"],\"properties\":{"
+              "\"degrees\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":360},"
+              "\"direction\":{\"type\":\"string\",\"enum\":[\"cw\",\"ccw\"]},"
+              "\"stepIntervalUs\":{\"type\":\"integer\",\"minimum\":10000,\"maximum\":100000,\"default\":20000}}}",
+          .async_handler = tool_motion_rotate_by },
 #endif
         { .name = "motion.stop",
           .description = "Immediately stop the stepper motor.",

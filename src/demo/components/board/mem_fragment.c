@@ -271,7 +271,46 @@ void mem_fragment_dump_once(void)
     heap_caps_free(s_blocks);
     s_blocks = NULL;
 }
+
+void mem_fragment_dump_retry_neighbors(void)
+{
+    /* 二次预览失败时仅重采样最大空闲块及其邻居，不重新开启长时heap trace。 */
+    if (!s_done) return;
+    s_blocks = heap_caps_calloc(BLOCK_MAX, sizeof(*s_blocks), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_blocks == NULL) return;
+    s_count = s_dropped = 0;
+    s_target_start = 0;
+    s_api_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    heap_caps_walk(MALLOC_CAP_INTERNAL, collect_block, NULL);
+    for (size_t i = 0; i < s_count; ++i) {
+        if (s_blocks[i].end - s_blocks[i].start == 199999U) {
+            s_target_start = s_blocks[i].start;
+            break;
+        }
+    }
+    size_t best = SIZE_MAX;
+    for (size_t i = 0; i < s_count; ++i) {
+        if (target_block(&s_blocks[i]) && !s_blocks[i].used &&
+            (best == SIZE_MAX || s_blocks[i].size > s_blocks[best].size)) best = i;
+    }
+    ESP_LOGW("FRAG", "RETRY_LARGEST region=%08x api=%u raw=%u dropped=%u",
+             (unsigned)s_target_start, (unsigned)s_api_largest,
+             best == SIZE_MAX ? 0U : (unsigned)s_blocks[best].size, (unsigned)s_dropped);
+    if (best != SIZE_MAX) {
+        for (int offset = -3; offset <= 3; ++offset) {
+            const ptrdiff_t index = (ptrdiff_t)best + offset;
+            if (index < 0 || (size_t)index >= s_count || !target_block(&s_blocks[index])) continue;
+            const block_t *b = &s_blocks[index];
+            ESP_LOGW("FRAG", "RETRY_NEIGHBOR offset=%d state=%s ptr=%08x size=%u",
+                     offset, b->used ? "ALLOC" : "FREE", (unsigned)b->ptr,
+                     (unsigned)b->size);
+        }
+    }
+    heap_caps_free(s_blocks);
+    s_blocks = NULL;
+}
 #else
 void mem_fragment_begin(void) {}
 void mem_fragment_dump_once(void) {}
+void mem_fragment_dump_retry_neighbors(void) {}
 #endif

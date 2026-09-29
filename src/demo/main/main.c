@@ -35,6 +35,8 @@
 #include "person_detect.h"
 #include "sd_card.h"
 #include "board_init.h"
+#include "board_pins.h"
+#include "battery_monitor.h"
 
 static const char *TAG = "APP_MAIN";
 
@@ -169,16 +171,24 @@ static void idle_stable_diag_task(void *arg)
 }
 
 #if defined(CONFIG_CLOUD_PROTOCOL_V3)
-/* MCP 工具 self.get_device_status 的执行体。
- * JSON 字段形状对照官方 wifi_board.cc 的 GetDeviceStatusJson：
- * 本设备没有电池模块、背光不可调，相关字段省略（不编造数值）。 */
+/* MCP 工具 self.get_device_status 的执行体；电池字段仅在取得真实采样后上报。 */
 static void device_status_tool_handler(const cJSON *arguments,
                                        char *result, size_t result_size,
                                        bool *is_error)
 {
     (void)arguments;
-    snprintf(result, result_size, "{\"audio_speaker\":{\"volume\":%d}}",
-             xiaozhi_audio_get_volume());
+    battery_monitor_snapshot_t battery;
+    if (battery_monitor_get_snapshot(&battery)) {
+        snprintf(result, result_size,
+                 "{\"audio_speaker\":{\"volume\":%d},"
+                 "\"battery\":{\"capacity\":%u,\"voltage_mv\":%u}}",
+                 xiaozhi_audio_get_volume(), battery.percent, battery.voltage_mv);
+    } else {
+        snprintf(result, result_size,
+                 "{\"audio_speaker\":{\"volume\":%d},"
+                 "\"battery\":{\"available\":false}}",
+                 xiaozhi_audio_get_volume());
+    }
     *is_error = false;
 }
 
@@ -300,7 +310,7 @@ static esp_err_t rtc_camera_start(void)
     bool expected = false;
     if (!__atomic_compare_exchange_n(&s_rtc_camera_started, &expected, true,
                                      false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-        return ESP_OK;
+        return camera_driver_request_start();
     }
     const esp_err_t err = camera_driver_prepare_ready_event();
     if (err != ESP_OK) {
@@ -315,6 +325,14 @@ static esp_err_t rtc_camera_start(void)
     }
     ESP_LOGI(TAG, "RTC 预览指令已启动 Camera Task，等待 UVC 首帧");
     return ESP_OK;
+}
+
+static esp_err_t rtc_camera_stop(void)
+{
+    if (!__atomic_load_n(&s_rtc_camera_started, __ATOMIC_ACQUIRE)) {
+        return ESP_OK;
+    }
+    return camera_driver_request_stop(5000);
 }
 
 static bool rtc_camera_is_ready(void)
@@ -432,6 +450,14 @@ void app_main(void)
              "任务分配：CPU0=USB/UVC+ESP-Hosted+WebSocket+音频，"
              "CPU1=视频编解码+LVGL+动画");
 
+#if CAMERA_TEST_PROFILE == CAMERA_TEST_FULL && BOARD_HAS_BATTERY_GAUGE
+    const esp_err_t battery_err = battery_monitor_init();
+    if (battery_err != ESP_OK) {
+        ESP_LOGW(TAG, "CW2015 电池检测不可用：%s，其它功能继续启动",
+                 esp_err_to_name(battery_err));
+    }
+#endif
+
     /* 设备身份：MAC (Device-Id) 和 UUID (Client-Id) 必须优先初始化，
      * OTA 请求和 WebSocket 建连均依赖这两个标识。 */
     esp_err_t identity_error = device_identity_init();
@@ -504,7 +530,8 @@ void app_main(void)
         webrtc_whip_set_resource_prepare(rtc_prepare_resources);
         webrtc_whip_set_audio_control(xiaozhi_audio_set_rtc_suspended);
 #if RTC_CAMERA_ON_DEMAND
-        webrtc_whip_set_camera_control(rtc_camera_start, rtc_camera_is_ready);
+        webrtc_whip_set_camera_control(rtc_camera_start, rtc_camera_stop,
+                                       rtc_camera_is_ready);
 #endif
     } else {
         ESP_LOGE(TAG, "WHIP 控制器初始化失败");

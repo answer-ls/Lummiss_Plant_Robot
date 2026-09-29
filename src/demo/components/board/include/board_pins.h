@@ -39,6 +39,11 @@
 #define BOARD_AUDIO_I2C_SCL  GPIO_NUM_33
 #define BOARD_AUDIO_I2C_SDA  GPIO_NUM_34
 
+/* CW2015 电量计使用独立 I2C 总线，不与音频 Codec 的 I2C 引脚复用。 */
+#define BOARD_HAS_BATTERY_GAUGE 1
+#define BOARD_BATTERY_I2C_SDA  GPIO_NUM_48
+#define BOARD_BATTERY_I2C_SCL  GPIO_NUM_49
+
 /* NS4150B CTRL 由本地 RC 网络拉到 V_OUT，未连接 P4 GPIO。 */
 #define BOARD_HAS_PA_GPIO    0
 #define BOARD_AUDIO_HAS_ES7210 1
@@ -67,6 +72,7 @@
 
 /* 开发板的 GPIO8 是 ES8311 I2C SCL，严禁配置为电源保持输出。 */
 #define BOARD_HAS_PWR_IO  0
+#define BOARD_HAS_BATTERY_GAUGE 0
 
 /* 当前开发板音频引脚；GPIO9~13 已接入音频，不能用于步进电机。 */
 #define BOARD_AUDIO_I2C_SDA  GPIO_NUM_7

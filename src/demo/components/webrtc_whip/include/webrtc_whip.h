@@ -55,9 +55,6 @@ void webrtc_whip_notify_storage_init_done(void);
 esp_err_t webrtc_whip_request_start(const webrtc_whip_credential_t *credential);
 esp_err_t webrtc_whip_request_stop(const char *session_id);
 webrtc_whip_state_t webrtc_whip_get_state(void);
-/* 仅停止预览后分块导出诊断，不在发送期间打印码流。 */
-void webrtc_whip_export_h264_probe_step(void);
-
 /* 由 video_upload 任务提交纯 Annex-B 帧；内部 esp_peer 负责 RTP/SRTP。 */
 esp_err_t webrtc_whip_send_h264(const uint8_t *annex_b, size_t length,
                                 uint32_t pts_ms, bool idr);
@@ -70,6 +67,7 @@ void webrtc_whip_set_video_control(esp_err_t (*start)(void),
 /* 按需摄像头：收到预览请求后启动 UVC；控制任务轮询首帧就绪状态。
  * 未注册时沿用开机启动摄像头并主动通知 CAMERA_READY 的旧流程。 */
 void webrtc_whip_set_camera_control(esp_err_t (*start)(void),
+                                    esp_err_t (*stop)(void),
                                     bool (*is_ready)(void));
 
 /* PeerConnection 创建前回收动画等非实时临时资源。回调在 WHIP 控制任务执行。 */

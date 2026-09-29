@@ -41,7 +41,7 @@ typedef struct {
  * 调用前需确保 SPIFFS 已挂载，"storage" 分区中存在 Wakenet 模型文件。
  * 该函数会加载模型、创建 AFE 实例并启动内部检测任务。
  *
- * @param channels      1 为单麦 M；3 为双麦加播放参考 MMR。
+ * @param channels      1 为单麦 M；2 为单麦加播放参考 MR；3 为双麦加播放参考 MMR。
  * @return ESP_OK 成功，否则失败
  */
 esp_err_t wake_word_init(int channels);
@@ -84,7 +84,7 @@ size_t wake_word_get_feed_size(void);
  *
  * 内部会缓存不足一个 chunk 的剩余数据，凑满后送入 AFE。
  *
- * @param data   16 kHz/16-bit PCM，按初始化的 M 或 MMR 顺序交错。
+ * @param data   16 kHz/16-bit PCM，按初始化的 M、MR 或 MMR 顺序交错。
  * @param count  样本数量
  */
 void wake_word_feed(const int16_t *data, size_t count);

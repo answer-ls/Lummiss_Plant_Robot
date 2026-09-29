@@ -20,6 +20,7 @@
 #include "freertos/task.h"
 
 #include "display_driver.h"
+#include "battery_monitor.h"
 #include "board_pins.h"
 #include "home_info.h"
 #include "test_profile.h"
@@ -80,6 +81,8 @@ static lv_obj_t *s_weather_label;
 static lv_obj_t *s_temperature_label;
 static lv_obj_t *s_time_label;
 static lv_obj_t *s_weather_dot;
+static lv_obj_t *s_battery_label;
+static lv_obj_t *s_battery_fill;
 static bool s_lvgl_ready;
 static bool s_rtc_hold_lcd;
 /* 仅 LVGL 线程访问：内容变更事件允许一次刷新，其余 RTC 刷新跳过。 */
@@ -414,11 +417,41 @@ static void update_home_screen(lv_timer_t *timer)
 {
     (void)timer;
     if (s_binding_required) return;
+    bool battery_changed = false;
+    battery_monitor_snapshot_t battery = {0};
+    if (s_battery_label != NULL) {
+        static bool battery_ui_valid;
+        static bool last_battery_available;
+        static uint8_t last_battery_percent;
+        static uint16_t last_battery_decivolts;
+        const bool available = battery_monitor_get_snapshot(&battery);
+        battery_changed = !battery_ui_valid || available != last_battery_available ||
+            (available && (battery.percent != last_battery_percent ||
+                           (uint16_t)((battery.voltage_mv + 50U) / 100U) != last_battery_decivolts));
+        if (battery_changed) {
+            if (available) {
+                lv_label_set_text_fmt(s_battery_label, "%u%%", battery.percent);
+                lv_obj_set_width(s_battery_fill,
+                                 (lv_coord_t)(12U * battery.percent / 100U));
+            } else {
+                lv_label_set_text(s_battery_label, "--%");
+                lv_obj_set_width(s_battery_fill, 0);
+            }
+            battery_ui_valid = true;
+            last_battery_available = available;
+            last_battery_percent = battery.percent;
+            last_battery_decivolts = available ?
+                (uint16_t)((battery.voltage_mv + 50U) / 100U) : 0;
+        }
+    }
     static const char *weekdays[] = {
-        "星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"
+        "周日", "周一", "周二", "周三", "周四", "周五", "周六"
     };
     home_info_snapshot_t info = {0};
     if (!home_info_get_snapshot(&info)) {
+        if (battery_changed && __atomic_load_n(&s_rtc_hold_lcd, __ATOMIC_ACQUIRE)) {
+            s_home_dirty = true;
+        }
         return;
     }
 
@@ -432,7 +465,7 @@ static void update_home_screen(lv_timer_t *timer)
         info.hour != last.hour || info.minute != last.minute ||
         info.temperature_c != last.temperature_c || info.weather_code != last.weather_code;
     const bool rtc = __atomic_load_n(&s_rtc_hold_lcd, __ATOMIC_ACQUIRE);
-    if (!changed && !s_home_dirty) return;
+    if (!changed && !battery_changed && !s_home_dirty) return;
     const int64_t now_us = esp_timer_get_time();
     if (rtc && s_last_rtc_refresh_us != 0 && now_us - s_last_rtc_refresh_us < 30000000LL) {
         s_home_dirty = true;
@@ -471,7 +504,7 @@ static void update_home_screen(lv_timer_t *timer)
                               info.month, info.day, weekdays[info.weekday]);
         lv_label_set_text_fmt(s_time_label, "%02d:%02d", info.hour, info.minute);
     } else {
-        lv_label_set_text(s_date_label, "--月--日 星期-");
+        lv_label_set_text(s_date_label, "--月--日 周-");
         lv_label_set_text(s_time_label, "--:--");
     }
 
@@ -501,7 +534,7 @@ static void update_home_screen(lv_timer_t *timer)
     }
 }
 
-/* 首页使用 LVGL 控件绘制，联网后可更新真实信息。电量等待电池管理模块。 */
+/* 首页使用 LVGL 控件绘制，并显示电量计最近一次有效采样。 */
 static void create_home_screen(void)
 {
     lv_obj_t *screen = lv_scr_act();
@@ -520,19 +553,46 @@ static void create_home_screen(void)
     lv_obj_set_style_pad_all(panel, 0, 0);
     lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
 
-    s_date_label = create_label(panel, &lv_font_simsun_16_cjk, 18, 34, 142, 26);
+    s_date_label = create_label(panel, &lv_font_simsun_16_cjk, 8, 12, 110, 26);
+    lv_label_set_long_mode(s_date_label, LV_LABEL_LONG_CLIP);
 
     /* 简洁的彩色天气图标；颜色随天气码变化。 */
     s_weather_dot = lv_obj_create(panel);
     lv_obj_remove_style_all(s_weather_dot);
-    lv_obj_set_pos(s_weather_dot, 166, 36);
-    lv_obj_set_size(s_weather_dot, 20, 20);
+    lv_obj_set_pos(s_weather_dot, 120, 16);
+    lv_obj_set_size(s_weather_dot, 16, 16);
     lv_obj_set_style_radius(s_weather_dot, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_opa(s_weather_dot, LV_OPA_COVER, 0);
 
     s_weather_label = create_label(panel, &lv_font_lummiss_weather_16,
-                                   190, 34, 54, 26);
-    s_temperature_label = create_label(panel, &lv_font_montserrat_20, 238, 32, 62, 30);
+                                   138, 12, 51, 26);
+    lv_label_set_long_mode(s_weather_label, LV_LABEL_LONG_CLIP);
+    lv_label_set_text(s_weather_label, "获取中");
+    s_temperature_label = create_label(panel, &lv_font_montserrat_16, 189, 12, 45, 26);
+    lv_label_set_long_mode(s_temperature_label, LV_LABEL_LONG_CLIP);
+    lv_obj_t *battery_body = lv_obj_create(panel);
+    lv_obj_remove_style_all(battery_body);
+    lv_obj_set_pos(battery_body, 236, 17);
+    lv_obj_set_size(battery_body, 20, 12);
+    lv_obj_set_style_radius(battery_body, 2, 0);
+    lv_obj_set_style_border_color(battery_body, lv_color_white(), 0);
+    lv_obj_set_style_border_width(battery_body, 2, 0);
+    lv_obj_set_style_bg_opa(battery_body, LV_OPA_TRANSP, 0);
+    s_battery_fill = lv_obj_create(battery_body);
+    lv_obj_remove_style_all(s_battery_fill);
+    lv_obj_set_pos(s_battery_fill, 2, 2);
+    lv_obj_set_size(s_battery_fill, 0, 8);
+    lv_obj_set_style_bg_color(s_battery_fill, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(s_battery_fill, LV_OPA_COVER, 0);
+    lv_obj_t *battery_terminal = lv_obj_create(panel);
+    lv_obj_remove_style_all(battery_terminal);
+    lv_obj_set_pos(battery_terminal, 257, 20);
+    lv_obj_set_size(battery_terminal, 3, 6);
+    lv_obj_set_style_radius(battery_terminal, 1, 0);
+    lv_obj_set_style_bg_color(battery_terminal, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(battery_terminal, LV_OPA_COVER, 0);
+    s_battery_label = create_label(panel, &lv_font_montserrat_16, 261, 12, 41, 26);
+    lv_label_set_long_mode(s_battery_label, LV_LABEL_LONG_CLIP);
     s_time_label = create_label(panel, &lv_font_montserrat_48, 12, 91, 280, 68);
 
     update_home_screen(NULL);
@@ -585,7 +645,7 @@ void display_driver_start(void)
     create_binding_screen();
     lvgl_port_unlock();
 
-    ESP_LOGI(TAG, "动态时间与天气首页已显示（横屏 320x240，镜像已修正，无电量）");
+    ESP_LOGI(TAG, "动态时间与天气首页已显示（日期/天气/电量顶部单行）");
 #endif
 }
 

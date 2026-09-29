@@ -1622,6 +1622,9 @@ static esp_err_t video_encoder_create(esp_h264_enc_handle_t *encoder)
     mem_fragment_dump_once();
     mem_contig_log("H264_REF_ALLOC_BEFORE");
     mem_contig_log("H264_OPEN_BEFORE");
+    if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) < 92224U) {
+        mem_fragment_dump_retry_neighbors();
+    }
 
     /* 直接创建实际编码器，不再申请占位 Guard。 */
     esp_h264_err_t err = esp_h264_enc_hw_new(&config, encoder);
@@ -2244,7 +2247,6 @@ static void video_codec_task(void *arg)
             /* 停流且参考内存回收后才导出，每轮只打印一块，保留任务调度点。 */
             if (video_streamer_get_state() == VIDEO_STATE_IDLE) {
                 jpeg_failure_probe_export_step();
-                webrtc_whip_export_h264_probe_step();
             }
             continue;
         }

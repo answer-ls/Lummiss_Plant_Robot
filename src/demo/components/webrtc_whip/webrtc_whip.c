@@ -1,6 +1,5 @@
 #include "mem_contig.h"
 #include "webrtc_whip.h"
-#include "h264_send_probe.h"
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -123,6 +122,7 @@ static esp_err_t (*s_video_start)(void);
 static esp_err_t (*s_video_stop)(void);
 static void (*s_force_idr)(void);
 static esp_err_t (*s_camera_start)(void);
+static esp_err_t (*s_camera_stop)(void);
 static bool (*s_camera_is_ready)(void);
 static esp_err_t (*s_resource_prepare)(uint32_t timeout_ms);
 static esp_err_t (*s_audio_control)(bool suspend);
@@ -553,9 +553,11 @@ void webrtc_whip_set_video_control(esp_err_t (*start)(void),
 }
 
 void webrtc_whip_set_camera_control(esp_err_t (*start)(void),
+                                    esp_err_t (*stop)(void),
                                     bool (*is_ready)(void))
 {
     s_camera_start = start;
+    s_camera_stop = stop;
     s_camera_is_ready = is_ready;
 }
 
@@ -1040,10 +1042,20 @@ static void stop_session(void)
     whip_delete();
     xSemaphoreTake(s_guard, portMAX_DELAY);
     if (s_peer != NULL) {
-        esp_peer_close(s_peer);
+        ESP_LOGI(TAG, "RTC_STOP peer_close begin stack_high_water=%u",
+                 (unsigned)uxTaskGetStackHighWaterMark(NULL));
+        const int close_result = esp_peer_close(s_peer);
         s_peer = NULL;
+        ESP_LOGI(TAG, "RTC_STOP peer_close end result=%d", close_result);
     }
     xSemaphoreGive(s_guard);
+    if (s_camera_stop != NULL) {
+        const esp_err_t camera_err = s_camera_stop();
+        if (camera_err != ESP_OK) {
+            ESP_LOGW(TAG, "停止 RTC 摄像头/UVC stream 失败：%s",
+                     esp_err_to_name(camera_err));
+        }
+    }
     heap_caps_free(s_offer);
     s_offer = NULL;
     s_offer_len = 0;
@@ -1510,7 +1522,8 @@ void webrtc_whip_notify_camera_unready(void)
         ESP_LOGW(TAG, "RTC 前置条件 CAMERA_READY 已撤销：等待 UVC 新流首帧");
         /* 正在建链或推流的旧会话已无可用视频源；只向控制队列投递停止，
          * 不在 UVC 回调中同步销毁 PeerConnection。新流就绪后可重新 start。 */
-        if (s_task != NULL || s_state != WEBRTC_WHIP_IDLE) {
+        if (s_state != WEBRTC_WHIP_STOPPING &&
+            (s_task != NULL || s_state != WEBRTC_WHIP_IDLE)) {
             const esp_err_t err = webrtc_whip_request_stop(NULL);
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "UVC 失效后投递 RTC 停止失败：%s",
@@ -1566,7 +1579,9 @@ esp_err_t webrtc_whip_request_start(const webrtc_whip_credential_t *credential)
 esp_err_t webrtc_whip_request_stop(const char *session_id)
 {
     if (s_commands == NULL) return ESP_ERR_INVALID_STATE;
-    if (s_state == WEBRTC_WHIP_IDLE && s_task == NULL) return ESP_OK;
+    /* 停止正在执行时，重复的服务端命令不再占用仅有的控制队列。 */
+    if (s_state == WEBRTC_WHIP_STOPPING ||
+        (s_state == WEBRTC_WHIP_IDLE && s_task == NULL)) return ESP_OK;
     control_command_t command = { .type = COMMAND_STOP };
     if (session_id) snprintf(command.session_id, sizeof(command.session_id), "%s", session_id);
     return xQueueSend(s_commands, &command, 0) == pdTRUE ? ESP_OK : ESP_ERR_TIMEOUT;
@@ -1585,10 +1600,7 @@ esp_err_t webrtc_whip_send_h264(const uint8_t *annex_b, size_t length,
             .data = (uint8_t *)annex_b,
             .size = (int)length,
         };
-        /* 此处已完成SPS处理，保存真正传给esp_peer的完整访问单元。 */
-        h264_send_probe_before(annex_b, length, pts_ms, idr);
         const int peer_result = esp_peer_send_video(s_peer, &frame);
-        h264_send_probe_after(peer_result);
         err = peer_result == ESP_PEER_ERR_NONE ? ESP_OK : ESP_FAIL;
     }
     xSemaphoreGive(s_guard);
@@ -1600,11 +1612,4 @@ esp_err_t webrtc_whip_send_h264(const uint8_t *annex_b, size_t length,
         __atomic_add_fetch(&s_send_fail, 1U, __ATOMIC_RELAXED);
     }
     return err;
-}
-
-void webrtc_whip_export_h264_probe_step(void)
-{
-    if (!s_guard || xSemaphoreTake(s_guard, 0) != pdTRUE) return;
-    if (s_state == WEBRTC_WHIP_IDLE) h264_send_probe_export_step();
-    xSemaphoreGive(s_guard);
 }

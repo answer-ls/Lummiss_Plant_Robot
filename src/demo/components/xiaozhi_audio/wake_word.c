@@ -350,7 +350,7 @@ static void detection_task(void *arg)
 
 esp_err_t wake_word_init(int channels)
 {
-    if (channels != 1 && channels != 3) {
+    if (channels != 1 && channels != 2 && channels != 3) {
         return ESP_ERR_INVALID_ARG;
     }
     if (s_ww.afe_data != NULL) {
@@ -396,8 +396,8 @@ esp_err_t wake_word_init(int channels)
         return ESP_ERR_NOT_SUPPORTED;
     }
 
-    /* 三通道必须是两只麦克风加参考，不能误配成三只麦克风 MMM。 */
-    const char *input_format = channels == 3 ? "MMR" : "M";
+    /* 双通道为单麦加播放参考 MR；三通道为双麦加播放参考 MMR。 */
+    const char *input_format = channels == 3 ? "MMR" : (channels == 2 ? "MR" : "M");
 
     afe_config_t *afe_config = afe_config_init(
         input_format, s_ww.models, AFE_TYPE_SR, AFE_MODE_HIGH_PERF);
@@ -407,7 +407,7 @@ esp_err_t wake_word_init(int channels)
         return ESP_FAIL;
     }
 
-    afe_config->aec_init = channels == 3;
+    afe_config->aec_init = channels > 1;
     afe_config->wakenet_init = true;
     afe_config->wakenet_model_name = s_ww.wakenet_model_name;
     afe_config->fixed_first_channel = false;
@@ -446,7 +446,7 @@ esp_err_t wake_word_init(int channels)
         return ESP_ERR_INVALID_STATE;
     }
     s_ww.afe_iface->print_pipeline(s_ww.afe_data);
-    ESP_LOGI(TAG, "AFE_ROUTE input=%s 16000Hz output=mono AEC=%d", input_format, channels == 3);
+    ESP_LOGI(TAG, "AFE_ROUTE input=%s 16000Hz output=mono AEC=%d", input_format, channels > 1);
     ESP_LOGI(TAG, "AFE_CHUNK feed_samples_per_channel=%d channels=%d feed_i16=%u feed_bytes=%u fetch_samples=%u expected_feed_calls_5s=%.2f",
              feed_samples_per_channel, channels, (unsigned)s_ww.feed_chunk_size,
              (unsigned)(s_ww.feed_chunk_size * sizeof(int16_t)),

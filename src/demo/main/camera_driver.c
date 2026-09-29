@@ -27,6 +27,9 @@ static const char *TAG = "CAMERA";
 #define CAMERA_DISCONNECTED BIT0
 #define CAMERA_ERROR        BIT1
 #define CAMERA_FORMATS_READY BIT2
+#define CAMERA_STOP_REQUEST BIT6
+#define CAMERA_STOPPED BIT7
+#define CAMERA_START_REQUEST BIT8
 #define MAX_CAMERA_FORMATS  32
 #define CAMERA_STALL_LIMIT  1
 #define CAMERA_SAME_FORMAT_RETRY_LIMIT 1
@@ -162,6 +165,38 @@ bool camera_driver_wait_ready(uint32_t timeout_ms)
         s_camera_ready_events, CAMERA_READY_BIT, pdFALSE, pdTRUE,
         timeout_ms == UINT32_MAX ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms));
     return (bits & CAMERA_READY_BIT) != 0;
+}
+
+esp_err_t camera_driver_request_stop(uint32_t timeout_ms)
+{
+    if (s_camera_events == NULL) return ESP_ERR_INVALID_STATE;
+    const EventBits_t current = xEventGroupGetBits(s_camera_events);
+    if (current & CAMERA_STOPPED) return ESP_OK;
+    if (!(current & CAMERA_STOP_REQUEST)) {
+        xEventGroupSetBits(s_camera_events, CAMERA_STOP_REQUEST);
+    }
+    const EventBits_t bits = xEventGroupWaitBits(
+        s_camera_events, CAMERA_STOPPED, pdFALSE, pdTRUE,
+        pdMS_TO_TICKS(timeout_ms));
+    return (bits & CAMERA_STOPPED) ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+esp_err_t camera_driver_request_start(void)
+{
+    if (s_camera_events == NULL) return ESP_ERR_INVALID_STATE;
+    const EventBits_t current = xEventGroupGetBits(s_camera_events);
+    if (!(current & (CAMERA_STOP_REQUEST | CAMERA_STOPPED))) return ESP_OK;
+    xEventGroupSetBits(s_camera_events, CAMERA_START_REQUEST);
+    return ESP_OK;
+}
+
+static void camera_wait_for_start_request(void)
+{
+    xEventGroupSetBits(s_camera_events, CAMERA_STOPPED);
+    xEventGroupWaitBits(s_camera_events, CAMERA_START_REQUEST,
+                        pdFALSE, pdTRUE, portMAX_DELAY);
+    xEventGroupClearBits(s_camera_events,
+                         CAMERA_STOP_REQUEST | CAMERA_STOPPED | CAMERA_START_REQUEST);
 }
 
 static void camera_record_frame_callback_time(int64_t started_us)
@@ -1068,6 +1103,10 @@ void camera_driver_run(void)
     unsigned candidate = 0;
     unsigned same_format_retries = 0;
     while (true) {
+        if (xEventGroupGetBits(s_camera_events) & CAMERA_STOP_REQUEST) {
+            camera_wait_for_start_request();
+            continue;
+        }
         ESP_LOGI(TAG, "等待 UVC 摄像头及格式列表");
         EventBits_t ready = xEventGroupWaitBits(s_camera_events, CAMERA_FORMATS_READY,
                                                 pdFALSE, pdTRUE, pdMS_TO_TICKS(3000));
@@ -1273,9 +1312,10 @@ void camera_driver_run(void)
 
             while (first_frame_ok) {
                 EventBits_t bits = xEventGroupWaitBits(
-                    s_camera_events, CAMERA_DISCONNECTED | CAMERA_ERROR,
+                    s_camera_events, CAMERA_DISCONNECTED | CAMERA_ERROR |
+                                    CAMERA_STOP_REQUEST,
                     pdFALSE, pdFALSE, pdMS_TO_TICKS(CAMERA_REPORT_INTERVAL_MS));
-                if (bits & (CAMERA_DISCONNECTED | CAMERA_ERROR)) {
+                if (bits & (CAMERA_DISCONNECTED | CAMERA_ERROR | CAMERA_STOP_REQUEST)) {
                     break;
                 }
 
@@ -1463,6 +1503,11 @@ void camera_driver_run(void)
             ESP_LOGE(TAG, "关闭视频流失败：%s；仍有 URB/回调未退出，拒绝释放并停止自动轮换",
                      esp_err_to_name(close_error));
             return;
+        }
+        if (xEventGroupGetBits(s_camera_events) & CAMERA_STOP_REQUEST) {
+            ESP_LOGI(TAG, "RTC 预览已停止，UVC stream 已关闭");
+            camera_wait_for_start_request();
+            continue;
         }
 #if CAMERA_TEST_PROFILE == CAMERA_TEST_UVC_ONLY
         ESP_LOGI(TAG, "固定 %ux%u MJPEG@30 冷启动测试结束；不会在本次运行中切换格式",
