@@ -117,6 +117,7 @@ esp_err_t cloud_mqtt_reopen_session(void)
         ESP_LOGW(TAG, "hello v3 重新发布失败");
         return ESP_FAIL;
     }
+    set_state(CLOUD_STATE_AI_HELLO_SENT);
     ESP_LOGI(TAG, "hello v3 已重新发布，等待新的 Server Hello");
     return ESP_OK;
 }
@@ -310,6 +311,24 @@ static void handle_downlink(const char *json, size_t len)
          * 文档 §6.2 明令禁止在 MQTT 回调里做这些。传原始 json/len，
          * 信封解析由 cloud_mcp 自己做。 */
         cloud_mcp_submit(json, len);
+    } else if (strcmp(type->valuestring, "goodbye") == 0) {
+        const cJSON *session_id = cJSON_GetObjectItem(root, "session_id");
+        const char *received_id = cJSON_IsString(session_id) ? session_id->valuestring : NULL;
+        if (!cloud_mqtt_is_session_ready() ||
+            (received_id != NULL && strcmp(received_id, s_session.session_id) != 0)) {
+            ESP_LOGI(TAG, "忽略旧会话 goodbye，当前 AI 会话未改变");
+        } else {
+            ESP_LOGI(TAG, "服务端结束 AI bridge：session_id=%s，MQTT 保持连接",
+                     s_session.session_id);
+            /* 先通知语音任务退出旧会话，再清除旧 UDP 凭据并在原 MQTT 连接上重发 Hello。 */
+            if (s_text_cb != NULL) {
+                s_text_cb(json, len, s_text_cb_ctx);
+            }
+            set_state(CLOUD_STATE_MQTT_SUBSCRIBED);
+            if (cloud_mqtt_reopen_session() != ESP_OK) {
+                ESP_LOGW(TAG, "AI bridge 重建未发出，等待下次唤醒重试");
+            }
+        }
     } else if (s_text_cb != NULL) {
         /* stt / tts / llm / listen / system …：语音业务状态机在
          * xiaozhi_audio（与旧协议的 server_text_callback 同一个函数）。

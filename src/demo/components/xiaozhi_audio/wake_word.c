@@ -399,8 +399,10 @@ esp_err_t wake_word_init(int channels)
     /* 双通道为单麦加播放参考 MR；三通道为双麦加播放参考 MMR。 */
     const char *input_format = channels == 3 ? "MMR" : (channels == 2 ? "MR" : "M");
 
+    /* 当前 PCB 双麦使用参考工程的 FD/LOW_COST；单麦测试保留 SR/HIGH_PERF。 */
     afe_config_t *afe_config = afe_config_init(
-        input_format, s_ww.models, AFE_TYPE_SR, AFE_MODE_HIGH_PERF);
+        input_format, s_ww.models, channels == 3 ? AFE_TYPE_FD : AFE_TYPE_SR,
+        channels == 3 ? AFE_MODE_LOW_COST : AFE_MODE_HIGH_PERF);
     if (afe_config == NULL) {
         ESP_LOGE(TAG, "创建 AFE 配置失败");
         wake_word_deinit();
@@ -408,6 +410,18 @@ esp_err_t wake_word_init(int channels)
     }
 
     afe_config->aec_init = channels > 1;
+    if (channels == 3) {
+        /* 双麦参考方案：AEC、VAD、WakeNet 开启，NS/AGC 关闭。 */
+        afe_config->ns_init = false;
+        afe_config->vad_init = true;
+        afe_config->vad_mode = VAD_MODE_0;
+        afe_config->vad_min_noise_ms = 100;
+        char *vad_model = esp_srmodel_filter(s_ww.models, ESP_VADN_PREFIX, NULL);
+        if (vad_model != NULL) {
+            afe_config->vad_model_name = vad_model;
+        }
+        afe_config->agc_init = false;
+    }
     afe_config->wakenet_init = true;
     afe_config->wakenet_model_name = s_ww.wakenet_model_name;
     afe_config->fixed_first_channel = false;
@@ -446,6 +460,9 @@ esp_err_t wake_word_init(int channels)
         return ESP_ERR_INVALID_STATE;
     }
     s_ww.afe_iface->print_pipeline(s_ww.afe_data);
+    if (channels == 3) {
+        ESP_LOGI(TAG, "AFE_PROFILE input=MMR type=FD mode=LOW_COST AEC=1 VAD=1 WakeNet=1 NS=0 AGC=0");
+    }
     ESP_LOGI(TAG, "AFE_ROUTE input=%s 16000Hz output=mono AEC=%d", input_format, channels > 1);
     ESP_LOGI(TAG, "AFE_CHUNK feed_samples_per_channel=%d channels=%d feed_i16=%u feed_bytes=%u fetch_samples=%u expected_feed_calls_5s=%.2f",
              feed_samples_per_channel, channels, (unsigned)s_ww.feed_chunk_size,

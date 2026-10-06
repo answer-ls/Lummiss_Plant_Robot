@@ -67,10 +67,13 @@ extern void expression_manager_post_emotion(const char *emotion) __attribute__((
 #define XIAOZHI_CAPTURE_SAMPLES_16K   160U
 #define XIAOZHI_CAPTURE_INPUT_SAMPLES \
     (XIAOZHI_CAPTURE_SAMPLES_16K * XIAOZHI_CODEC_SAMPLE_RATE / XIAOZHI_UPLINK_SAMPLE_RATE)
+#define XIAOZHI_SINGLE_MIC_TEST 0
+/* 双麦对齐独立参考工程的三路 24dB；单麦对照保留原有 30dB 设置。 */
+#if BOARD_AUDIO_HAS_ES7210 && !XIAOZHI_SINGLE_MIC_TEST
+#define XIAOZHI_CODEC_INPUT_GAIN_DB   24.0f
+#else
 #define XIAOZHI_CODEC_INPUT_GAIN_DB   30.0f
-/* 单麦对照使用实测清晰的 MIC2（SLOT2）和播放参考（SLOT1）；保留四槽采集和原有增益。
- * 改回 0 即恢复双麦 MMR。 */
-#define XIAOZHI_SINGLE_MIC_TEST 1
+#endif
 /* 保留四槽物理帧；单麦测试向 AFE 输入 MIC2 和播放参考。 */
 #if BOARD_AUDIO_HAS_ES7210
 #define XIAOZHI_CAPTURE_CHANNELS 4U
@@ -1368,15 +1371,15 @@ static esp_err_t audio_hw_init(void)
                           XIAOZHI_CODEC_INPUT_GAIN_DB) == ESP_CODEC_DEV_OK,
                       ESP_FAIL, fail, TAG, "设置麦克风增益失败");
 #if BOARD_AUDIO_HAS_ES7210
-    /* 增益掩码使用物理 MIC 编号：只降低 MIC3 参考，MIC1/MIC2 保持 30dB。 */
+    /* 单麦对照保留原参考增益；双麦参考方案让 MIC1/MIC2/REF 均为 24dB。 */
+#if XIAOZHI_SINGLE_MIC_TEST
     ESP_GOTO_ON_FALSE(esp_codec_dev_set_in_channel_gain(
                           audio_input_device(), ESP_CODEC_DEV_MAKE_CHANNEL_MASK(2),
                           0.0f) == ESP_CODEC_DEV_OK,
                       ESP_FAIL, fail, TAG, "设置 AEC 参考增益失败");
-#if XIAOZHI_SINGLE_MIC_TEST
     ESP_LOGW(TAG, "MIC_ROUTE SINGLE_MIC_TEST=1 MIC2=SLOT2 REF=SLOT1 -> AFE=MR; gain=30dB; MIC1 excluded from AFE");
 #else
-    ESP_LOGI(TAG, "MIC_ROUTE slots=MIC1,REF,MIC2,unused -> AFE=MMR; gain=30/30/0dB; uplink=AFE mono");
+    ESP_LOGI(TAG, "MIC_ROUTE slots=MIC1,REF,MIC2,unused -> AFE=MMR; gain=24/24/24dB; uplink=AFE mono");
 #endif
 #endif
     ESP_GOTO_ON_FALSE(esp_codec_dev_set_out_vol(

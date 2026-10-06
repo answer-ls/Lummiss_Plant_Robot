@@ -197,3 +197,8 @@ CONFIG_FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER=y
 
 # 首页日期、天气和电量统一使用 16px 顶栏文字。
 CONFIG_LV_FONT_MONTSERRAT_16=y
+# 天气专用中文字体使用压缩字形；关闭此项时 LVGL 无法绘制“获取中”等文字。
+CONFIG_LV_USE_FONT_COMPRESSED=y
+
+# RTC 链路诊断：每 5 秒统计 ESP-Hosted STA 上行成功数与两类丢弃数。
+CONFIG_ESP_HOSTED_PKT_STATS=y

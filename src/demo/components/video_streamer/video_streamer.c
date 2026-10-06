@@ -33,10 +33,10 @@
 #include "webrtc_whip.h"
 
 static const char *TAG = "VIDEO_STREAM";
-/* 两条 DMA2D YUV422→YUV420 路径均未通过实机核对。调试期间固定
- * 使用一次 JPEG YUV422 解码 + 已验证的 CPU 重排，避免首帧重复转换。 */
+/* 独立 DMA2D 转换保持关闭；本轮只比较 JPEG 解码器内置 RX CSC。 */
 #define VIDEO_PRIVATE_DMA2D_CSC_ENABLED 0
-#define VIDEO_OFFICIAL_JPEG_YUV420_ENABLED 0
+/* A=0：JPEG YUV422 + CPU；B=1：JPEG 直出 YUV420。失败仍回退 A。 */
+#define VIDEO_JPEG_DMA2D_AB_PATH_B 1
 /* 视频控制层专用 TAG：启停状态迁移打在这里，便于和服务端命令逐条对账。 */
 static const char *TAG_CTRL = "VIDEO_CTRL";
 /* 初始化完成后发布，允许 RTC 在 UVC 启动前等待编解码任务就绪。 */
@@ -323,6 +323,8 @@ typedef struct {
     uint32_t jpeg_decoded;
     uint32_t yuv_converted;
     uint32_t encoded;
+    uint32_t ab_direct_encoded; /* JPEG/DMA2D 直出后成功编码的帧数 */
+    uint32_t ab_cpu_encoded;    /* CPU 转换后成功编码的帧数 */
     uint32_t sent;
     uint32_t send_failed;
     uint64_t encoded_bytes;
@@ -1417,6 +1419,8 @@ static void video_stream_report(int64_t now_us)
 
     const double seconds = (now_us - last_report_us) / 1000000.0;
     const uint32_t encoded_delta = current.encoded - previous.encoded;
+    const uint32_t ab_direct_delta = current.ab_direct_encoded - previous.ab_direct_encoded;
+    const uint32_t ab_cpu_delta = current.ab_cpu_encoded - previous.ab_cpu_encoded;
     const uint32_t decoded_delta = current.jpeg_decoded - previous.jpeg_decoded;
     const uint32_t yuv_delta = current.yuv_converted - previous.yuv_converted;
     /* JPEG/YUV 各自使用独立样本数计算平均耗时，完整基线和隔离档位都可直接对照。 */
@@ -1483,6 +1487,12 @@ static void video_stream_report(int64_t now_us)
                             (current.p_encoded - previous.p_encoded)) : 0U,
              (unsigned)VIDEO_QP_MAX);
 #endif
+    if (ab_direct_delta != 0 || ab_cpu_delta != 0) {
+        ESP_LOGI("JPEG_AB", "5s selected=%c encoded_direct=%" PRIu32
+                 " encoded_cpu=%" PRIu32,
+                 VIDEO_JPEG_DMA2D_AB_PATH_B ? 'B' : 'A',
+                 ab_direct_delta, ab_cpu_delta);
+    }
     ESP_LOGI(TAG,
              "[VIDEO] avg/max ms input_wait=%.2f validate=%.2f JPEG_DEC=%.2f/%.2f "
              "YUV_CONV=%.2f/%.2f H264_ENC=%.2f max_H264=%.2f output_wait=%.2f "
@@ -2021,8 +2031,11 @@ static void video_codec_task(void *arg)
     int64_t pts_origin_us = -1;
     /* 编码器参数句柄：重新开启视频后用它请求 IDR，见 s_force_idr 的说明。 */
     esp_h264_enc_param_hw_handle_t encoder_param = NULL;
-    /* 0=尚未核对，1=官方直出已验证，-1=本次运行回退 CPU。 */
-    int official_yuv420_state = VIDEO_OFFICIAL_JPEG_YUV420_ENABLED ? 0 : -1;
+    /* B 首次直接试用官方 RX CSC；首次失败后本次启动退回 A。 */
+    int official_yuv420_state = VIDEO_JPEG_DMA2D_AB_PATH_B ? 1 : -1;
+    bool ab_layout_logged = false;
+    unsigned ab_frame_logs = 0;
+    bool ab_decode_error_logged = false;
 #else
     uint8_t *h264_input = NULL;
     esp_h264_enc_handle_t encoder = NULL;
@@ -2178,6 +2191,10 @@ static void video_codec_task(void *arg)
 #endif
 
     __atomic_store_n(&s_codec_ready, true, __ATOMIC_RELEASE);
+    ESP_LOGI("JPEG_AB", "PATH=%c output=%s fallback=CPU expected_size=%u",
+             VIDEO_JPEG_DMA2D_AB_PATH_B ? 'B' : 'A',
+             VIDEO_JPEG_DMA2D_AB_PATH_B ? "JPEG_DMA2D_YUV420" : "JPEG_YUV422_CPU",
+             (unsigned)VIDEO_H264_INPUT_SIZE);
     unsigned slot_index;
     while (true) {
         const int64_t integrity_now = esp_timer_get_time();
@@ -2363,7 +2380,9 @@ static void video_codec_task(void *arg)
 #else
                 ESP_LOGI(TAG, "JPEG 采样格式：%s",
                          jpeg_sampling == JPEG_DOWN_SAMPLING_YUV420 ? "YUV420 原生直通" :
-                         "YUV422，固定使用 CPU 转换为 YUV420");
+                          VIDEO_JPEG_DMA2D_AB_PATH_B ?
+                          "YUV422，B 路径尝试 JPEG RX DMA2D 直出 YUV420" :
+                          "YUV422，A 路径使用 CPU 转换为 YUV420");
 #endif
             }
         }
@@ -2371,8 +2390,6 @@ static void video_codec_task(void *arg)
                                    jpeg_sampling == JPEG_DOWN_SAMPLING_YUV420;
         bool direct_yuv420 = native_yuv420;
 #if !VIDEO_STREAM_JPEG_ONLY_TEST
-        bool probe_cpu_ready = false;
-        uint32_t probe_cpu_us = 0;
         const bool try_official_direct = !native_yuv420 && jpeg_sampling_known &&
                                          official_yuv420_state == 1;
         direct_yuv420 = native_yuv420 || try_official_direct;
@@ -2392,6 +2409,8 @@ static void video_codec_task(void *arg)
             jpeg_decoder, &decode_cfg,
             (uint8_t *)jpeg_data, (uint32_t)jpeg_size,
             jpeg_yuv, (uint32_t)jpeg_yuv_size, &decoded_size, sequence);
+        const esp_err_t primary_decode_error = decode_error;
+        const uint32_t primary_decoded_size = decoded_size;
 #if !VIDEO_STREAM_JPEG_ONLY_TEST
         if (try_official_direct &&
             (decode_error != ESP_OK || decoded_size != VIDEO_H264_INPUT_SIZE)) {
@@ -2408,35 +2427,6 @@ static void video_codec_task(void *arg)
                 (uint8_t *)jpeg_data, (uint32_t)jpeg_size,
                 jpeg_yuv, (uint32_t)jpeg_yuv_size, &decoded_size, sequence);
         }
-        if (!direct_yuv420 && official_yuv420_state == 0 &&
-            jpeg_sampling_known && decode_error == ESP_OK &&
-            decoded_size == VIDEO_YUV422_SIZE) {
-            /* 先生成可信的 CPU 输出，再让官方解码器覆盖 JPEG 输出缓冲。
-             * 比较失败时仍可直接编码 CPU 缓冲，不会发送未经验证的帧。 */
-            const int64_t cpu_started_us = esp_timer_get_time();
-            yuv422_to_h264_yuv420(jpeg_yuv, h264_input);
-            probe_cpu_us = (uint32_t)(esp_timer_get_time() - cpu_started_us);
-            probe_cpu_ready = true;
-            jpeg_decode_cfg_t direct_cfg = decode_cfg;
-            direct_cfg.output_format = JPEG_DECODE_OUT_FORMAT_YUV420;
-            uint32_t direct_size = 0;
-            const esp_err_t direct_err = jpeg_failure_probe_process(
-                jpeg_decoder, &direct_cfg,
-                (uint8_t *)jpeg_data, (uint32_t)jpeg_size,
-                jpeg_yuv, (uint32_t)jpeg_yuv_size, &direct_size, sequence);
-            size_t mismatch = VIDEO_H264_INPUT_SIZE;
-            if (direct_err == ESP_OK && direct_size == VIDEO_H264_INPUT_SIZE) {
-                mismatch = 0;
-                for (size_t i = 0; i < VIDEO_H264_INPUT_SIZE; ++i) {
-                    mismatch += jpeg_yuv[i] != h264_input[i];
-                }
-            }
-            official_yuv420_state = mismatch == 0 ? 1 : -1;
-            ESP_LOGI(TAG, "官方 JPEG DMA2D YUV422→YUV420 核对：ret=%s size=%" PRIu32
-                          " mismatch=%u result=%s",
-                     esp_err_to_name(direct_err), direct_size, (unsigned)mismatch,
-                     official_yuv420_state == 1 ? "PASS" : "CPU_FALLBACK");
-        }
 #endif
         const int64_t decode_elapsed_us = esp_timer_get_time() - decode_started_us;
 
@@ -2448,12 +2438,39 @@ static void video_codec_task(void *arg)
         }
 
         if (decode_error != ESP_OK || decoded_size != expected_decode_size) {
+            if (!ab_decode_error_logged) {
+                ESP_LOGW("JPEG_AB", "first_decode_error seq=%" PRIu32 " path=%c jpeg_ret=%s"
+                         " out_size=%" PRIu32 " expected_size=%u fallback=%d"
+                         " final_ret=%s final_size=%" PRIu32,
+                         sequence, VIDEO_JPEG_DMA2D_AB_PATH_B ? 'B' : 'A',
+                         esp_err_to_name(primary_decode_error), primary_decoded_size,
+                         (unsigned)VIDEO_H264_INPUT_SIZE, try_official_direct,
+                         esp_err_to_name(decode_error), decoded_size);
+                ab_decode_error_logged = true;
+            }
             ++hw_failed;
             if (integrity_result.kind == JPEG_CHECK_PADDING) ++padding_hw_failed;
             prefer_latest = true;
             video_stream_log_error_limited("JPEG 解码失败", decode_error);
             continue;
         }
+
+#if !VIDEO_STREAM_JPEG_ONLY_TEST
+        if (direct_yuv420 && !ab_layout_logged) {
+            const uint8_t *even = jpeg_yuv;
+            const uint8_t *odd = jpeg_yuv + VIDEO_WIDTH * 3 / 2;
+            ESP_LOGI("JPEG_AB", "LAYOUT seq=%" PRIu32 " stride=%u even[0..11]="
+                     "%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+                     sequence, (unsigned)(VIDEO_WIDTH * 3 / 2),
+                     even[0], even[1], even[2], even[3], even[4], even[5],
+                     even[6], even[7], even[8], even[9], even[10], even[11]);
+            ESP_LOGI("JPEG_AB", "LAYOUT seq=%" PRIu32 " odd[0..11]="
+                     "%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+                     sequence, odd[0], odd[1], odd[2], odd[3], odd[4], odd[5],
+                     odd[6], odd[7], odd[8], odd[9], odd[10], odd[11]);
+            ab_layout_logged = true;
+        }
+#endif
 
         portENTER_CRITICAL(&s_lock);
         s_stats.jpeg_decoded++;
@@ -2484,13 +2501,12 @@ static void video_codec_task(void *arg)
         video_out_slot_t *out_slot = &s_out_slots[out_index];
 #endif
 
-        /* 原生或经核对的官方 YUV420 输出直接送 H.264；首次核对帧仍使用
-         * 预先生成的 CPU 输出。官方直出不可用时保留原有 CPU 回退。 */
+        /* B 直出与原生 YUV420 直接送 H.264；失败后保留原 CPU 路径。 */
         const int64_t repack_started_us = esp_timer_get_time();
         s_yuv_busy = !direct_yuv420;
         uint8_t *h264_frame = direct_yuv420 ? jpeg_yuv : h264_input;
         uint32_t h264_frame_len = VIDEO_H264_INPUT_SIZE;
-        if (!direct_yuv420 && !probe_cpu_ready) {
+        if (!direct_yuv420) {
             esp_err_t dma2d_ret = ESP_ERR_NOT_SUPPORTED;
             if (dma2d_yuv_ready) {
                 dma2d_ret = dma2d_yuv422_to_h264_yuv420(
@@ -2512,9 +2528,8 @@ static void video_codec_task(void *arg)
                 yuv422_to_h264_yuv420(jpeg_yuv, h264_input);
             }
         }
-        const int64_t repack_elapsed_us = probe_cpu_us +
-            (!direct_yuv420 && !probe_cpu_ready ?
-             esp_timer_get_time() - repack_started_us : 0);
+        const int64_t repack_elapsed_us = direct_yuv420 ? 0 :
+                                          esp_timer_get_time() - repack_started_us;
         s_yuv_busy = false;
 
 #if !VIDEO_STREAM_YUV_ONLY_TEST
@@ -2577,6 +2592,25 @@ static void video_codec_task(void *arg)
             esp_h264_enc_process(encoder, &input_frame, &output_frame);
         const int64_t encode_elapsed_us = esp_timer_get_time() - encode_started_us;
 
+        /* 逐帧日志只保留前三帧，稳态性能由五秒窗口统计，避免串口扰动编解码。 */
+        if (ab_frame_logs < 3) {
+            ESP_LOGI("JPEG_AB", "FRAME seq=%" PRIu32 " selected=%c actual=%s primary_jpeg_ret=%s"
+                 " primary_out_size=%" PRIu32 " jpeg_ret=%s out_size=%" PRIu32
+                 " expected_size=%" PRIu32 " h264_input_size=%u h264_ret=%d h264_size=%" PRIu32
+                 " jpeg_us=%" PRId64 " cpu_us=%" PRId64 " h264_us=%" PRId64
+                 " stage_total_us=%" PRId64 " codec_total_us=%" PRId64,
+                 sequence, VIDEO_JPEG_DMA2D_AB_PATH_B ? 'B' : 'A',
+                 direct_yuv420 ? "DMA2D_YUV420" : "CPU_FALLBACK_OR_A",
+                 esp_err_to_name(primary_decode_error), primary_decoded_size,
+                 esp_err_to_name(decode_error), decoded_size,
+                 expected_decode_size, (unsigned)VIDEO_H264_INPUT_SIZE, (int)encode_error,
+                 (uint32_t)output_frame.length, decode_elapsed_us,
+                 repack_elapsed_us, encode_elapsed_us,
+                 decode_elapsed_us + repack_elapsed_us + encode_elapsed_us,
+                     esp_timer_get_time() - codec_started_us);
+            ++ab_frame_logs;
+        }
+
         portENTER_CRITICAL(&s_lock);
         s_stats.h264_encode_us += encode_elapsed_us;
         if ((uint64_t)encode_elapsed_us > s_stats.h264_max_us) {
@@ -2595,6 +2629,11 @@ static void video_codec_task(void *arg)
             out_slot->ready_us = esp_timer_get_time();
             portENTER_CRITICAL(&s_lock);
             s_stats.encoded++;
+            if (direct_yuv420) {
+                s_stats.ab_direct_encoded++;
+            } else {
+                s_stats.ab_cpu_encoded++;
+            }
             s_stats.encoded_bytes += output_frame.length;
             if (output_frame.frame_type == ESP_H264_FRAME_TYPE_IDR) {
                 s_stats.idr_encoded++;
