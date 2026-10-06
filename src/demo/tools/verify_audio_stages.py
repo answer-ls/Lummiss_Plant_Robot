@@ -1,4 +1,4 @@
-"""独立核对WAV头、逐通道重采样结果、MMR拆分以及抽样布局。"""
+"""独立核对WAV头、MMR拆分以及抽样布局。"""
 import json
 from pathlib import Path
 import struct
@@ -33,16 +33,12 @@ def verify(folder):
     if not raw or len(raw) % 12 or len(mmr) != len(raw) // 2:
         raise ValueError('raw/MMR样本数不满足4槽24k→3通道16k比例')
     report = dict(raw_header='4ch/24000Hz/16bit/block_align=8',
-                  mmr_header='3ch/16000Hz/16bit/block_align=6', channels={})
+                  mmr_header='3ch/16000Hz/16bit/block_align=6',
+                  resampler='esp_ae_rate_cvt：离线脚本未复现其内部滤波状态，不作逐样本重采样校验',
+                  channels={})
     names = ['mic1', 'mic2', 'ref']
     for ch, slot in enumerate([0, 2, 1]):
-        # 先独立抽出单通道24k，再按当前C算法独立计算16k，绝不对交织流整体重采样。
-        single = raw[slot::4]
-        expected = []
-        for n in range(0, len(single), 3):
-            value = single[n+1] + single[n+2]
-            average = value // 2 if value >= 0 else -((-value) // 2)
-            expected.extend((single[n], average))
+        # 固件现用 esp_ae_rate_cvt；旧的 3:2 抽取/平均不能充当其预期输出。
         before = read_wav(folder / f'{names[ch]}_16k_before_afe.wav', 1, 16000)
         actual = mmr[ch::3]
         with wave.open(str(folder / f'{names[ch]}_16k_from_mmr.wav'), 'wb') as out:
@@ -50,10 +46,9 @@ def verify(folder):
             out.setsampwidth(2)
             out.setframerate(16000)
             out.writeframes(struct.pack(f'<{len(actual)}h', *actual))
-        mismatch_resample = sum(a != b for a, b in zip(expected, actual)) + abs(len(expected) - len(actual))
         mismatch_split = sum(a != b for a, b in zip(before, actual)) + abs(len(before) - len(actual))
         report['channels'][names[ch]] = dict(source_slot=slot, samples=len(actual),
-                                            resample_mismatch=mismatch_resample, mmr_split_mismatch=mismatch_split)
+                                            mmr_split_mismatch=mismatch_split)
     metadata = json.loads((folder / 'stage_timestamps.json').read_text(encoding='utf-8'))
     sampled = metadata['frame_samples']
     report['layout_samples'] = len(sampled)
@@ -65,7 +60,7 @@ def verify(folder):
     (folder / 'stage_verification.json').write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding='utf-8')
     print(json.dumps(report, indent=2, ensure_ascii=False), flush=True)
     if len(sampled) != 100 or report['layout_mismatch'] or any(
-            x['resample_mismatch'] or x['mmr_split_mismatch'] for x in report['channels'].values()):
+            x['mmr_split_mismatch'] for x in report['channels'].values()):
         raise ValueError('逐级数据不一致，已保存stage_verification.json及所有WAV')
     return report
 

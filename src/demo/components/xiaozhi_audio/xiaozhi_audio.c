@@ -43,6 +43,7 @@
 #endif
 #include "wake_word.h"
 #include "audio_probe.h"
+#include "opus_probe.h"
 #include "lifecycle_probe.h"
 #include "capture_diag.h"
 #include "raw_adc_probe.h"
@@ -107,16 +108,14 @@ static volatile int s_output_volume = XIAOZHI_CODEC_OUTPUT_VOLUME;
  * stack size should about 40k"、"To support all decoders, the task running the
  * decoder should have stack size of about 20K"。那里只统计堆，栈是另外算的。
  *
- * 原来只有一个 5120 的宏给 capture_task 和 playback_task 共用，于是上行门控一打
- * 开、第一次真正执行 esp_opus_enc_process()（SILK 编码 + VAD）就冲爆栈：实机 panic
- * 报 Stack protection fault，任务 "xiaozhi_mic"，现场
- * silk_encode_frame_FIX ← silk_Encode。此前不崩只是因为会话没建立时那段编码根本
- * 没执行过。
+ * 原来由 capture_task 执行 Opus 时，5120 字节栈曾触发保护异常。
+ * 现在 Opus 独立在 encoder_task，先保留采集任务原有栈预算，实机验证后再缩减。
  *
  * 逐次试探的代价（5120 时越界 600 B，12288 时仍越界 1952 B）说明这条路径要 14 KB
  * 以上，所以直接按厂商给的数字定，不再一点点往上加。编码和解码需求差一倍，拆开。
- * 栈落在 PSRAM（创建时带 MALLOC_CAP_SPIRAM），合计约 60 KB，不占内部 RAM。 */
+ * 工作任务栈落在 PSRAM（创建时带 MALLOC_CAP_SPIRAM），不占内部 RAM。 */
 #define XIAOZHI_CAPTURE_STACK_BYTES   40960
+#define XIAOZHI_ENCODER_STACK_BYTES   40960
 #define XIAOZHI_DECODE_STACK_BYTES    20480
 #define XIAOZHI_OUTPUT_STACK_BYTES    6144
 #define XIAOZHI_SERVICE_STACK_BYTES   7168
@@ -130,6 +129,7 @@ static volatile int s_output_volume = XIAOZHI_CODEC_OUTPUT_VOLUME;
  * 每 60 ms 准备好一帧 PCM，但仍低于 USB/UVC 的实时任务。 */
 #define XIAOZHI_CAPTURE_CORE           0
 #define XIAOZHI_CAPTURE_PRIORITY       6
+#define XIAOZHI_ENCODER_PRIORITY       2
 #define XIAOZHI_DECODE_CORE            1
 #define XIAOZHI_DECODE_PRIORITY        9
 #define XIAOZHI_OUTPUT_CORE            0
@@ -177,6 +177,7 @@ typedef struct {
     int encoder_output_size;
     uint8_t *capture_raw;
     uint8_t *capture_pcm;
+    uint8_t *uplink_pcm;
     uint8_t *capture_opus;
     /* 每个 AFE 输入通道各自保留重采样相位，避免交错多通道相互串扰。 */
     esp_ae_rate_cvt_handle_t input_resamplers[XIAOZHI_AFE_CHANNELS];
@@ -201,6 +202,7 @@ static uint8_t s_pcm_ready_queue_storage[
     XIAOZHI_PCM_QUEUE_DEPTH * sizeof(xiaozhi_pcm_frame_t)];
 static TaskHandle_t s_service_task;
 static TaskHandle_t s_capture_task;
+static TaskHandle_t s_encoder_task;
 static TaskHandle_t s_decode_task;
 static TaskHandle_t s_output_task;
 static TaskHandle_t s_wake_process_task;
@@ -211,8 +213,10 @@ static TaskHandle_t s_hardware_test_spk_task;
 static int16_t *s_hardware_test_mic_buffer;
 static int16_t *s_hardware_test_tone_buffer;
 static bool s_wake_word_ready;
-/* 只在 AFE 访问/编码期间持有；RTC 销毁模型前须取得此锁。 */
+/* 只在 AFE 访问期间持有；RTC 销毁模型前须取得此锁。 */
 static SemaphoreHandle_t s_capture_guard;
+/* 预录与实时上行共用 Opus 编码器及输出缓冲。 */
+static SemaphoreHandle_t s_encoder_guard;
 static SemaphoreHandle_t s_rtc_request_guard;
 static bool s_rtc_requested;
 static bool s_rtc_pending;
@@ -354,7 +358,8 @@ static void set_voice_state(voice_state_t next)
         return;
     }
     const bool waking = next == VOICE_STATE_WAKE_IDLE && s_wake_word_ready && !s_rtc_suspended;
-    /* 与 capture 串行：关闭门控后不会再有旧 PCM 被编码/发送。 */
+    /* 先等编码/发送结束，再切换上行门控，避免旧会话音频跨轮发送。 */
+    xSemaphoreTake(s_encoder_guard, portMAX_DELAY);
     xSemaphoreTake(s_capture_guard, portMAX_DELAY);
     xEventGroupClearBits(s_events, XIAOZHI_EVENT_UPLINK_ENABLED | XIAOZHI_EVENT_WAKE_ACTIVE);
     wake_word_enable_voice_processing(listening);
@@ -379,6 +384,7 @@ static void set_voice_state(voice_state_t next)
     s_voice_state_entered_ms = now_ms;
     const EventBits_t bits = xEventGroupGetBits(s_events);
     xSemaphoreGive(s_capture_guard);
+    xSemaphoreGive(s_encoder_guard);
     ESP_LOGI("VOICE_STATE", "%s -> %s wake_enabled=%d voice_processing_enabled=%d mic_uplink=%d vad_state=%s session_ready=%d idle_ms=%u",
              voice_state_name(old), voice_state_name(next),
              (bits & XIAOZHI_EVENT_WAKE_ACTIVE) ? 1 : 0,
@@ -539,8 +545,8 @@ static void resume_listening_after_playback(void)
         ESP_LOGI(TAG, "回答播放完成，listen/start 已本地发布（QoS0 无服务端确认），恢复连续对话监听");
 #if defined(CONFIG_CLOUD_PROTOCOL_V3)
         set_voice_state(VOICE_STATE_CONTINUOUS_LISTENING);
-        /* 每次开机只抓第一轮回答后的音频，诊断失败不影响正常对话。 */
-        /* 本轮只记录生命周期raw，关闭上一轮逐级dump。 */
+        /* 每次开机仅抓首次续听中实际发送成功的 Opus 包。 */
+        opus_probe_start();
 #else
         xEventGroupSetBits(s_events, XIAOZHI_EVENT_UPLINK_ENABLED);
 #endif
@@ -564,9 +570,11 @@ static void restore_uplink_after_playback(void)
 }
 
 /* 与开发板示例一致：唤醒时先发送 AFE 保存的前置音频，再发送 detect/start。
- * 使用当前 Opus 编码器即可；此时实时上行尚未开启，不会与采集任务并发编码。 */
+ * 与实时编码任务共用编码器，由 encoder_guard 保证预录顺序。 */
 static void send_wake_preroll(void)
 {
+    /* 预录和实时上行共用 Opus 编码器，整段预录必须串行发送。 */
+    xSemaphoreTake(s_encoder_guard, portMAX_DELAY);
     voice_trace("PREROLL_SEND_BEGIN", NULL, ESP_OK);
     const size_t available = wake_word_copy_preroll(NULL, 0);
     const size_t frame_samples =
@@ -574,6 +582,7 @@ static void send_wake_preroll(void)
     if (available < frame_samples || frame_samples == 0) {
         voice_trace("PREROLL_SEND_END", NULL, ESP_ERR_INVALID_SIZE);
         ESP_LOGW(TAG, "唤醒前音频不足，跳过前置音频发送");
+        xSemaphoreGive(s_encoder_guard);
         return;
     }
 
@@ -582,6 +591,7 @@ static void send_wake_preroll(void)
     if (pcm == NULL) {
         voice_trace("PREROLL_SEND_END", NULL, ESP_ERR_NO_MEM);
         ESP_LOGW(TAG, "唤醒前音频复制缓冲分配失败，继续建立对话");
+        xSemaphoreGive(s_encoder_guard);
         return;
     }
     const size_t samples = wake_word_copy_preroll(pcm, available);
@@ -642,6 +652,7 @@ static void send_wake_preroll(void)
     ESP_LOGI(TAG, "唤醒前音频已处理：%u 包，约 %u ms",
              (unsigned)sent_packets,
              (unsigned)(sent_packets * XIAOZHI_FRAME_DURATION_MS));
+    xSemaphoreGive(s_encoder_guard);
 }
 
 #if defined(CONFIG_CLOUD_PROTOCOL_V3)
@@ -652,12 +663,14 @@ static void server_text_callback(const char *text, size_t len, void *ctx);
 /* 退回 WAKE_IDLE：停上行、停 UDP 通道（旧会话作废）、重启唤醒词喂音。幂等。 */
 static void enter_wake_idle(void)
 {
+    xSemaphoreTake(s_encoder_guard, portMAX_DELAY);
     xSemaphoreTake(s_capture_guard, portMAX_DELAY);
     xEventGroupClearBits(s_events, XIAOZHI_EVENT_UPLINK_ENABLED |
                                   XIAOZHI_EVENT_SPEAKING | XIAOZHI_EVENT_CHANNEL_ACTIVE);
     wake_word_enable_voice_processing(false);
     xSemaphoreGive(s_capture_guard);
     cloud_udp_stop();
+    xSemaphoreGive(s_encoder_guard);
     s_session_id[0] = '\0';
     s_tts_finished = false;
     s_last_stt_ms = 0;
@@ -1048,6 +1061,10 @@ static void stop_worker_tasks(void)
         vTaskDeleteWithCaps(s_capture_task);
         s_capture_task = NULL;
     }
+    if (s_encoder_task != NULL) {
+        vTaskDeleteWithCaps(s_encoder_task);
+        s_encoder_task = NULL;
+    }
     if (s_decode_task != NULL) {
         vTaskDeleteWithCaps(s_decode_task);
         s_decode_task = NULL;
@@ -1076,9 +1093,11 @@ static void audio_hw_cleanup(void)
     s_audio.resample_output = NULL;
     s_audio.resample_max_output_samples = 0;
     heap_caps_free(s_audio.capture_pcm);
+    heap_caps_free(s_audio.uplink_pcm);
     heap_caps_free(s_audio.capture_raw);
     heap_caps_free(s_audio.capture_opus);
     s_audio.capture_pcm = NULL;
+    s_audio.uplink_pcm = NULL;
     s_audio.capture_raw = NULL;
     s_audio.capture_opus = NULL;
     for (size_t i = 0; i < XIAOZHI_PCM_POOL_SIZE; i++) {
@@ -1490,6 +1509,9 @@ static esp_err_t audio_work_buffers_init(void)
     s_audio.capture_pcm = heap_caps_malloc(
         pcm_bytes,
         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_audio.uplink_pcm = heap_caps_malloc(
+        (size_t)s_audio.encoder_input_size,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s_audio.capture_opus = heap_caps_malloc(
         (size_t)s_audio.encoder_output_size,
         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -1531,6 +1553,7 @@ static esp_err_t audio_work_buffers_init(void)
             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     }
     if (s_audio.capture_raw == NULL || s_audio.capture_pcm == NULL ||
+        s_audio.uplink_pcm == NULL ||
         s_audio.capture_opus == NULL || s_audio.resample_input == NULL ||
         s_audio.resample_output == NULL) {
         ESP_LOGE(TAG, "小智音频工作缓冲分配失败");
@@ -1595,7 +1618,6 @@ static void capture_task(void *arg)
     (void)arg;
     uint8_t *raw = s_audio.capture_raw;
     uint8_t *pcm = s_audio.capture_pcm;
-    uint8_t *opus = s_audio.capture_opus;
     const int raw_size = XIAOZHI_CAPTURE_SAMPLES_16K * sizeof(int16_t) *
                          XIAOZHI_CODEC_SAMPLE_RATE /
                          XIAOZHI_UPLINK_SAMPLE_RATE * XIAOZHI_CAPTURE_CHANNELS;
@@ -1666,11 +1688,11 @@ static void capture_task(void *arg)
         audio_probe_input((const int16_t *)raw, (size_t)raw_size,
                           (const int16_t *)pcm, output_samples);
 
+#if !defined(CONFIG_CLOUD_PROTOCOL_V3)
         EventBits_t bits = xEventGroupGetBits(s_events);
         const bool uplink = (bits & (XIAOZHI_EVENT_CHANNEL_ACTIVE |
                      XIAOZHI_EVENT_UPLINK_ENABLED)) ==
             (XIAOZHI_EVENT_CHANNEL_ACTIVE | XIAOZHI_EVENT_UPLINK_ENABLED);
-#if !defined(CONFIG_CLOUD_PROTOCOL_V3)
         wake_word_set_uplink(uplink);
 #endif
         /* 持续 feed 让 AEC 状态跟随播放参考；只有监听时缓存并上传 AFE 输出。 */
@@ -1678,61 +1700,6 @@ static void capture_task(void *arg)
         wake_word_feed((const int16_t *)pcm,
                        XIAOZHI_CAPTURE_SAMPLES_16K * XIAOZHI_AFE_CHANNELS);
         capture_diag_metric(CD_FEED, esp_timer_get_time() - diag_ts);
-        while (uplink && wake_word_read_pcm((int16_t *)pcm,
-                   (size_t)s_audio.encoder_input_size / sizeof(int16_t)) != 0) {
-            /* 网络回调可能刚切入播报，发送前再次检查，丢弃已取出的旧帧。 */
-            bits = xEventGroupGetBits(s_events);
-            if ((bits & (XIAOZHI_EVENT_CHANNEL_ACTIVE | XIAOZHI_EVENT_UPLINK_ENABLED)) !=
-                (XIAOZHI_EVENT_CHANNEL_ACTIVE | XIAOZHI_EVENT_UPLINK_ENABLED)) {
-                wake_word_set_uplink(false);
-                break;
-            }
-            s_uplink_pcm_frames++;
-            esp_audio_enc_in_frame_t input_frame = {
-                .buffer = pcm,
-                .len = (uint32_t)s_audio.encoder_input_size,
-            };
-            esp_audio_enc_out_frame_t output_frame = {
-                .buffer = opus,
-                .len = (uint32_t)s_audio.encoder_output_size,
-            };
-            audio_probe_uplink((const int16_t *)pcm, (size_t)s_audio.encoder_input_size);
-            diag_ts = esp_timer_get_time();
-            esp_audio_err_t audio_error = esp_opus_enc_process(
-                s_audio.opus_encoder, &input_frame, &output_frame);
-            capture_diag_metric(CD_OPUS, esp_timer_get_time() - diag_ts);
-            if (audio_error == ESP_AUDIO_ERR_OK && output_frame.encoded_bytes > 0) {
-                s_uplink_opus_packets++;
-                /* 传输层分叉：V3 走 UDP（打包 + AES-128-CTR），旧协议走 WS 二进制。
-                 * Opus 编解码本身完全不变。 */
-#if defined(CONFIG_CLOUD_PROTOCOL_V3)
-                /* B窗口仅将实际UDP调用替换成本地计数，其余编码和门控照常。 */
-                bool diag_sink = capture_diag_sink(output_frame.encoded_bytes);
-                esp_err_t send_error = ESP_OK;
-                if (!diag_sink) {
-                    diag_ts = esp_timer_get_time();
-                    send_error = cloud_udp_send_opus(opus, output_frame.encoded_bytes);
-                    capture_diag_metric(CD_UDP, esp_timer_get_time() - diag_ts);
-                    capture_diag_udp_result(send_error, output_frame.encoded_bytes);
-                }
-#else
-                bool diag_sink = false;
-                esp_err_t send_error = video_streamer_agent_send_audio(
-                    opus, output_frame.encoded_bytes);
-#endif
-                if (!diag_sink) voice_trace("LIVE_OPUS_TX", NULL, send_error);
-                if (send_error == ESP_OK) {
-                    s_capture_frames++;
-                    s_capture_bytes += output_frame.encoded_bytes;
-                } else {
-                    s_uplink_drop++;
-                    s_capture_errors++;
-                }
-            } else {
-                s_uplink_drop++;
-                s_capture_errors++;
-            }
-        }
         /* 实时采集只更新数字，不在持锁/供数路径打印串口日志。 */
         s_mic_diag.clipped += clipped_samples;
         s_mic_diag.input_samples += XIAOZHI_CAPTURE_SAMPLES_16K;
@@ -1740,6 +1707,83 @@ static void capture_task(void *arg)
             if (channel_peak[ch] > s_mic_diag.peak[ch]) s_mic_diag.peak[ch] = channel_peak[ch];
         }
         xSemaphoreGive(s_capture_guard);
+    }
+}
+
+/* AFE 自带 PCM 输出缓冲；独立任务消费它，避免 Opus/UDP 阻塞下一次 I2S 读取。 */
+static void encoder_task(void *arg)
+{
+    (void)arg;
+    uint8_t *pcm = s_audio.uplink_pcm;
+    uint8_t *opus = s_audio.capture_opus;
+    const EventBits_t uplink_bits =
+        XIAOZHI_EVENT_CHANNEL_ACTIVE | XIAOZHI_EVENT_UPLINK_ENABLED;
+    for (;;) {
+        if ((xEventGroupGetBits(s_events) & uplink_bits) != uplink_bits) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+        xSemaphoreTake(s_capture_guard, portMAX_DELAY);
+        const size_t samples = (!s_rtc_suspended && s_wake_word_ready) ?
+            wake_word_read_pcm((int16_t *)pcm,
+                (size_t)s_audio.encoder_input_size / sizeof(int16_t)) : 0;
+        xSemaphoreGive(s_capture_guard);
+        if (samples == 0) {
+            vTaskDelay(pdMS_TO_TICKS(2));
+            continue;
+        }
+
+        xSemaphoreTake(s_encoder_guard, portMAX_DELAY);
+        /* 状态可能在取出 PCM 后切换；旧轮音频不能送入新轮会话。 */
+        if ((xEventGroupGetBits(s_events) & uplink_bits) != uplink_bits ||
+            s_rtc_suspended) {
+            xSemaphoreGive(s_encoder_guard);
+            continue;
+        }
+        s_uplink_pcm_frames++;
+        esp_audio_enc_in_frame_t input_frame = {
+            .buffer = pcm,
+            .len = (uint32_t)s_audio.encoder_input_size,
+        };
+        esp_audio_enc_out_frame_t output_frame = {
+            .buffer = opus,
+            .len = (uint32_t)s_audio.encoder_output_size,
+        };
+        audio_probe_uplink((const int16_t *)pcm, (size_t)s_audio.encoder_input_size);
+        int64_t diag_ts = esp_timer_get_time();
+        esp_audio_err_t audio_error = esp_opus_enc_process(
+            s_audio.opus_encoder, &input_frame, &output_frame);
+        capture_diag_metric(CD_OPUS, esp_timer_get_time() - diag_ts);
+        if (audio_error == ESP_AUDIO_ERR_OK && output_frame.encoded_bytes > 0) {
+            s_uplink_opus_packets++;
+#if defined(CONFIG_CLOUD_PROTOCOL_V3)
+            bool diag_sink = capture_diag_sink(output_frame.encoded_bytes);
+            esp_err_t send_error = ESP_OK;
+            if (!diag_sink) {
+                diag_ts = esp_timer_get_time();
+                send_error = cloud_udp_send_opus(opus, output_frame.encoded_bytes);
+                capture_diag_metric(CD_UDP, esp_timer_get_time() - diag_ts);
+                capture_diag_udp_result(send_error, output_frame.encoded_bytes);
+            }
+#else
+            bool diag_sink = false;
+            esp_err_t send_error = video_streamer_agent_send_audio(
+                opus, output_frame.encoded_bytes);
+#endif
+            if (!diag_sink) voice_trace("LIVE_OPUS_TX", NULL, send_error);
+            if (send_error == ESP_OK) {
+                if (!diag_sink) opus_probe_packet(opus, output_frame.encoded_bytes);
+                s_capture_frames++;
+                s_capture_bytes += output_frame.encoded_bytes;
+            } else {
+                s_uplink_drop++;
+                s_capture_errors++;
+            }
+        } else {
+            s_uplink_drop++;
+            s_capture_errors++;
+        }
+        xSemaphoreGive(s_encoder_guard);
     }
 }
 
@@ -2198,8 +2242,9 @@ static void delete_voice_control_resources(void)
     s_voice_events = NULL;
 #endif
     if (s_capture_guard) vSemaphoreDelete(s_capture_guard);
+    if (s_encoder_guard) vSemaphoreDelete(s_encoder_guard);
     if (s_rtc_request_guard) vSemaphoreDelete(s_rtc_request_guard);
-    s_capture_guard = s_rtc_request_guard = NULL;
+    s_capture_guard = s_encoder_guard = s_rtc_request_guard = NULL;
 }
 
 static void abort_audio_service(void)
@@ -2321,6 +2366,12 @@ static void service_task(void *arg)
             XIAOZHI_CAPTURE_PRIORITY, &s_capture_task, XIAOZHI_CAPTURE_CORE,
             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     }
+    if (task_result == pdPASS) {
+        task_result = xTaskCreatePinnedToCoreWithCaps(
+            encoder_task, "xiaozhi_enc", XIAOZHI_ENCODER_STACK_BYTES, NULL,
+            XIAOZHI_ENCODER_PRIORITY, &s_encoder_task, XIAOZHI_CAPTURE_CORE,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
     mem_contig_log("AUDIO_TASKS_AFTER");
     if (task_result != pdPASS) {
         ESP_LOGE(TAG, "创建小智音频工作任务失败");
@@ -2329,9 +2380,10 @@ static void service_task(void *arg)
     }
 
     ESP_LOGI(TAG,
-             "小智音频流水线已就绪：MIC=CPU%d/P%d，DEC=CPU%d/P%d，"
+             "小智音频流水线已就绪：MIC=CPU%d/P%d，ENC=CPU%d/P%d，DEC=CPU%d/P%d，"
              "SPK=CPU%d/P%d，WAKE=CPU%d/P%d，PCM=%u帧",
              XIAOZHI_CAPTURE_CORE, XIAOZHI_CAPTURE_PRIORITY,
+             XIAOZHI_CAPTURE_CORE, XIAOZHI_ENCODER_PRIORITY,
              XIAOZHI_DECODE_CORE, XIAOZHI_DECODE_PRIORITY,
              XIAOZHI_OUTPUT_CORE, XIAOZHI_OUTPUT_PRIORITY,
              XIAOZHI_WAKE_PROCESS_CORE, XIAOZHI_WAKE_PROCESS_PRIORITY,
@@ -2832,15 +2884,17 @@ esp_err_t xiaozhi_audio_start(void)
     }
 
     s_capture_guard = xSemaphoreCreateMutex();
+    s_encoder_guard = xSemaphoreCreateMutex();
     s_rtc_request_guard = xSemaphoreCreateMutex();
 #if defined(CONFIG_CLOUD_PROTOCOL_V3)
     s_voice_events = xQueueCreateWithCaps(12, sizeof(voice_event_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_voice_events || !s_capture_guard || !s_rtc_request_guard) {
+    if (!s_voice_events || !s_capture_guard || !s_encoder_guard || !s_rtc_request_guard) {
         if (s_voice_events) vQueueDeleteWithCaps(s_voice_events);
 #else
-    if (!s_capture_guard || !s_rtc_request_guard) {
+    if (!s_capture_guard || !s_encoder_guard || !s_rtc_request_guard) {
 #endif
         if (s_capture_guard) vSemaphoreDelete(s_capture_guard);
+        if (s_encoder_guard) vSemaphoreDelete(s_encoder_guard);
         if (s_rtc_request_guard) vSemaphoreDelete(s_rtc_request_guard);
         vEventGroupDelete(s_events);
         s_events = NULL;

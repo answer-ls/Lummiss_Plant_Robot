@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "capture_diag.c" "lifecycle_probe.c" "raw_adc_probe.c" "audio_probe.c" "xiaozhi_audio.c" "wake_word.c"
+    SRCS "capture_diag.c" "lifecycle_probe.c" "raw_adc_probe.c" "audio_probe.c" "opus_probe.c" "xiaozhi_audio.c" "wake_word.c"
     INCLUDE_DIRS "."
     REQUIRES
         board
