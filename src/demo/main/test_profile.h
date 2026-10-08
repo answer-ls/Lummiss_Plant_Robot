@@ -1,6 +1,8 @@
 #ifndef LUMMISS_TEST_PROFILE_H
 #define LUMMISS_TEST_PROFILE_H
 
+#include "board_pins.h"
+
 /* 启动组合测试档位 —— 全工程唯一的档位号枚举点。
  *
  * 档位号 0~8 与历史实机测试记录、项目文档一一对应（"档位 6" 等写法到处都在），
@@ -24,7 +26,7 @@
  * 8 = UVC/USB Host + JPEG 解码/YUV 转换，不启动 H.264/WiFi/WebSocket/UI/SD
  * 9 = UI/LCD + 按键/限位/TTP223 + 本地麦克风/扬声器自检，
  *     不启动 UVC/WiFi/WebSocket/SD/小智/天气
- * 10 = SD卡 raw 1000 次写入回读压力测试，可选后续WiFi连接/DHCP测试
+ * 10 = SD卡独立测试；新PCB走官方 SDSPI 只读对照，旧板保留原测试
  * 11 = 仅测试ESP-Hosted/C6 WiFi连接与DHCP，不访问SD卡
  */
 #define CAMERA_TEST_FULL                   0
@@ -39,12 +41,10 @@
 #define CAMERA_TEST_PERIPH_ONLY            9
 #define CAMERA_TEST_SD_ONLY               10
 #define CAMERA_TEST_WIFI_ONLY             11
-#define CAMERA_TEST_STEPPER_ONLY          12  /* 仅电机单次往返自检 */
+#define CAMERA_TEST_STEPPER_ONLY          12  /* 仅电机循环两圈往返自检 */
 #define CAMERA_TEST_AUDIO_RAW             13  /* ES7210 四槽原始采集 */
 
-/* ← 改这一行切换档位。
- * 当前运行完整系统，电机仅由 MCP 指令触发；档位12保留四档速度自检。
- * SD 卡 raw 1000 次压力测试仍保留在档位 10，可随时切回单独复测。 */
+/* ← 改这一行切换档位。当前运行 SD 卡独立测试。 */
 #define CAMERA_TEST_PROFILE                CAMERA_TEST_FULL
 
 /* 完整系统欠压排查：分阶段启动并在各阶段保持一段时间观察。
@@ -133,11 +133,15 @@ static inline const char *test_profile_name(void)
 #if CAMERA_TEST_PROFILE == CAMERA_TEST_AUDIO_RAW
     return "ES7210 原始四槽 BASE/A/B/C 采集";
 #elif CAMERA_TEST_PROFILE == CAMERA_TEST_STEPPER_ONLY
-    return "仅步进电机：四档速度往返测试";
+    return "仅步进电机：正反各两圈，每轮间隔10秒";
 #elif CAMERA_TEST_PROFILE == CAMERA_TEST_WIFI_ONLY
     return "仅WiFi连接/DHCP（不访问SD卡）";
 #elif CAMERA_TEST_PROFILE == CAMERA_TEST_SD_ONLY
+#if BOARD_USE_NEW_PCB
+    return "官方 SDSPI SPI2 三轮只读挂载测试";
+#else
     return SD_TEST_WIFI_ENABLED ? "SD卡raw CMD24 + WiFi连接测试" : "SD卡raw 1000次写读压力测试";
+#endif
 #elif CAMERA_TEST_PROFILE == CAMERA_TEST_FULL
     return "完整系统";
 #elif CAMERA_TEST_PROFILE == CAMERA_TEST_UVC_ONLY

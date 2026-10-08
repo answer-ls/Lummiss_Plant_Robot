@@ -1,0 +1,8 @@
+menu "Reference board"
+config REFERENCE_WIFI_SSID
+    string "Test WiFi SSID (empty: saved STA configuration)"
+    default ""
+config REFERENCE_WIFI_PASSWORD
+    string "Test WiFi password"
+    default ""
+endmenu

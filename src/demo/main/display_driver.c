@@ -26,6 +26,7 @@
 #include "test_profile.h"
 
 LV_FONT_DECLARE(lv_font_lummiss_weather_16);
+LV_FONT_DECLARE(lv_font_lummiss_binding_16);
 
 static const char *TAG = "DISPLAY";
 
@@ -600,11 +601,11 @@ static void create_binding_screen(void)
     lv_obj_set_style_bg_color(panel, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
     lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_t *title = create_label(panel, &lv_font_simsun_16_cjk, 10, 24, 300, 28);
+    lv_obj_t *title = create_label(panel, &lv_font_lummiss_binding_16, 10, 24, 300, 28);
     lv_label_set_text(title, "设备未绑定");
     lv_obj_t *code = create_label(panel, &lv_font_montserrat_48, 10, 77, 300, 64);
     lv_label_set_text(code, s_binding_code[0] ? s_binding_code : "------");
-    lv_obj_t *hint = create_label(panel, &lv_font_simsun_16_cjk, 10, 154, 300, 70);
+    lv_obj_t *hint = create_label(panel, &lv_font_lummiss_binding_16, 10, 154, 300, 70);
     lv_label_set_text(hint, s_binding_code[0] ?
         "请在应用中输入绑定码\n绑定完成后请重启设备" :
         "未获取到有效绑定码\n请检查网络后重启设备");

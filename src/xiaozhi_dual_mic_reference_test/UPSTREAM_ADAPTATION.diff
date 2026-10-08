@@ -1,0 +1,363 @@
+--- upstream/XiaozhiApp.cpp
++++ reference/XiaozhiApp.cpp
+@@ -29,7 +29,6 @@
+ #endif
+ #define ESP_UTILS_LOG_TAG "BS:XiaozhiApp"
+ #include "esp_lib_utils.h"
+-LV_IMG_DECLARE(img_app_xiaozhi);
+ namespace esp_brookesia::apps {
+ namespace {
+ constexpr uint32_t RETRY_INTERVAL_MS = 5000;
+@@ -50,12 +49,11 @@
+ constexpr size_t PCM_QUEUE_LENGTH = 40;
+ constexpr size_t PLAYBACK_QUEUE_LENGTH = 10;
+ constexpr size_t DEVICE_TDM_CHANNELS = CODEC_VOICE_INPUT_CHANNELS;
++constexpr size_t DEVICE_ECHO_SLOT = 1;
+ constexpr size_t DEVICE_MIC1_SLOT = 0;
+-constexpr size_t DEVICE_ECHO_SLOT = 1;
+-constexpr size_t DEVICE_MIC2_SLOT = 2;
+ static_assert(
+-    XiaozhiAudioProcessor::INPUT_CHANNELS == 3,
+-    "Xiaozhi AFE input must be MIC1, MIC2, echo reference"
++    XiaozhiAudioProcessor::INPUT_CHANNELS == 2,
++    "Xiaozhi AFE input must be MIC1, echo reference"
+ );
+ constexpr size_t INPUT_READ_FRAMES = DEVICE_AUDIO_SAMPLE_RATE / 100;
+ constexpr size_t MAX_SERVER_SAMPLE_RATE = 48000;
+@@ -182,8 +180,7 @@
+     }
+     return _instance;
+ }
+-XiaozhiApp::XiaozhiApp(bool use_status_bar, bool use_navigation_bar):
+-    App("AIChats", &img_app_xiaozhi, true, use_status_bar, use_navigation_bar)
++XiaozhiApp::XiaozhiApp(bool use_status_bar, bool use_navigation_bar)
+ {
+     _lifecycle_mutex = xSemaphoreCreateMutex();
+ }
+@@ -230,7 +227,7 @@
+     if (!postControlEvent(event, true)) {
+         return false;
+     }
+-    return notifyCoreClosed();
++    return true;
+ }
+ bool XiaozhiApp::close()
+ {
+@@ -524,78 +521,19 @@
+ }
+ void XiaozhiApp::createUi()
+ {
+-    destroyUi();
+-    if (!_ui) {
+-        return;
+-    }
+-    lv_obj_t *screen = lv_screen_active();
+-    lv_obj_clean(screen);
+-    lv_obj_set_style_bg_color(screen, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+-    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
+-    lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+-    _page_root = lv_obj_create(screen);
+-    lv_obj_remove_style_all(_page_root);
+-    lv_obj_set_size(_page_root, lv_pct(100), lv_pct(100));
+-    lv_obj_center(_page_root);
+-    lv_obj_set_style_bg_color(_page_root, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+-    lv_obj_set_style_bg_opa(_page_root, LV_OPA_COVER, LV_PART_MAIN);
+-    lv_obj_clear_flag(_page_root, LV_OBJ_FLAG_SCROLLABLE);
+-    if (!_ui->create(_page_root, uiActionCallback, this, false)) {
+-        destroyUi();
+-        return;
+-    }
+-    _ui_timer = lv_timer_create(uiTimerCallback, 100, this);
+-    refreshUi();
++    // 测试禁用显示/触摸，仅使用串口状态日志。
+ }
+ void XiaozhiApp::destroyUi()
+ {
+-    if (_ui_timer) {
+-        lv_timer_delete(_ui_timer);
+-        _ui_timer = nullptr;
+-    }
+-    if (_ui) {
+-        _ui->destroy();
+-    }
+-    if (_page_root) {
+-        lv_obj_delete(_page_root);
+-        _page_root = nullptr;
+-    }
++    // 测试禁用显示/触摸，仅使用串口状态日志。
+ }
+ void XiaozhiApp::refreshUi()
+ {
+-    if (!_ui || !_page_root) {
+-        return;
+-    }
+-    char code[sizeof(_activation_code)] = {};
+-    char message[sizeof(_activation_message)] = {};
+-    char role[sizeof(_chat_role)] = {};
+-    char text[sizeof(_chat_text)] = {};
+-    char emotion[sizeof(_emotion)] = {};
+-    if (!_state_mutex ||
+-            xSemaphoreTake(_state_mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+-        return;
+-    }
+-    memcpy(code, _activation_code, sizeof(code));
+-    memcpy(message, _activation_message, sizeof(message));
+-    memcpy(role, _chat_role, sizeof(role));
+-    memcpy(text, _chat_text, sizeof(text));
+-    memcpy(emotion, _emotion, sizeof(emotion));
+-    xSemaphoreGive(_state_mutex);
+-    State state = _state.load();
+-    _ui->setNetworkReady(_network_ready.load());
+-    _ui->setStatus(stateText(state));
+-    _ui->setChatMessage(role, text);
+-    _ui->setEmotion(emotion[0] ? emotion : "neutral");
+-    _ui->setActivation(
+-        code,
+-        message[0] ? message : xiaozhiUiText(
+-            XiaozhiUiText::ActivationInstructions
+-        ),
+-        state == State::ActivationRequired
+-    );
++    // 测试禁用显示/触摸，仅使用串口状态日志。
+ }
+ void XiaozhiApp::setState(State state)
+ {
++    ESP_LOGI("REF_STATE", "state=%s", stateText(state));
+     _state.store(state);
+ }
+ void XiaozhiApp::setError(esp_err_t error, const char *source)
+@@ -618,6 +556,7 @@
+         role == XiaozhiClient::TextRole::Assistant ? "assistant" : "user"
+     );
+     copyString(_chat_text, sizeof(_chat_text), text);
++    ESP_LOGI("REF_CHAT", "%s: %s", _chat_role, _chat_text);
+     xSemaphoreGive(_state_mutex);
+ }
+ void XiaozhiApp::setEmotion(const char *emotion)
+@@ -638,6 +577,7 @@
+ }
+ void XiaozhiApp::copyActivation(const char *code, const char *message)
+ {
++    ESP_LOGI("REF_BIND", "code=%s message=%s", code ? code : "", message ? message : "");
+     if (_state_mutex && xSemaphoreTake(_state_mutex, portMAX_DELAY) == pdTRUE) {
+         copyString(_activation_code, sizeof(_activation_code), code);
+         copyString(_activation_message, sizeof(_activation_message), message);
+@@ -1296,6 +1236,7 @@
+ #else
+     use_websocket = service.value.has_websocket_config;
+ #endif
++    ref_diag_transport(use_mqtt);
+     if (!use_mqtt && !use_websocket) {
+ #if CONFIG_XIAOZHI_APP_TRANSPORT_MQTT
+         setError(ESP_ERR_NOT_SUPPORTED, "Get Xiaozhi MQTT configuration");
+@@ -1510,8 +1451,11 @@
+ }
+ bool XiaozhiApp::ensureAudioReady()
+ {
+-    const bool input_resamplers_ready =
+-        _input_resamplers[0] && _input_resamplers[1] && _input_resamplers[2];
++    // 按实际通道数检查，兼容单麦 MR，避免访问不存在的第三路。
++    bool input_resamplers_ready = true;
++    for (auto resampler : _input_resamplers) {
++        input_resamplers_ready = input_resamplers_ready && resampler != nullptr;
++    }
+     if (_audio_tasks_running.load() && _input_task_running.load() &&
+             _encoder_task_running.load() && _playback_task_running.load() &&
+             _audio_processor && _audio_processor->isReady() &&
+@@ -2448,19 +2392,25 @@
+     );
+     uint32_t read_failures = 0;
+     uint32_t resample_failures = 0;
+-    const bool input_resamplers_ready =
+-        _input_resamplers[0] && _input_resamplers[1] && _input_resamplers[2];
++    // 按实际通道数检查，兼容单麦 MR，避免访问不存在的第三路。
++    bool input_resamplers_ready = true;
++    for (auto resampler : _input_resamplers) {
++        input_resamplers_ready = input_resamplers_ready && resampler != nullptr;
++    }
+     if (!device_tdm || !device_planar || !chat_planar || !afe_interleaved ||
+             !input_resamplers_ready) {
++        const bool buffers_ready = device_tdm && device_planar && chat_planar && afe_interleaved;
+         free(device_tdm);
+         free(device_planar);
+         free(chat_planar);
+         free(afe_interleaved);
+         ControlEvent event = {};
+         event.type = ControlEventType::AudioError;
+-        event.error = ESP_ERR_NO_MEM;
++        // 区分缓冲分配失败与重采样器未就绪，避免把两者都报告为内存不足。
++        event.error = buffers_ready ? ESP_ERR_INVALID_STATE : ESP_ERR_NO_MEM;
+         copyString(
+-            event.detail, sizeof(event.detail), "Allocate audio input buffer"
++            event.detail, sizeof(event.detail),
++            buffers_ready ? "Input resamplers not ready" : "Allocate audio input buffer"
+         );
+         postControlEvent(event);
+         _input_task_running.store(false);
+@@ -2491,14 +2441,12 @@
+             for (uint32_t frame = 0; frame < input_frames; ++frame) {
+                 const int16_t mic1 =
+                     device_tdm[frame * DEVICE_TDM_CHANNELS + DEVICE_MIC1_SLOT];
+-                const int16_t mic2 =
+-                    device_tdm[frame * DEVICE_TDM_CHANNELS + DEVICE_MIC2_SLOT];
+                 const int16_t echo =
+                     device_tdm[frame * DEVICE_TDM_CHANNELS + DEVICE_ECHO_SLOT];
++                // 单麦对照：仅将 SLOT0 人声与 SLOT1 硬件回采送入 MR，保持四槽采集配置。
+                 device_planar[frame] = mic1;
+-                device_planar[INPUT_READ_FRAMES + frame] = mic2;
+-                device_planar[INPUT_READ_FRAMES * 2 + frame] = echo;
+-                const int16_t microphone_samples[2] = {mic1, mic2};
++                device_planar[INPUT_READ_FRAMES + frame] = echo;
++                const int16_t microphone_samples[1] = {mic1};
+                 for (int16_t sample : microphone_samples) {
+                     int32_t value = sample;
+                     uint32_t magnitude = static_cast<uint32_t>(
+@@ -2511,7 +2459,7 @@
+             _input_pcm_peak.store(peak);
+             _input_pcm_mean_abs.store(
+                 input_frames ?
+-                    static_cast<uint32_t>(absolute_sum / (input_frames * 2)) : 0
++                    static_cast<uint32_t>(absolute_sum / input_frames) : 0
+             );
+             int resample_ret = ESP_AE_ERR_OK;
+             uint32_t output_samples = 0;
+@@ -2645,6 +2593,7 @@
+             }
+             xSemaphoreGive(_audio_tx_mutex);
+         }
++        if (attempted_send) ref_diag_send(send_ret);
+         if (attempted_send && send_ret == ESP_OK) {
+             if (preroll) {
+                 uint32_t remaining = _preroll_frames_remaining.load();
+@@ -2935,10 +2884,7 @@
+ }
+ void XiaozhiApp::uiTimerCallback(lv_timer_t *timer)
+ {
+-    auto *instance = static_cast<XiaozhiApp *>(lv_timer_get_user_data(timer));
+-    if (instance) {
+-        instance->refreshUi();
+-    }
++    // 测试禁用显示/触摸，仅使用串口状态日志。
+ }
+ void XiaozhiApp::uiActionCallback(void *context)
+ {
+--- upstream/XiaozhiApp.hpp
++++ reference/XiaozhiApp.hpp
+@@ -14,26 +14,27 @@
+ #include "freertos/queue.h"
+ #include "freertos/semphr.h"
+ #include "freertos/task.h"
+-#include "lvgl.h"
+-#include "systems/phone/esp_brookesia_phone_app.hpp"
++#include "headless_ui.hpp"
+ namespace esp_brookesia::apps {
+ class XiaozhiActivationClient;
+ class XiaozhiActivationPrompt;
+ class XiaozhiAudioProcessor;
+ class XiaozhiUi;
+-class XiaozhiApp: public systems::phone::App {
++class XiaozhiApp {
+ public:
+     static XiaozhiApp *requestInstance(bool use_status_bar = false, bool use_navigation_bar = false);
+     ~XiaozhiApp();
++    // 独立无屏入口，原控制任务保持不变。
++    bool startHeadless() { return init() && run(); }
+ protected:
+     XiaozhiApp(bool use_status_bar, bool use_navigation_bar);
+-    bool run() override;
+-    bool back() override;
+-    bool close() override;
+-    bool init() override;
+-    bool deinit() override;
+-    bool pause() override;
+-    bool resume() override;
++    bool run();
++    bool back();
++    bool close();
++    bool init();
++    bool deinit();
++    bool pause();
++    bool resume();
+ private:
+     enum class State : uint8_t {
+         NetworkRequired,
+@@ -110,7 +111,7 @@
+     static constexpr int INPUT_TASK_STACK_SIZE = 6 * 1024;
+     static constexpr int ENCODER_TASK_STACK_SIZE = 40 * 1024;
+     static constexpr int PLAYBACK_TASK_STACK_SIZE = 24 * 1024;
+-    static constexpr size_t AFE_INPUT_CHANNELS = 3;
++    static constexpr size_t AFE_INPUT_CHANNELS = 2;
+     static XiaozhiApp *_instance;
+     lv_obj_t *_page_root = nullptr;
+     lv_timer_t *_ui_timer = nullptr;
+--- upstream/XiaozhiAudioProcessor.cpp
++++ reference/XiaozhiAudioProcessor.cpp
+@@ -1,3 +1,4 @@
++#include "bsp_board_extra.h"
+ /*
+  * Derived from 78/xiaozhi-esp32 (MIT).
+  *
+@@ -13,7 +14,7 @@
+ namespace esp_brookesia::apps {
+ namespace {
+ constexpr char TAG[] = "XiaozhiAudio";
+-constexpr char AFE_INPUT_FORMAT[] = "MMR";
++constexpr char AFE_INPUT_FORMAT[] = "MR";
+ class SemaphoreLock {
+ public:
+     explicit SemaphoreLock(SemaphoreHandle_t semaphore): semaphore_(semaphore)
+@@ -207,6 +208,7 @@
+     size_t consumed = 0;
+     while (input_buffer_.size() - consumed >= feed_samples) {
+         afe_iface_->feed(afe_data_, input_buffer_.data() + consumed);
++        ref_diag_feed();
+         consumed += feed_samples;
+     }
+     if (consumed > 0) {
+@@ -596,6 +598,7 @@
+         xEventGroupClearBits(event_group_, EVENT_WAKE_WORD_ENABLED);
+         afe_iface_->disable_wakenet(afe_data_);
+     }
++    ref_diag_wake();
+     ESP_LOGI(TAG, "Wake word detected: %s", wake_word.c_str());
+     WakeWordCallback callback = copyWakeWordCallback();
+     if (callback) {
+@@ -638,6 +641,7 @@
+         if (!result || result->ret_value == ESP_FAIL) {
+             continue;
+         }
++        ref_diag_fetch(result->vad_state);
+         const bool wake_word_enabled =
+             (bits & EVENT_WAKE_WORD_ENABLED) != 0;
+         const bool voice_enabled = (bits & EVENT_VOICE_ENABLED) != 0;
+--- upstream/XiaozhiAudioProcessor.hpp
++++ reference/XiaozhiAudioProcessor.hpp
+@@ -19,16 +19,13 @@
+ #include "model_path.h"
+ namespace esp_brookesia::apps {
+ /**
+- * Dual-microphone WakeNet front end with an analog playback reference.
+- *
+- * Input is 16 kHz signed 16-bit interleaved MMR PCM: MIC1, MIC2, then the
+- * MIC3 echo-reference channel. The PCM callback still receives the AFE's
+- * single-channel 60 ms output frame.
++ * 单麦对照使用 MIC1 和硬件 REF，16kHz、16bit，以 MR 顺序交织。
++ * AFE 输出仍组装为单声道 60ms 帧，其余对话处理沿用参考实现。
+  */
+ class XiaozhiAudioProcessor {
+ public:
+     static constexpr uint32_t SAMPLE_RATE = 16000;
+-    static constexpr size_t INPUT_CHANNELS = 3;
++    static constexpr size_t INPUT_CHANNELS = 2;
+     static constexpr size_t PCM_FRAME_SAMPLES = 960;
+     using WakeWordCallback = std::function<void(const std::string &wake_word)>;
+     using PcmFrameCallback =
+@@ -40,7 +37,7 @@
+     XiaozhiAudioProcessor &operator=(const XiaozhiAudioProcessor &) = delete;
+     bool initialize();
+     bool shutdown();
+-    /** Feed frame_count interleaved MMR samples into the AFE. */
++    /** 向 AFE 输入 frame_count 帧交织 MR 数据。 */
+     bool feed(const int16_t *interleaved_pcm, size_t frame_count);
+     bool enableWakeWord(bool enable);
+     bool enableVoiceProcessing(bool enable);

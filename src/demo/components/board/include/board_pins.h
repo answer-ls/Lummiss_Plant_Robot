@@ -54,7 +54,7 @@
 #define BOARD_TF_D3 GPIO_NUM_44
 #define BOARD_TF_CS BOARD_TF_D3
 #define BOARD_TF_D1 GPIO_NUM_40
-#define BOARD_TF_D2 GPIO_NUM_46
+#define BOARD_TF_D2 GPIO_NUM_46 
 #define BOARD_TF_POWER GPIO_NUM_45
 #define BOARD_TF_CD GPIO_NUM_39
 #define BOARD_TF_POWER_ON_LEVEL 0
@@ -136,7 +136,7 @@
 
 /* 灯珠数量必须与实物一致：写多了只是多发一段无效数据（无害），写少了末尾
  * 灯珠不亮。改这里即可，不用动驱动代码。两种板型共用。 */
-#define BOARD_WS2812_A_LED_COUNT 20
+#define BOARD_WS2812_A_LED_COUNT 1
 #define BOARD_WS2812_B_LED_COUNT 20
 
 /* TTP223 电容触摸按键：模块已在硬件侧完成电容检测并输出数字电平，

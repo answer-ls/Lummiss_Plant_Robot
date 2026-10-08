@@ -35,8 +35,13 @@
 static const char *TAG = "VIDEO_STREAM";
 /* 独立 DMA2D 转换保持关闭；本轮只比较 JPEG 解码器内置 RX CSC。 */
 #define VIDEO_PRIVATE_DMA2D_CSC_ENABLED 0
-/* A=0：JPEG YUV422 + CPU；B=1：JPEG 直出 YUV420。失败仍回退 A。 */
+/* v1.x 不支持 JPEG 内置 RX CSC 的 YUV422→YUV420，固定走 YUV422 + CPU。 */
+#if CONFIG_ESP_REV_MIN_FULL < 300
+#define VIDEO_JPEG_DMA2D_AB_PATH_B 0
+#else
+/* v3.x 保留 JPEG 直出 YUV420 的 B 路径及原有 CPU 回退。 */
 #define VIDEO_JPEG_DMA2D_AB_PATH_B 1
+#endif
 /* 视频控制层专用 TAG：启停状态迁移打在这里，便于和服务端命令逐条对账。 */
 static const char *TAG_CTRL = "VIDEO_CTRL";
 /* 初始化完成后发布，允许 RTC 在 UVC 启动前等待编解码任务就绪。 */

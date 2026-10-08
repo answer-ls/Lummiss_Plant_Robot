@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.16)
+set(COMPONENTS main)
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+idf_build_set_property(MINIMAL_BUILD ON)
+project(sdmmc_4bit_idf555_test)

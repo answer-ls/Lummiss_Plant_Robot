@@ -9,6 +9,7 @@
 #include "esp_log.h"
 #include "esp_hosted_transport_init.h"
 #include "esp_hosted_header.h"
+#include "esp_heap_caps.h"
 
 #if TEST_RAW_TP || ESP_PKT_STATS || CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
 static const char TAG[] = "stats";
@@ -306,6 +307,12 @@ static void stats_timer_func(void* arg)
 			(unsigned)slv_state_g.current_throttling,
 			(unsigned long)pkt_stats.sta_flowctrl_on,
 			(unsigned long)pkt_stats.sta_flowctrl_off);
+	ESP_LOGI(TAG, "C6_TX_MEM int_free=%u int_largest=%u int_min=%u dma_free=%u dma_largest=%u",
+			(unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+			(unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+			(unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+			(unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
+			(unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
 
 #ifdef ESP_FUNCTION_PROFILING
 	/* Print timing stats for all active entries */

@@ -8,6 +8,7 @@
 #include "cJSON.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_hosted.h"
 #include "esp_system.h"
 #include "esp_task_wdt.h"
 #include "freertos/FreeRTOS.h"
@@ -347,8 +348,23 @@ void app_main(void)
     mem_fragment_begin();
     ESP_LOGW(TAG, "POWER_DIAG boot_reset_reason=%d (BROWNOUT=%d)",
              (int)esp_reset_reason(), (int)ESP_RST_BROWNOUT);
+    /* 新板早期挂载 TF 时先只保持整板供电，挂载后再点亮背光。 */
+#if BOARD_USE_NEW_PCB && \
+    (CAMERA_TEST_PROFILE == CAMERA_TEST_SD_ONLY || \
+     (CAMERA_TEST_PROFILE == CAMERA_TEST_FULL && TP_HAS(SD) && !CAMERA_PERSON_DETECT_ENABLED))
+    esp_err_t board_error = gpio_set_level(BOARD_PWR_IO, 1);
+    if (board_error == ESP_OK) {
+        const gpio_config_t power_hold = {
+            .pin_bit_mask = 1ULL << BOARD_PWR_IO,
+            .mode = GPIO_MODE_INPUT_OUTPUT,
+        };
+        board_error = gpio_config(&power_hold);
+    }
+    if (board_error == ESP_OK) board_error = gpio_set_level(BOARD_PWR_IO, 1);
+#else
     /* 新 PCB 的 PWR_IO 引脚由 board_pins.h 定义，必须先拉高并保持供电。 */
     const esp_err_t board_error = board_init_early();
+#endif
     if (board_error != ESP_OK) {
         ESP_LOGE(TAG, "板级启动 GPIO 初始化失败：%s",
                  esp_err_to_name(board_error));
@@ -360,7 +376,7 @@ void app_main(void)
     return;
 #endif
 #if CAMERA_TEST_PROFILE == CAMERA_TEST_STEPPER_ONLY
-    ESP_LOGI(TAG, "测试档位12：仅步进电机，100/50/20/10ms速度阶梯测试");
+    ESP_LOGI(TAG, "测试档位12：仅步进电机，正反各两圈，每轮间隔10秒");
     if (board_error != ESP_OK) {
         return;
     }
@@ -373,14 +389,25 @@ void app_main(void)
 #if CAMERA_TEST_PROFILE == CAMERA_TEST_SD_ONLY || CAMERA_TEST_PROFILE == CAMERA_TEST_WIFI_ONLY
     ESP_LOGI(TAG, "测试档位%d：%s", CAMERA_TEST_PROFILE, test_profile_name());
 #if CAMERA_TEST_PROFILE == CAMERA_TEST_SD_ONLY
+    if (board_error != ESP_OK) return;
+#if BOARD_USE_NEW_PCB
+    /* 对照独立工程：档位 10 挂载前释放 app_main 之前自动启动的 Hosted。 */
+    const esp_err_t hosted_stop = esp_hosted_deinit();
+    ESP_LOGI(TAG, "SD_TEST Hosted teardown=%s", esp_err_to_name(hosted_stop));
+    if (hosted_stop != ESP_OK) return;
+#endif
     // 仅测试期间延长 TWDT；不在 SD Busy 轮询中插入任务延时。
     const esp_task_wdt_config_t sd_wdt = {
         .timeout_ms = 15000, .idle_core_mask = (1U << 0) | (1U << 1), .trigger_panic = false,
     };
     esp_err_t sd_wdt_err = esp_task_wdt_reconfigure(&sd_wdt);
     ESP_LOGI(TAG, "SD_TEST TWDT 15s: %s", esp_err_to_name(sd_wdt_err));
-    // 本轮只在 FAT 未分配的空闲扇区执行 1000 次 raw CMD24/17，首次失败即停。
+    // 新板复现独立工程的官方 SDSPI 挂载和只读扇区校验。
+#if BOARD_USE_NEW_PCB
+    const esp_err_t sd_test_result = sd_card_sdspi_reference_test();
+#else
     const esp_err_t sd_test_result = sd_card_raw_diagnostic();
+#endif
     const esp_task_wdt_config_t normal_wdt = {
         .timeout_ms = 5000, .idle_core_mask = (1U << 0) | (1U << 1), .trigger_panic = false,
     };
@@ -429,6 +456,24 @@ void app_main(void)
     ESP_LOGI(TAG, "TEST_SUMMARY SD=%s WiFi=SKIPPED", esp_err_to_name(sd_test_result));
 #endif
     return;
+#endif
+
+#if CAMERA_TEST_PROFILE == CAMERA_TEST_FULL && TP_HAS(SD) && !CAMERA_PERSON_DETECT_ENABLED
+    /* 诊断挂载时机：在网络、音频和 UI 启动前挂载，后期入口仍可复用已挂载卡。 */
+    if (board_error == ESP_OK) {
+        ESP_LOGI(TAG, "EARLY_SD_MOUNT begin");
+        const esp_err_t early_sd_error = sd_card_mount();
+        ESP_LOGI(TAG, "EARLY_SD_MOUNT result=%s mounted=%d",
+                 esp_err_to_name(early_sd_error), sd_card_is_mounted());
+    }
+#if BOARD_USE_NEW_PCB
+    /* 早期挂载结束后恢复正式系统的屏幕背光和板级 GPIO 初始化。 */
+    const esp_err_t ui_board_error = board_init_early();
+    if (ui_board_error != ESP_OK) {
+        ESP_LOGE(TAG, "早期 TF 挂载后板级 GPIO 初始化失败：%s",
+                 esp_err_to_name(ui_board_error));
+    }
+#endif
 #endif
 
     ESP_LOGI(TAG,

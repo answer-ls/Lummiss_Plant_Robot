@@ -39,6 +39,7 @@
 #include "stats.h"
 #include "esp_mac.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include "mempool.h"
 
 #include "esp_hosted_coprocessor_fw_ver.h"
@@ -584,6 +585,13 @@ static void process_rx_pkt(interface_buffer_handle_t *buf_handle)
 		pkt_stats.sta_tx_api_retry += attempts - 1;
 		if (attempts > 1 && !ret)
 			pkt_stats.sta_tx_api_retry_recovered++;
+		if (ret && pkt_stats.hs_bus_sta_fail == 0)
+			ESP_LOGW(TAG, "STA_TX_FIRST_FAIL err=0x%x len=%u attempts=%d int_free=%u int_largest=%u dma_free=%u dma_largest=%u",
+					ret, payload_len, attempts,
+					(unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+					(unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+					(unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
+					(unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
 		if (ret)
 			pkt_stats.sta_tx_api_last_error = ret;
 		if (ret)

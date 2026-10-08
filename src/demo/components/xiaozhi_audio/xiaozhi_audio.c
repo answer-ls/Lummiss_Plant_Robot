@@ -42,8 +42,6 @@
 #include "ambient_led.h"
 #endif
 #include "wake_word.h"
-#include "audio_probe.h"
-#include "opus_probe.h"
 #include "lifecycle_probe.h"
 #include "capture_diag.h"
 #include "raw_adc_probe.h"
@@ -545,8 +543,6 @@ static void resume_listening_after_playback(void)
         ESP_LOGI(TAG, "回答播放完成，listen/start 已本地发布（QoS0 无服务端确认），恢复连续对话监听");
 #if defined(CONFIG_CLOUD_PROTOCOL_V3)
         set_voice_state(VOICE_STATE_CONTINUOUS_LISTENING);
-        /* 每次开机仅抓首次续听中实际发送成功的 Opus 包。 */
-        opus_probe_start();
 #else
         xEventGroupSetBits(s_events, XIAOZHI_EVENT_UPLINK_ENABLED);
 #endif
@@ -691,8 +687,8 @@ static bool v3_open_session_for_wake(void)
         ESP_LOGE(TAG, "重新发布 hello 失败");
         return false;
     }
-    /* 最多等 3 s：hello 经 MQTT 往返，实测几百毫秒。 */
-    for (int i = 0; i < 150; i++) {
+    /* 本次实机 Server Hello 在唤醒后约 9 秒到达，等待 12 秒以接住迟到响应。 */
+    for (int i = 0; i < 600; i++) {
         if (__atomic_load_n(&s_rtc_requested, __ATOMIC_ACQUIRE)) return false;
         if (cloud_mqtt_is_session_ready()) {
             cloud_mqtt_session_t session;
@@ -714,7 +710,7 @@ static bool v3_open_session_for_wake(void)
         }
         vTaskDelay(pdMS_TO_TICKS(20));
     }
-    ESP_LOGE(TAG, "等待 Server Hello 超时（3 s）");
+    ESP_LOGE(TAG, "等待 Server Hello 超时（12 s）");
     return false;
 }
 #endif /* CONFIG_CLOUD_PROTOCOL_V3 */
@@ -1449,7 +1445,7 @@ static esp_err_t audio_codec_init(void)
         .bits_per_sample = ESP_AUDIO_BIT16,
         .bitrate = ESP_OPUS_BITRATE_AUTO,
         .frame_duration = ESP_OPUS_ENC_FRAME_DURATION_60_MS,
-        .application_mode = ESP_OPUS_ENC_APPLICATION_VOIP,
+        .application_mode = ESP_OPUS_ENC_APPLICATION_AUDIO,
         .complexity = 0,
         .enable_fec = false,
         .enable_dtx = true,
@@ -1685,8 +1681,6 @@ static void capture_task(void *arg)
             continue;
         }
         capture_diag_metric(CD_RESAMPLE, esp_timer_get_time() - diag_ts);
-        audio_probe_input((const int16_t *)raw, (size_t)raw_size,
-                          (const int16_t *)pcm, output_samples);
 
 #if !defined(CONFIG_CLOUD_PROTOCOL_V3)
         EventBits_t bits = xEventGroupGetBits(s_events);
@@ -1749,7 +1743,6 @@ static void encoder_task(void *arg)
             .buffer = opus,
             .len = (uint32_t)s_audio.encoder_output_size,
         };
-        audio_probe_uplink((const int16_t *)pcm, (size_t)s_audio.encoder_input_size);
         int64_t diag_ts = esp_timer_get_time();
         esp_audio_err_t audio_error = esp_opus_enc_process(
             s_audio.opus_encoder, &input_frame, &output_frame);
@@ -1772,7 +1765,6 @@ static void encoder_task(void *arg)
 #endif
             if (!diag_sink) voice_trace("LIVE_OPUS_TX", NULL, send_error);
             if (send_error == ESP_OK) {
-                if (!diag_sink) opus_probe_packet(opus, output_frame.encoded_bytes);
                 s_capture_frames++;
                 s_capture_bytes += output_frame.encoded_bytes;
             } else {
@@ -2282,9 +2274,8 @@ static void abort_audio_service(void)
 static void service_task(void *arg)
 {
     (void)arg;
-    ESP_LOGI(TAG, "AUDIO_DIAGNOSTICS udp_ab=%d lifecycle_tx=%d recording=%d",
-             CAPTURE_UPLINK_AB_DIAGNOSTIC, AUDIO_LIFECYCLE_DIAGNOSTIC,
-             AUDIO_RECORDING_DIAGNOSTIC);
+    ESP_LOGI(TAG, "AUDIO_DIAGNOSTICS udp_ab=%d lifecycle_tx=%d",
+             CAPTURE_UPLINK_AB_DIAGNOSTIC, AUDIO_LIFECYCLE_DIAGNOSTIC);
     if (audio_hw_init() != ESP_OK ||
         (AUDIO_LIFECYCLE_DIAGNOSTIC && !CAPTURE_UPLINK_AB_DIAGNOSTIC && lifecycle_prepare(s_audio.input_ctrl_if, s_audio.rx_channel, s_audio.tx_channel) != ESP_OK) ||
         audio_codec_init() != ESP_OK ||

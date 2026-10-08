@@ -28,9 +28,9 @@ static const char *TAG = "PERIPH_TEST";
 #if BOARD_HAS_STEPPER && (!PERIPH_LCD_DIAGNOSTIC_ONLY || CAMERA_TEST_PROFILE == CAMERA_TEST_STEPPER_ONLY)
 #define STEPPER_TEST_TASK_STACK       3072
 #define STEPPER_TEST_TASK_PRIORITY    4
-#define STEPPER_TEST_STEPS            20U
-#define STEPPER_TEST_HOLD_MS          500U
-#define STEPPER_TEST_REPEAT_DELAY_MS  5000U
+#define STEPPER_TEST_STEPS            400U  /* 按 1.8° 全步进：200 步/圈，往返各两圈。 */
+#define STEPPER_TEST_INTERVAL_US      50000U
+#define STEPPER_TEST_REPEAT_DELAY_MS  10000U
 #define STEPPER_TEST_CORE             1
 #endif
 
@@ -293,50 +293,45 @@ static void peripheral_test_task(void *arg)
 }
 
 #if BOARD_HAS_STEPPER && (!PERIPH_LCD_DIAGNOSTIC_ONLY || CAMERA_TEST_PROFILE == CAMERA_TEST_STEPPER_ONLY)
-/* 保持已验证的 GPIO 和相序，只改变步间隔；每档重新使能验证启动能力。
- * 无编码器，软件完成不代表没有失步，需要现场观察每档的正反转。 */
+/* 保持 GPIO 和相序不变，连续测试两圈正转、两圈反转。
+ * 无编码器，软件完成不代表没有失步，需要现场观察实际圈数。 */
 static void stepper_test_task(void *arg)
 {
     (void)arg;
-    static const uint32_t intervals_us[] = {100000U, 50000U, 20000U, 10000U};
-    ESP_LOGI(TAG, "STEPPER_SPEED_TEST：3秒后开始，100/50/20/10ms，每档正反各20步");
+    ESP_LOGI(TAG, "STEPPER_ROTATION_TEST：3秒后开始，正反各400步，50ms/步，每轮结束后等待10秒");
     vTaskDelay(pdMS_TO_TICKS(3000));
     esp_err_t err = ESP_OK;
-    unsigned completed = 0;
-    for (unsigned i = 0; i < sizeof(intervals_us) / sizeof(intervals_us[0]); ++i) {
-        const uint32_t interval = intervals_us[i];
-        ESP_LOGI(TAG, "SPEED_BEGIN stage=%u/4 interval_us=%u steps=%u",
-                 i + 1, (unsigned)interval, (unsigned)STEPPER_TEST_STEPS);
+    unsigned cycle = 0;
+    while (true) {
+        ESP_LOGI(TAG, "ROTATION_BEGIN cycle=%u steps_per_direction=%u interval_us=%u",
+                 cycle + 1, (unsigned)STEPPER_TEST_STEPS, (unsigned)STEPPER_TEST_INTERVAL_US);
         err = stepper_motor_enable();
         if (err == ESP_OK) {
-            ESP_LOGI(TAG, "SPEED_MOVE stage=%u direction=cw", i + 1);
-            err = stepper_motor_move_steps(STEPPER_TEST_STEPS, STEPPER_DIR_CW, interval);
+            ESP_LOGI(TAG, "ROTATION_MOVE cycle=%u direction=cw", cycle + 1);
+            err = stepper_motor_move_steps(STEPPER_TEST_STEPS, STEPPER_DIR_CW,
+                                           STEPPER_TEST_INTERVAL_US);
         }
         if (err == ESP_OK) {
-            vTaskDelay(pdMS_TO_TICKS(STEPPER_TEST_HOLD_MS));
-            ESP_LOGI(TAG, "SPEED_MOVE stage=%u direction=ccw", i + 1);
-            err = stepper_motor_move_steps(STEPPER_TEST_STEPS, STEPPER_DIR_CCW, interval);
+            ESP_LOGI(TAG, "ROTATION_MOVE cycle=%u direction=ccw", cycle + 1);
+            err = stepper_motor_move_steps(STEPPER_TEST_STEPS, STEPPER_DIR_CCW,
+                                           STEPPER_TEST_INTERVAL_US);
         }
-        /* 关闭前保存故障状态，避免休眠时的电平影响本档诊断。 */
+        /* 关闭前保存故障状态，首次失败即停止，避免故障后反复重启。 */
         const bool fault = stepper_motor_is_fault();
         const esp_err_t disable_err = stepper_motor_disable();
         if (err == ESP_OK) {
             err = fault ? ESP_FAIL : disable_err;
         }
-        ESP_LOGI(TAG, "SPEED_END stage=%u result=%s disable=%s fault=%d",
-                 i + 1, esp_err_to_name(err), esp_err_to_name(disable_err), fault);
+        ESP_LOGI(TAG, "ROTATION_END cycle=%u result=%s disable=%s fault=%d",
+                 cycle + 1, esp_err_to_name(err), esp_err_to_name(disable_err), fault);
         if (err != ESP_OK) {
-            /* 首次驱动失败即停止，不重试、不进入更快档位。 */
             break;
         }
-        completed++;
-        if (i + 1 < sizeof(intervals_us) / sizeof(intervals_us[0])) {
-            ESP_LOGI(TAG, "线圈已关闭，等待5秒后开始下一档");
-            vTaskDelay(pdMS_TO_TICKS(STEPPER_TEST_REPEAT_DELAY_MS));
-        }
+        cycle++;
+        vTaskDelay(pdMS_TO_TICKS(STEPPER_TEST_REPEAT_DELAY_MS));
     }
-    ESP_LOGI(TAG, "STEPPER_SPEED_SUMMARY completed=%u/4 result=%s（机械转动需观察）",
-             completed, esp_err_to_name(err));
+    ESP_LOGE(TAG, "STEPPER_ROTATION_TEST stopped after=%u cycles result=%s",
+             cycle, esp_err_to_name(err));
     vTaskDelete(NULL);
 }
 

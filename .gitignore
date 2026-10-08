@@ -2,6 +2,7 @@
 build/
 build_camera_verified/
 build_screen_verified/
+build_*/
 
 # ===== ESP-IDF generated config (keep sdkconfig.defaults / sdkconfig.ci.*) =====
 sdkconfig
@@ -41,6 +42,10 @@ desktop.ini
 # ===== Local tooling =====
 .claude/
 /logs/*.log
+/logs/
+/.workbuddy/
+/src/demo/reconfigure
+/src/c6_hosted_slave_2_7_4/main/common/protobuf-c/
 
 # ===== Backups =====
 *.bak

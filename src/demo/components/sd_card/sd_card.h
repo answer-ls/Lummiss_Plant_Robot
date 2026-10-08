@@ -40,5 +40,9 @@ esp_err_t sd_card_self_test(void);
 esp_err_t sd_card_official_style_test(void);
 /* 仅用于 SDSPI 诊断：选取空闲数据扇区，直接执行 CMD24/CMD17 测试。 */
 esp_err_t sd_card_raw_diagnostic(void);
+/* 档位 10：复现独立工程的官方 SDSPI 挂载与扇区只读校验。 */
+esp_err_t sd_card_sdspi_reference_test(void);
+/* 新 PCB 独立档位：SDMMC Slot 1 四位总线文件读写对照，不启动 C6。 */
+esp_err_t sd_card_sdmmc_4bit_test(void);
 
 #endif /* LUMMISS_SD_CARD_H */

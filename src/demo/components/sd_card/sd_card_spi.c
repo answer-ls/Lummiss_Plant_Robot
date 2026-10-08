@@ -27,16 +27,6 @@ static uint32_t s_fsinfo_initial_hash;
 static bool s_fsinfo_initial_valid;
 static bool s_raw_diag_requested;
 static bool s_raw_bad_identity_seen;
-extern void sdspi_diag_dump_busy_stats(void);
-extern void sdspi_diag_set_raw_mode(bool enabled);
-extern void sdspi_diag_reset_busy_stats(void);
-extern void sdspi_diag_get_busy_stats(uint32_t *count, int64_t *min_us, int64_t *max_us,
-                                      uint64_t *total_us, uint32_t bins[7]);
-extern void sdspi_diag_get_last_write(uint8_t *r1, bool *r1_seen, uint8_t *token,
-                                      bool *token_seen, int64_t *busy_us, uint8_t *busy_last_rx,
-                                      esp_err_t *busy_result, const char **failure);
-
-void sd_card_dump_busy_stats(void) { sdspi_diag_dump_busy_stats(); }
 
 static void raw_log_card_identity(const char *stage, const sdmmc_card_t *card)
 {
@@ -166,15 +156,52 @@ static esp_err_t trace_transaction(int slot, sdmmc_command_t *cmd)
             diagnose_after_busy_timeout();
         }
     }
+    const bool init_cmd = cmd->opcode == 0 || cmd->opcode == 5 || cmd->opcode == 8 ||
+                          cmd->opcode == 52 || cmd->opcode == 58;
     if (write_cmd || err != ESP_OK || cmd->error != ESP_OK) {
         ESP_LOGW(TAG, "CMD%" PRIu32 " end: ret=%s cmd_error=%s elapsed=%" PRId64
-                 " ms response0=0x%08" PRIx32,
+                 " us response0=0x%08" PRIx32,
                  cmd->opcode, esp_err_to_name(err), esp_err_to_name(cmd->error),
-                 (esp_timer_get_time() - started) / 1000, cmd->response[0]);
+                 esp_timer_get_time() - started, cmd->response[0]);
+    } else if (init_cmd) {
+        ESP_LOGI(TAG, "CMD%" PRIu32 " end: ret=%s cmd_error=%s elapsed=%" PRId64
+                 " us response0=0x%08" PRIx32,
+                 cmd->opcode, esp_err_to_name(err), esp_err_to_name(cmd->error),
+                 esp_timer_get_time() - started, cmd->response[0]);
     }
-    /* Each transaction has released the SPI bus before returning here. */
-    vTaskDelay(1);
+    /* 初始化阶段对齐独立 SDSPI 工程，不在两条卡命令之间额外让出一个 tick。 */
+    if (s_card) vTaskDelay(1);
     return err;
+}
+
+static esp_err_t mount_trace_transaction(int slot, sdmmc_command_t *cmd)
+{
+    esp_err_t err = s_transaction(slot, cmd);
+    if (cmd->opcode == 0 || cmd->opcode == 5 || cmd->opcode == 8 ||
+        cmd->opcode == 9 || cmd->opcode == 10 || cmd->opcode == 58 ||
+        err != ESP_OK || cmd->error != ESP_OK) {
+        ESP_LOGI(TAG, "CMD%lu ret=%s cmd_error=%s response0=0x%08lx",
+                 (unsigned long)cmd->opcode, esp_err_to_name(err),
+                 esp_err_to_name(cmd->error), (unsigned long)cmd->response[0]);
+    }
+    return err;
+}
+
+static esp_err_t float_tf_bus(void)
+{
+    const gpio_num_t pins[] = {
+        BOARD_TF_CLK, BOARD_TF_MOSI, BOARD_TF_MISO,
+        BOARD_TF_D1, BOARD_TF_D2, BOARD_TF_D3,
+    };
+    for (size_t i = 0; i < sizeof(pins) / sizeof(pins[0]); ++i) {
+        esp_err_t err = gpio_reset_pin(pins[i]);
+        if (err != ESP_OK) return err;
+        err = gpio_set_direction(pins[i], GPIO_MODE_INPUT);
+        if (err != ESP_OK) return err;
+        err = gpio_set_pull_mode(pins[i], GPIO_FLOATING);
+        if (err != ESP_OK) return err;
+    }
+    return ESP_OK;
 }
 
 static uint32_t read_le32(const uint8_t *p)
@@ -254,7 +281,7 @@ static esp_err_t release_bus(void)
         if (err != ESP_OK) return err;
         s_bus_owned = false;
     }
-    /* Remove host drive before cutting switched TF power. */
+    /* 释放总线驱动后恢复 TF 供电控制脚高电平。 */
     gpio_reset_pin(BOARD_TF_CS);
     gpio_reset_pin(BOARD_TF_CLK);
     gpio_reset_pin(BOARD_TF_MOSI);
@@ -338,35 +365,22 @@ static void diagnose_mount_failure_readonly(const sdspi_device_config_t *slot_co
     ESP_LOGI(TAG, "MOUNT_READONLY cleanup=%s", esp_err_to_name(cleanup));
 }
 
-esp_err_t sd_card_mount(void)
+static esp_err_t sd_card_mount_once(void)
 {
     if (s_card) return ESP_OK;
     if (s_bus_owned) return ESP_ERR_INVALID_STATE;
     s_write_error = ESP_OK;
     s_fsinfo_lba = UINT32_MAX;
     s_fsinfo_initial_valid = false;
-    gpio_config_t power = {
-        .pin_bit_mask = 1ULL << BOARD_TF_POWER,
-        .mode = GPIO_MODE_OUTPUT,
-    };
-    esp_err_t err = gpio_set_level(BOARD_TF_POWER, !BOARD_TF_POWER_ON_LEVEL);
+    esp_err_t err;
+    /* 与独立工程一致：每轮先释放总线，供电脚只在挂载入口配置一次。 */
+    err = float_tf_bus();
     if (err != ESP_OK) return err;
-    err = gpio_config(&power);
+    err = gpio_set_level(BOARD_TF_POWER, !BOARD_TF_POWER_ON_LEVEL);
     if (err != ESP_OK) return err;
-    gpio_config_t unused = {
-        .pin_bit_mask = (1ULL << BOARD_TF_D1) | (1ULL << BOARD_TF_D2) | (1ULL << BOARD_TF_CD),
-        .mode = GPIO_MODE_INPUT,
-    };
-    err = gpio_config(&unused);
-    if (err != ESP_OK) return err;
+    ESP_LOGI(TAG, "TF_POWER 断电：GPIO45=%d，等待 100ms",
+             gpio_get_level(BOARD_TF_POWER));
     vTaskDelay(pdMS_TO_TICKS(100));
-    err = gpio_set_level(BOARD_TF_POWER, BOARD_TF_POWER_ON_LEVEL);
-    if (err != ESP_OK) return err;
-    vTaskDelay(pdMS_TO_TICKS(200));
-    ESP_LOGI(TAG, "SDSPI SPI2: CLK=%d CMD/MOSI=%d D0/MISO=%d D3/CS=%d POWER=%d(active low) CD=%d level=%d",
-             BOARD_TF_CLK, BOARD_TF_MOSI, BOARD_TF_MISO, BOARD_TF_CS,
-             BOARD_TF_POWER, BOARD_TF_CD, gpio_get_level(BOARD_TF_CD));
-    /* CD polarity awaits physical verification: log only, do not gate mount. */
     spi_bus_config_t bus = {
         .mosi_io_num = BOARD_TF_MOSI, .miso_io_num = BOARD_TF_MISO,
         .sclk_io_num = BOARD_TF_CLK, .quadwp_io_num = -1, .quadhd_io_num = -1,
@@ -379,6 +393,19 @@ esp_err_t sd_card_mount(void)
         return err;
     }
     s_bus_owned = true;
+    ESP_LOGI(TAG, "SPI2 已初始化，准备给 TF 卡上电");
+    err = gpio_set_level(BOARD_TF_POWER, BOARD_TF_POWER_ON_LEVEL);
+    if (err != ESP_OK) {
+        release_bus();
+        return err;
+    }
+    ESP_LOGI(TAG, "TF_POWER 上电：GPIO45=%d，等待 200ms",
+             gpio_get_level(BOARD_TF_POWER));
+    vTaskDelay(pdMS_TO_TICKS(200));
+    ESP_LOGI(TAG, "SDSPI SPI2: CLK=%d CMD/MOSI=%d D0/MISO=%d D3/CS=%d POWER=%d(active low) CD=%d level=%d",
+             BOARD_TF_CLK, BOARD_TF_MOSI, BOARD_TF_MISO, BOARD_TF_CS,
+             BOARD_TF_POWER, BOARD_TF_CD, gpio_get_level(BOARD_TF_CD));
+    /* CD 极性尚待实测，只记录电平，不阻止挂载。 */
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
     host.slot = SPI2_HOST;
     /* Keep the 1 MHz diagnostic clock, but use SDSPI_HOST_DEFAULT's timeout
@@ -386,7 +413,8 @@ esp_err_t sd_card_mount(void)
      * to CMD24 when command_timeout_ms remains zero. */
     host.max_freq_khz = 1000;
     s_transaction = host.do_transaction;
-    host.do_transaction = trace_transaction;
+    /* 仅初始化期间记录与独立工程相同的卡命令，成功后恢复正常事务入口。 */
+    host.do_transaction = s_raw_diag_requested ? trace_transaction : mount_trace_transaction;
     sdspi_device_config_t slot = SDSPI_DEVICE_CONFIG_DEFAULT();
     slot.host_id = SPI2_HOST;
     slot.gpio_cs = BOARD_TF_CS;
@@ -398,11 +426,13 @@ esp_err_t sd_card_mount(void)
     if (err != ESP_OK) {
         s_card = NULL;
         ESP_LOGE(TAG, "SDSPI mount failed: %s (no formatting)", esp_err_to_name(err));
-        diagnose_mount_failure_readonly(&slot);
+        /* 卡初始化超时后不重复发送命令，避免干扰下一轮挂载。 */
+        if (err != ESP_ERR_TIMEOUT) diagnose_mount_failure_readonly(&slot);
         esp_err_t cleanup = release_bus();
         if (cleanup != ESP_OK) ESP_LOGE(TAG, "SPI cleanup failed: %s", esp_err_to_name(cleanup));
         return err;
     }
+    if (!s_raw_diag_requested) s_card->host.do_transaction = s_transaction;
     sdmmc_card_print_info(stdout, s_card);
     raw_log_card_identity("MOUNTED_CARD", s_card);
     err = check_read_stability();
@@ -416,6 +446,36 @@ esp_err_t sd_card_mount(void)
     ESP_LOGI(TAG, "SDSPI mounted %s, max clock=%d kHz, host timeout override=%d ms (CMD24 default=5000 ms)",
              SD_CARD_MOUNT_POINT, host.max_freq_khz, host.command_timeout_ms);
     return ESP_OK;
+}
+
+esp_err_t sd_card_mount(void)
+{
+    if (s_card) return ESP_OK;
+    esp_err_t err = gpio_set_level(BOARD_TF_POWER, !BOARD_TF_POWER_ON_LEVEL);
+    if (err != ESP_OK) return err;
+    const gpio_config_t power = {
+        .pin_bit_mask = 1ULL << BOARD_TF_POWER,
+        .mode = GPIO_MODE_INPUT_OUTPUT,
+    };
+    err = gpio_config(&power);
+    if (err != ESP_OK) return err;
+    const gpio_config_t cd = {
+        .pin_bit_mask = 1ULL << BOARD_TF_CD,
+        .mode = GPIO_MODE_INPUT,
+    };
+    err = gpio_config(&cd);
+    if (err != ESP_OK) return err;
+    /* 独立 SDSPI 实测冷启动首轮可能 CMD0 超时，完整断电重试后可识别。 */
+    const int attempts = s_raw_diag_requested ? 1 : 3;
+    for (int attempt = 1; attempt <= attempts; ++attempt) {
+        ESP_LOGI(TAG, "SDSPI 挂载尝试 %d/%d：GPIO45=%d", attempt, attempts,
+                 gpio_get_level(BOARD_TF_POWER));
+        err = sd_card_mount_once();
+        ESP_LOGI(TAG, "SDSPI 挂载尝试 %d/%d 结果=%s GPIO45=%d", attempt, attempts,
+                 esp_err_to_name(err), gpio_get_level(BOARD_TF_POWER));
+        if (err == ESP_OK || err != ESP_ERR_TIMEOUT) break;
+    }
+    return err;
 }
 
 esp_err_t sd_card_unmount(void)
@@ -466,11 +526,6 @@ static esp_err_t raw_stress_write_verify(uint32_t lba, unsigned pass,
     uint32_t expected_hash = 0;
     uint32_t readback_hash = 0;
     uint32_t arg = (s_card->ocr & SD_OCR_SDHC_CAP) ? lba : lba * 512U;
-    uint8_t r1 = 0, token = 0, busy_last_rx = 0;
-    bool r1_seen = false, token_seen = false;
-    int64_t busy_us = 0;
-    esp_err_t busy_result = ESP_ERR_INVALID_STATE;
-    const char *driver_failure = NULL;
     const char *failure = NULL;
     uint32_t cmd13_response = 0;
     bool match = false;
@@ -506,17 +561,13 @@ static esp_err_t raw_stress_write_verify(uint32_t lba, unsigned pass,
         .flags = SCF_CMD_ADTC | SCF_RSP_R1, .timeout_ms = 5000,
     };
     write_err = s_transaction(s_card->host.slot, &cmd);
-    /* 下一条命令会复用驱动的诊断字段，必须在此刻取走 CMD24 现场。 */
-    sdspi_diag_get_last_write(&r1, &r1_seen, &token, &token_seen,
-                              &busy_us, &busy_last_rx, &busy_result, &driver_failure);
-    if (write_err == ESP_OK && (cmd.response[0] & 0xff) == 0 &&
-        r1_seen && r1 == 0 && token_seen && (token & 0x1f) == 0x05 &&
-        busy_result == ESP_OK) {
+    /* 官方驱动已在 CMD24 返回值中检查 R1、数据响应和 Busy 结束状态。 */
+    if (write_err == ESP_OK && cmd.error == ESP_OK && (cmd.response[0] & 0xff) == 0) {
         ++stats->write_ok;
     } else {
         ++stats->write_fail;
     }
-    if (busy_result == ESP_ERR_TIMEOUT) ++stats->busy_timeout;
+    if (write_err == ESP_ERR_TIMEOUT || cmd.error == ESP_ERR_TIMEOUT) ++stats->busy_timeout;
 
     /* CMD24 即使失败，也只做状态和回读诊断，不再发下一笔写命令。 */
     sdmmc_command_t status = {
@@ -540,16 +591,13 @@ static esp_err_t raw_stress_write_verify(uint32_t lba, unsigned pass,
 
     if (stats->write_ok + stats->write_fail == stats->total &&
         write_err == ESP_OK && (cmd.response[0] & 0xff) == 0 &&
-        r1_seen && r1 == 0 && token_seen && (token & 0x1f) == 0x05 &&
-        busy_result == ESP_OK && status_err == ESP_OK && cmd13_response == 0 &&
+        cmd.error == ESP_OK && status_err == ESP_OK && cmd13_response == 0 &&
         read_err == ESP_OK && match) {
         ++stats->verify_ok;
         return ESP_OK;
     }
-    failure = write_err != ESP_OK ? (driver_failure ? driver_failure : "cmd24_error") :
-              !r1_seen || r1 != 0 ? "cmd24_r1" :
-              !token_seen || (token & 0x1f) != 0x05 ? "data_response" :
-              busy_result != ESP_OK ? "busy_error" :
+    failure = write_err != ESP_OK || cmd.error != ESP_OK ? "cmd24_error" :
+              (cmd.response[0] & 0xff) != 0 ? "cmd24_r1" :
               status_err != ESP_OK || cmd13_response != 0 ? "cmd13_error" :
               read_err != ESP_OK ? "after_cmd17" : "memcmp_fail";
 
@@ -565,12 +613,8 @@ failed:
     }
     ESP_LOGE(TAG, "RAW_STRESS_FAIL pass=%u/1000 LBA=%" PRIu32 " failure=%s",
              pass + 1, lba, failure ? failure : "unknown");
-    ESP_LOGE(TAG, "RAW_STRESS_CMD24 arg=0x%08" PRIx32 " ret=%s R1=%s0x%02x"
-             " token=%s0x%02x masked=0x%02x busy=%" PRId64
-             "us busy_result=%s busy_last_rx=0x%02x",
-             arg, esp_err_to_name(write_err), r1_seen ? "" : "UNSEEN:", r1,
-             token_seen ? "" : "UNSEEN:", token, token & 0x1f, busy_us,
-             esp_err_to_name(busy_result), busy_last_rx);
+    ESP_LOGE(TAG, "RAW_STRESS_CMD24 arg=0x%08" PRIx32 " ret=%s cmd_error=%s R1=0x%02" PRIx32,
+             arg, esp_err_to_name(write_err), esp_err_to_name(cmd.error), cmd.response[0] & 0xff);
     ESP_LOGE(TAG, "RAW_STRESS_CMD13 ret=%s R1=0x%02" PRIx32 " R2=0x%02" PRIx32
              " BEFORE_CMD17=%s AFTER_CMD17=%s",
              esp_err_to_name(status_err), cmd13_response & 0xff,
@@ -675,8 +719,6 @@ esp_err_t sd_card_raw_diagnostic(void)
 {
     s_raw_diag_requested = true;
     s_raw_bad_identity_seen = false;
-    sdspi_diag_set_raw_mode(false);
-    sdspi_diag_reset_busy_stats();
     raw_stress_stats_t stats = {0};
     esp_err_t err = ESP_FAIL;
     uint32_t base_lba = 0;
@@ -721,11 +763,6 @@ esp_err_t sd_card_raw_diagnostic(void)
         err = ESP_ERR_INVALID_RESPONSE;
     }
 done:;
-    uint32_t busy_count = 0, busy_bins[7] = {0};
-    int64_t busy_min_us = 0, busy_max_us = 0;
-    uint64_t busy_total_us = 0;
-    sdspi_diag_get_busy_stats(&busy_count, &busy_min_us, &busy_max_us,
-                              &busy_total_us, busy_bins);
     ESP_LOGI(TAG, "RAW_STRESS SUMMARY total=%" PRIu32 " write_ok=%" PRIu32
              " read_ok=%" PRIu32 " verify_ok=%" PRIu32 " write_fail=%" PRIu32
              " busy_timeout=%" PRIu32 " cmd17_timeout=%" PRIu32
@@ -733,13 +770,6 @@ done:;
              stats.total, stats.write_ok, stats.read_ok, stats.verify_ok,
              stats.write_fail, stats.busy_timeout, stats.cmd17_timeout,
              stats.cmd13_error, stats.memcmp_fail, esp_err_to_name(err));
-    ESP_LOGI(TAG, "RAW_STRESS BUSY count=%" PRIu32 " min=%" PRId64 "us max=%" PRId64
-             "us avg=%" PRIu64 "us bins_<1ms/1-5/5-20/20-100/100-500/500-1000/>=1000ms="
-             "%" PRIu32 "/%" PRIu32 "/%" PRIu32 "/%" PRIu32 "/%" PRIu32 "/%" PRIu32 "/%" PRIu32,
-             busy_count, busy_min_us, busy_max_us,
-             busy_count ? busy_total_us / busy_count : 0,
-             busy_bins[0], busy_bins[1], busy_bins[2], busy_bins[3],
-             busy_bins[4], busy_bins[5], busy_bins[6]);
     esp_err_t unmount_err = sd_card_unmount();
     s_raw_diag_requested = false;
     if (err == ESP_OK) err = unmount_err;

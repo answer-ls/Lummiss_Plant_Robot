@@ -1,0 +1,7 @@
+/build*/
+/managed_components/
+/dependencies.lock
+/sdkconfig
+/sdkconfig.hosted
+/sdkconfig.hosted.v2
+/sdkconfig.old

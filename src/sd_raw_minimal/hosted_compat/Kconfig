@@ -1,0 +1,3 @@
+# Wi-Fi Remote 2.7.4 只有 5.5 入口，IDF 5.5.5 的补丁版本名未命中。
+# 仅在 Hosted A/B 构建中引入与主工程相同的 5.5 配置定义。
+rsource "../../demo/managed_components/espressif__esp_wifi_remote/Kconfig.idf_v5.5.in"

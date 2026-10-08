@@ -1,0 +1,22 @@
+{
+  "repository": "waveshareteam/ESP32-P4-WIFI6-Touch-LCD-4B",
+  "commit": "5a7a9a2823d77983c15b44a72934a7699e5d2d8b",
+  "path": "firmware/brookesia/components/XiaozhiApp",
+  "sha256": {
+    "Kconfig": "332e10b33360858d4d46588bce342bf5f45fe902e28ff543fda31b96b4b92261",
+    "XiaozhiActivationClient.cpp": "5bd13b4ec212556b274d573890844d4bdc069e63d120f5ca6c8e0e65912ac083",
+    "XiaozhiActivationClient.hpp": "5ceeaac00ee589394218967faeb14d0c525b3cff07225821060a17c3b2ec3c02",
+    "XiaozhiActivationPrompt.cpp": "94013953790131d497a087a8998c1a18589a736f14203f21332cc8eea48b4920",
+    "XiaozhiActivationPrompt.hpp": "13e79ba0535b323e4d8ff5ffe5fa908ad4fdc9dbfee9172f4013bde58b7385aa",
+    "XiaozhiApp.cpp": "82fb980aa28bc1fc433df8e87bef1294ba3ca3f4bab90f6276e229d39fbd221b",
+    "XiaozhiApp.hpp": "5cf00a20576d6923e559215945c9a1deeeb964e5cb331abb2a1d98746b262ae0",
+    "XiaozhiAudioProcessor.cpp": "e6586db5c254a8205a92586ca0e15e3a54b7c3fd36fdcf88fb0297c05ce20360",
+    "XiaozhiAudioProcessor.hpp": "86cc6b373baf064f80c00d98198e0e3199ca43b6c09d11ee002bee851bfb1073",
+    "XiaozhiClient.cpp": "0396a70e8dacf32bddd2c5f839392fa30bab26f93ce48c5dd9ff73d138f530d2",
+    "XiaozhiClient.hpp": "759fc5c3a18b244ce79cf3f4ca569928a94357acb4dcb43edd94af299ee8d53f",
+    "XiaozhiDeveloperTools.cpp": "4b4e764790b90f5c6183868d4b4434bd9d17c12418d5af83b9de956054a2e32e",
+    "XiaozhiDeveloperTools.hpp": "7362a4d424a78105c58b9f40d5845b853ee21eeac35056ab8b1e5b344b774740",
+    "XiaozhiLocalization.cpp": "3f6daffa4e35201a4a4f44c332c5097bd228048cb7ca6450d38841051007c155",
+    "XiaozhiLocalization.hpp": "249e5b56f6b6edb687bb8c306bad36dab75dbde10b8bf72219931c876f9ef1b5"
+  }
+}

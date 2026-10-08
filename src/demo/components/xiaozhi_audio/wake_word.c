@@ -1,5 +1,4 @@
 #include "wake_word.h"
-#include "audio_probe.h"
 #include "mem_contig.h"
 
 #include <string.h>
@@ -26,7 +25,8 @@ static const char *TAG = "WAKE_WORD";
 #define WAKE_PREROLL_SAMPLE_RATE 16000U
 #define WAKE_PREROLL_SECONDS     2U
 #define WAKE_PREROLL_SAMPLES     (WAKE_PREROLL_SAMPLE_RATE * WAKE_PREROLL_SECONDS)
-#define AFE_OUTPUT_BYTES (4U * 960U * sizeof(int16_t))
+#define AFE_OUTPUT_FRAME_BYTES (960U * sizeof(int16_t))
+#define AFE_OUTPUT_BYTES (40U * AFE_OUTPUT_FRAME_BYTES)
 
 typedef struct {
     int channels;
@@ -72,6 +72,7 @@ typedef struct {
     StreamBufferHandle_t output_stream;
     StaticStreamBuffer_t output_stream_control;
     uint8_t *output_storage;
+    uint8_t *output_drop_storage;
     bool uplink_enabled;
     uint32_t output_generation;
     uint32_t wake_generation;
@@ -238,8 +239,14 @@ static void handle_voice_result(wake_word_ctx_t *ctx, const afe_fetch_result_t *
 
     xSemaphoreTake(ctx->output_lock, portMAX_DELAY);
     if (ctx->uplink_enabled && output_generation == ctx->output_generation) {
-        /* 输出缓冲在 PSRAM，满时明确报错，不能阻塞 fetch 导致采集停顿。 */
+        /* 与参考工程一致：缓冲满时丢弃最旧的 60ms 帧，保留最新语音。 */
         const size_t bytes = afe_result->data_size;
+        while (xStreamBufferSpacesAvailable(ctx->output_stream) < bytes &&
+               xStreamBufferBytesAvailable(ctx->output_stream) >= AFE_OUTPUT_FRAME_BYTES) {
+            xStreamBufferReceive(ctx->output_stream, ctx->output_drop_storage,
+                                 AFE_OUTPUT_FRAME_BYTES, 0);
+            stats_inc(&ctx->output_drop);
+        }
         if (xStreamBufferSpacesAvailable(ctx->output_stream) >= bytes) {
             xStreamBufferSend(ctx->output_stream, afe_result->data, bytes, 0);
             __atomic_add_fetch(&ctx->output_samples, bytes / sizeof(int16_t), __ATOMIC_RELAXED);
@@ -313,7 +320,6 @@ static void detection_task(void *arg)
         while (peak > previous && !__atomic_compare_exchange_n(
                    &ctx->processed_peak, &previous, peak, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
         __atomic_add_fetch(&ctx->processed_samples, samples, __ATOMIC_RELAXED);
-        audio_probe_afe(afe_result->data, (size_t)afe_result->data_size);
         handle_voice_result(ctx, afe_result, output_generation);
 
         if (!detecting || requested != __atomic_load_n(&ctx->wake_generation, __ATOMIC_ACQUIRE)) {
@@ -486,11 +492,14 @@ esp_err_t wake_word_init(int channels)
     s_ww.event_group = xEventGroupCreate();
     s_ww.output_lock = xSemaphoreCreateMutex();
     s_ww.output_storage = heap_caps_malloc(AFE_OUTPUT_BYTES + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_ww.output_drop_storage = heap_caps_malloc(
+        AFE_OUTPUT_FRAME_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (s_ww.output_storage != NULL) {
         s_ww.output_stream = xStreamBufferCreateStatic(
             AFE_OUTPUT_BYTES + 1, 1, s_ww.output_storage, &s_ww.output_stream_control);
     }
-    if (s_ww.event_group == NULL || s_ww.output_lock == NULL || s_ww.output_stream == NULL) {
+    if (s_ww.event_group == NULL || s_ww.output_lock == NULL ||
+        s_ww.output_stream == NULL || s_ww.output_drop_storage == NULL) {
         ESP_LOGE(TAG, "创建事件组失败");
         wake_word_deinit();
         return ESP_ERR_NO_MEM;
@@ -730,6 +739,8 @@ static void wake_word_deinit_internal(void)
     }
     heap_caps_free(s_ww.output_storage);
     s_ww.output_storage = NULL;
+    heap_caps_free(s_ww.output_drop_storage);
+    s_ww.output_drop_storage = NULL;
     if (s_ww.output_lock != NULL) {
         vSemaphoreDelete(s_ww.output_lock);
         s_ww.output_lock = NULL;
