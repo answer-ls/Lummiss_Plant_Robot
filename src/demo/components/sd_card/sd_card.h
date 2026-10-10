@@ -31,6 +31,8 @@ esp_err_t sd_card_mount(void);
 esp_err_t sd_card_unmount(void);
 
 bool sd_card_is_mounted(void);
+/* 只读检查挂载后的扇区 0，用于定位屏幕启动前后的读卡状态。 */
+esp_err_t sd_card_probe_sector0(const char *stage);
 /* First low-level write error since mounting; retained across unmount for tests. */
 esp_err_t sd_card_get_write_error(void);
 

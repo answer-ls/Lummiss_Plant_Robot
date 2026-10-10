@@ -4,4 +4,4 @@ idf_component_register(
     # stepper_motor / ambient_led 是 MCP 工具的实际执行者。
     # mcp_registry 是工具/能力登记处（tools/list、tools/call、
     # capability_manifest 三方同源）。不再依赖 ota_client（清单宏已废止）。
-    REQUIRES mqtt mbedtls json esp_timer mcp_registry board stepper_motor ambient_led camera_photo webrtc_whip video_streamer)
+    REQUIRES mqtt mbedtls json esp_timer mcp_registry board stepper_motor ambient_led camera_photo webrtc_whip video_streamer alert_clip)

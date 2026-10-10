@@ -26,7 +26,7 @@
  * 8 = UVC/USB Host + JPEG 解码/YUV 转换，不启动 H.264/WiFi/WebSocket/UI/SD
  * 9 = UI/LCD + 按键/限位/TTP223 + 本地麦克风/扬声器自检，
  *     不启动 UVC/WiFi/WebSocket/SD/小智/天气
- * 10 = SD卡独立测试；新PCB走官方 SDSPI 只读对照，旧板保留原测试
+ * 10 = GPIO47 低电平读表情文件，10 秒后拉高重读并在屏幕轮播表情
  * 11 = 仅测试ESP-Hosted/C6 WiFi连接与DHCP，不访问SD卡
  */
 #define CAMERA_TEST_FULL                   0
@@ -39,24 +39,19 @@
 #define CAMERA_TEST_UVC_JPEG_ONLY          7
 #define CAMERA_TEST_UVC_YUV_ONLY           8
 #define CAMERA_TEST_PERIPH_ONLY            9
-#define CAMERA_TEST_SD_ONLY               10
+#define CAMERA_TEST_SD_ONLY               10    // GPIO47 读卡对照与屏幕表情轮播
 #define CAMERA_TEST_WIFI_ONLY             11
 #define CAMERA_TEST_STEPPER_ONLY          12  /* 仅电机循环两圈往返自检 */
 #define CAMERA_TEST_AUDIO_RAW             13  /* ES7210 四槽原始采集 */
+#define CAMERA_TEST_ALERT_ONLY            14  /* UVC + YOLO + MQTT 人体预警上报 */
 
-/* ← 改这一行切换档位。当前运行 SD 卡独立测试。 */
+/* ← 改这一行切换档位。 */
 #define CAMERA_TEST_PROFILE                CAMERA_TEST_FULL
 
 /* 完整系统欠压排查：分阶段启动并在各阶段保持一段时间观察。
  * 只延后后续模块启动，不禁用欠压保护，也不更改各驱动的工作参数。 */
 #define FULL_POWER_DIAG_HOLD_MS             3000
-/* SD故障定位期间暂停后续WiFi测试；置1恢复顺序联网测试。 */
-#define SD_TEST_WIFI_ENABLED               0
-
-/* 视频链路隔离测试：0 只关闭本地 YOLO 模型加载和 AI 抽帧。
- * UVC、JPEG/YUV/H.264、WHIP、音频和 UI 仍按完整系统档位运行。
- * 当前 YOLO 预处理仅适配 640×480；720p 视频联调期间保持为 0，
- * 后续适配 720p 输入后才能恢复人体检测。 */
+/* 本地人体检测：当前 1280×720 MJPEG 会缩放补边后交给 YOLO11n。 */
 #define CAMERA_PERSON_DETECT_ENABLED       0
 
 /* UVC 丢包诊断：完整系统启动时自动打开摄像头并持续收帧，
@@ -107,11 +102,13 @@
 #elif CAMERA_TEST_PROFILE == CAMERA_TEST_UVC_UI_SD_WIFI_VIDEO
 #  define TP_BITS (TP_UVC | TP_HANDOFF | TP_UI | TP_SD | TP_WIFI)
 #elif CAMERA_TEST_PROFILE == CAMERA_TEST_SD_ONLY
-#  define TP_BITS (TP_SD | (SD_TEST_WIFI_ENABLED ? TP_WIFI : 0))
+#  define TP_BITS (TP_UI | TP_SD)
 #elif CAMERA_TEST_PROFILE == CAMERA_TEST_STEPPER_ONLY || CAMERA_TEST_PROFILE == CAMERA_TEST_AUDIO_RAW
 #  define TP_BITS (0)
 #elif CAMERA_TEST_PROFILE == CAMERA_TEST_WIFI_ONLY
 #  define TP_BITS (TP_WIFI)
+#elif CAMERA_TEST_PROFILE == CAMERA_TEST_ALERT_ONLY
+#  define TP_BITS (TP_UVC | TP_HANDOFF | TP_SD | TP_WIFI)
 #elif CAMERA_TEST_PROFILE == CAMERA_TEST_PERIPH_ONLY
 #  define TP_BITS (TP_UI | TP_PERIPH)
 #elif CAMERA_TEST_PROFILE == CAMERA_TEST_UVC_H264_ONLY || \
@@ -136,12 +133,10 @@ static inline const char *test_profile_name(void)
     return "仅步进电机：正反各两圈，每轮间隔10秒";
 #elif CAMERA_TEST_PROFILE == CAMERA_TEST_WIFI_ONLY
     return "仅WiFi连接/DHCP（不访问SD卡）";
+#elif CAMERA_TEST_PROFILE == CAMERA_TEST_ALERT_ONLY
+    return "UVC + YOLO + 20秒H264预警片段 + TF/HTTPS（无 UI/音频/天气）";
 #elif CAMERA_TEST_PROFILE == CAMERA_TEST_SD_ONLY
-#if BOARD_USE_NEW_PCB
-    return "官方 SDSPI SPI2 三轮只读挂载测试";
-#else
-    return SD_TEST_WIFI_ENABLED ? "SD卡raw CMD24 + WiFi连接测试" : "SD卡raw 1000次写读压力测试";
-#endif
+    return "GPIO47 低/高电平读卡对照后轮播表情（无摄像头/WiFi）";
 #elif CAMERA_TEST_PROFILE == CAMERA_TEST_FULL
     return "完整系统";
 #elif CAMERA_TEST_PROFILE == CAMERA_TEST_UVC_ONLY

@@ -115,6 +115,9 @@ typedef struct {
  * PC 端不需要在连接建立时协商几何参数。 */
 esp_err_t video_streamer_init(const video_streamer_config_t *config);
 
+/* 预警测试：本地持续编码，编码输出交给 PSRAM 片段缓冲，不启动实时预览。 */
+void video_streamer_set_alert_capture_mode(bool enabled);
+
 /* 如果在 video_streamer_init 之前调用，会在 WebSocket 上传任务启动时使用该配置。
  * 正式链路只接受 OTA 返回的 WSS 地址和动态 Token；未配置时不建立连接。
  * 典型用法：main.c 在 OTA 完成后调用此函数，再启动摄像头任务。 */

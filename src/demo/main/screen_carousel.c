@@ -1,6 +1,7 @@
 #include "screen_carousel.h"
 
 #include <dirent.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -16,6 +17,7 @@
 #include "lvgl.h"
 
 #include "sd_card.h"
+#include "test_profile.h"
 
 static const char *TAG = "CAROUSEL";
 
@@ -25,7 +27,6 @@ static const char *TAG = "CAROUSEL";
 #define CAROUSEL_SLOT_MS          5000
 #define CAROUSEL_TIMER_PERIOD_MS  50
 #define CAROUSEL_DIR_PRIMARY      SD_CARD_MOUNT_POINT "/expressions"
-#define CAROUSEL_DIR_FALLBACK     SD_CARD_MOUNT_POINT
 #define CAROUSEL_MAX_ANIMATIONS   64
 #define CAROUSEL_PATH_MAX         128
 
@@ -81,12 +82,13 @@ static void sort_animation_paths(void)
     }
 }
 
-static void collect_animations_from(const char *directory)
+static bool collect_animations_from(const char *directory)
 {
     DIR *handle = opendir(directory);
     if (handle == NULL) {
-        ESP_LOGW(TAG, "打不开目录 %s", directory);
-        return;
+        ESP_LOGE(TAG, "打开目录失败：%s errno=%d (%s)", directory,
+                 errno, strerror(errno));
+        return false;
     }
 
     struct dirent *entry;
@@ -109,16 +111,15 @@ static void collect_animations_from(const char *directory)
         s_animation_count++;
     }
     closedir(handle);
+    return true;
 }
 
-static void collect_animations(void)
+static bool collect_animations(void)
 {
     s_animation_count = 0;
-    collect_animations_from(CAROUSEL_DIR_PRIMARY);
-    if (s_animation_count == 0) {
-        collect_animations_from(CAROUSEL_DIR_FALLBACK);
-    }
+    if (!collect_animations_from(CAROUSEL_DIR_PRIMARY)) return false;
     sort_animation_paths();
+    return true;
 }
 
 static void load_home_after_error(esp_err_t error)
@@ -172,9 +173,13 @@ static void carousel_timer_cb(lv_timer_t *timer)
         s_next_animation++;
         if (s_next_animation >= s_animation_count) {
             s_next_animation = 0;
+#if CAMERA_TEST_PROFILE == CAMERA_TEST_SD_ONLY
+            start_animation(s_next_animation);
+#else
             lv_scr_load(s_home_screen);
             s_showing_home = true;
             ESP_LOGI(TAG, "一轮表情完成，返回天气首页");
+#endif
         } else {
             start_animation(s_next_animation);
         }
@@ -205,10 +210,13 @@ static void carousel_task(void *arg)
         return;
     }
 
-    collect_animations();
+    if (!collect_animations()) {
+        vTaskDelete(NULL);
+        return;
+    }
     if (s_animation_count == 0) {
-        ESP_LOGE(TAG, "%s 和 %s 下都没有 .bin 文件，屏幕停在天气首页",
-                 CAROUSEL_DIR_PRIMARY, CAROUSEL_DIR_FALLBACK);
+        ESP_LOGE(TAG, "%s 下没有 .bin 文件，屏幕保持首页",
+                 CAROUSEL_DIR_PRIMARY);
         vTaskDelete(NULL);
         return;
     }
@@ -223,6 +231,11 @@ static void carousel_task(void *arg)
         if (s_carousel_timer == NULL) {
             error = ESP_ERR_NO_MEM;
         }
+#if CAMERA_TEST_PROFILE == CAMERA_TEST_SD_ONLY
+        if (error == ESP_OK) {
+            start_animation(0);
+        }
+#endif
     }
     lvgl_port_unlock();
 
@@ -232,9 +245,8 @@ static void carousel_task(void *arg)
         return;
     }
 
-    ESP_LOGI(TAG,
-             "找到 %u 个 LUM1 BIN：天气首页 %d ms → 每个表情 %d ms → 回到首页",
-             (unsigned)s_animation_count, CAROUSEL_SLOT_MS, CAROUSEL_SLOT_MS);
+    ESP_LOGI(TAG, "找到 %u 个 LUM1 BIN，每个表情显示 %d ms",
+             (unsigned)s_animation_count, CAROUSEL_SLOT_MS);
     vTaskDelete(NULL);
 }
 

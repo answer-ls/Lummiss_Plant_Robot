@@ -408,9 +408,7 @@ static esp_err_t sd_card_mount_once(void)
     /* CD 极性尚待实测，只记录电平，不阻止挂载。 */
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
     host.slot = SPI2_HOST;
-    /* Keep the 1 MHz diagnostic clock, but use SDSPI_HOST_DEFAULT's timeout
-     * policy as in the bundled SDSPI examples. sdmmc_cmd.c assigns 5000 ms
-     * to CMD24 when command_timeout_ms remains zero. */
+    /* GPIO47 低/高电平对照使用 1 MHz；保持默认命令超时策略。 */
     host.max_freq_khz = 1000;
     s_transaction = host.do_transaction;
     /* 仅初始化期间记录与独立工程相同的卡命令，成功后恢复正常事务入口。 */
@@ -491,6 +489,19 @@ esp_err_t sd_card_unmount(void)
 }
 
 bool sd_card_is_mounted(void) { return s_card != NULL; }
+
+esp_err_t sd_card_probe_sector0(const char *stage)
+{
+    if (s_card == NULL) return ESP_ERR_INVALID_STATE;
+    uint8_t sector[512];
+    const int64_t started = esp_timer_get_time();
+    const esp_err_t err = sdmmc_read_sectors(s_card, sector, 0, 1);
+    ESP_LOGI(TAG, "READ_PROBE stage=%s result=%s elapsed_us=%lld TF_POWER=%d LCD_BL=%d PWR_IO=%d",
+             stage, esp_err_to_name(err), (long long)(esp_timer_get_time() - started),
+             gpio_get_level(BOARD_TF_POWER), gpio_get_level(BOARD_LCD_BL),
+             gpio_get_level(BOARD_PWR_IO));
+    return err;
+}
 
 static void raw_log_edge_bytes(const char *stage, const uint8_t *data)
 {

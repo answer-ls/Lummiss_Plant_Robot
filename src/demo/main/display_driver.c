@@ -32,6 +32,9 @@ static const char *TAG = "DISPLAY";
 
 static bool s_binding_required;
 static char s_binding_code[7];
+static lv_obj_t *s_provisioning_panel;
+static bool s_lvgl_ready;
+static void create_binding_screen(void);
 
 void display_driver_set_binding_code(const char *code)
 {
@@ -43,6 +46,10 @@ void display_driver_set_binding_code(const char *code)
         if (code[i] < '0' || code[i] > '9') return;
     }
     memcpy(s_binding_code, code, sizeof(s_binding_code));
+    if (s_lvgl_ready && lvgl_port_lock(1000)) {
+        create_binding_screen();
+        lvgl_port_unlock();
+    }
 }
 
 
@@ -84,7 +91,6 @@ static lv_obj_t *s_time_label;
 static lv_obj_t *s_weather_dot;
 static lv_obj_t *s_battery_label;
 static lv_obj_t *s_battery_fill;
-static bool s_lvgl_ready;
 static bool s_rtc_hold_lcd;
 /* 仅 LVGL 线程访问：内容变更事件允许一次刷新，其余 RTC 刷新跳过。 */
 static bool s_rtc_event_flush;
@@ -210,6 +216,12 @@ static void lcd_gpio_spi_fill_test(void)
 static void lcd_initialize(esp_lcd_panel_io_handle_t *out_io,
                            esp_lcd_panel_handle_t *out_panel)
 {
+#if CAMERA_TEST_PROFILE == CAMERA_TEST_SD_ONLY
+    /* 读卡对照时保持背光关闭，主测试流程随后拉高 GPIO47 显示表情。 */
+    const int backlight_level = 0;
+#else
+    const int backlight_level = BOARD_LCD_BL_ON_LEVEL;
+#endif
     const gpio_config_t backlight_config = {
         .pin_bit_mask = 1ULL << LCD_PIN_BL,
         /* 同时打开输入通路，档位 9 才能读取背光引脚的实际物理电平。 */
@@ -219,9 +231,7 @@ static void lcd_initialize(esp_lcd_panel_io_handle_t *out_io,
         .intr_type = GPIO_INTR_DISABLE,
     };
     ESP_ERROR_CHECK(gpio_config(&backlight_config));
-    /* 新 PCB 首板诊断期间背光从板级早期初始化开始一直保持高电平，
-     * LCD 初始化过程也不得拉低 GPIO47。 */
-    ESP_ERROR_CHECK(gpio_set_level(LCD_PIN_BL, 1));
+    ESP_ERROR_CHECK(gpio_set_level(LCD_PIN_BL, backlight_level));
 
 #if CAMERA_TEST_PROFILE == CAMERA_TEST_PERIPH_ONLY
     /* PWR_IO 刚接管整板电源时，给新 PCB 的 LCD 电源和复位 RC 留出稳定时间。 */
@@ -271,13 +281,12 @@ static void lcd_initialize(esp_lcd_panel_io_handle_t *out_io,
     ESP_ERROR_CHECK(esp_lcd_panel_invert_color(*out_panel, true));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(*out_panel, true));
     vTaskDelay(pdMS_TO_TICKS(20));
-    ESP_ERROR_CHECK(gpio_set_level(LCD_PIN_BL, 1));
 
     ESP_LOGI(TAG,
              "LCD GPIO 回读：RST=%d DC=%d CS=%d BL=%d（期望 BL_ON=%d）",
              gpio_get_level(LCD_PIN_RST), gpio_get_level(LCD_PIN_DC),
              gpio_get_level(LCD_PIN_CS), gpio_get_level(LCD_PIN_BL),
-             BOARD_LCD_BL_ON_LEVEL);
+             backlight_level);
 #if BOARD_HAS_PWR_IO
     ESP_LOGI(TAG, "LCD 供电保持回读：PWR_IO(GPIO%d)=%d",
              BOARD_PWR_IO, gpio_get_level(BOARD_PWR_IO));
@@ -610,6 +619,83 @@ static void create_binding_screen(void)
         "请在应用中输入绑定码\n绑定完成后请重启设备" :
         "未获取到有效绑定码\n请检查网络后重启设备");
     ESP_LOGI(TAG, "绑定页面已显示：六位绑定码%s", s_binding_code[0] ? "有效" : "缺失或格式错误");
+}
+
+void display_driver_show_provisioning(const char *name, const char *username,
+                                      const char *pop)
+{
+    if (!s_lvgl_ready || !lvgl_port_lock(1000)) return;
+    if (s_provisioning_panel != NULL) {
+        lv_obj_del(s_provisioning_panel);
+    }
+    s_provisioning_panel = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(s_provisioning_panel);
+    lv_obj_set_size(s_provisioning_panel, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_style_bg_color(s_provisioning_panel, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_provisioning_panel, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(s_provisioning_panel, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* 与配网管理器打印的官方 App 数据保持同一字段和取值。 */
+    char qr_data[160];
+    const int qr_len = snprintf(qr_data, sizeof(qr_data),
+                                "{\"ver\":\"v1\",\"name\":\"%s\","
+                                "\"username\":\"%s\",\"pop\":\"%s\","
+                                "\"transport\":\"ble\",\"network\":\"wifi\"}",
+                                name ? name : "", username ? username : "",
+                                pop ? pop : "");
+    if (qr_len > 0 && (size_t)qr_len < sizeof(qr_data)) {
+        lv_obj_t *qr_bg = lv_obj_create(s_provisioning_panel);
+        lv_obj_remove_style_all(qr_bg);
+        lv_obj_set_pos(qr_bg, 4, 32);
+        lv_obj_set_size(qr_bg, 196, 196);
+        lv_obj_set_style_bg_color(qr_bg, lv_color_white(), 0);
+        lv_obj_set_style_bg_opa(qr_bg, LV_OPA_COVER, 0);
+        lv_obj_t *qr = lv_qrcode_create(s_provisioning_panel, 176,
+                                         lv_color_black(), lv_color_white());
+        lv_obj_set_pos(qr, 14, 42);
+        if (lv_qrcode_update(qr, qr_data, qr_len) != LV_RES_OK) {
+            ESP_LOGE(TAG, "BLE 配网二维码生成失败");
+            lv_obj_del(qr);
+            lv_obj_del(qr_bg);
+        }
+    } else {
+        ESP_LOGE(TAG, "BLE 配网二维码数据过长");
+    }
+
+    lv_obj_t *label = create_label(s_provisioning_panel, &lv_font_lummiss_binding_16,
+                                   204, 12, 112, 28);
+    lv_label_set_text(label, "蓝牙配网");
+    label = create_label(s_provisioning_panel, &lv_font_lummiss_binding_16,
+                         204, 48, 112, 22);
+    lv_label_set_text(label, "设备名称");
+    label = create_label(s_provisioning_panel, &lv_font_montserrat_14,
+                         204, 70, 112, 44);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(label, name ? name : "");
+    label = create_label(s_provisioning_panel, &lv_font_lummiss_binding_16,
+                         204, 118, 112, 22);
+    lv_label_set_text(label, "用户名");
+    label = create_label(s_provisioning_panel, &lv_font_montserrat_16,
+                         204, 140, 112, 30);
+    lv_label_set_text(label, username ? username : "");
+    label = create_label(s_provisioning_panel, &lv_font_lummiss_binding_16,
+                         204, 174, 112, 22);
+    lv_label_set_text(label, "配网口令 PoP");
+    label = create_label(s_provisioning_panel, &lv_font_montserrat_16,
+                         204, 196, 112, 30);
+    lv_label_set_text(label, pop ? pop : "");
+    lvgl_port_unlock();
+    ESP_LOGI(TAG, "BLE 配网页面已显示");
+}
+
+void display_driver_hide_provisioning(void)
+{
+    if (!s_lvgl_ready || !lvgl_port_lock(1000)) return;
+    if (s_provisioning_panel != NULL) {
+        lv_obj_del(s_provisioning_panel);
+        s_provisioning_panel = NULL;
+    }
+    lvgl_port_unlock();
 }
 
 void display_driver_start(void)

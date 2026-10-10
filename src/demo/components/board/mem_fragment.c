@@ -165,9 +165,11 @@ static void focused_report(void)
     for (size_t i = 0; i < s_count; ++i) {
         const block_t *b = &s_blocks[i];
         if (b->start == 0x4ff861c0U) { s_target_start = b->start; break; }
-        /* 当前200000字节独立reserve；链接起点变化时按实际region长度选择。
+        /* 按当前配置的独立 reserve 大小匹配；链接起点变化时按 region 长度选择。
          * 若reserve拆成多区而无法匹配，宁可报未找到，不猜其他heap。 */
-        if (b->end - b->start == 199999U) s_target_start = b->start;
+        if (b->end - b->start == CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL - 1U) {
+            s_target_start = b->start;
+        }
     }
     ESP_LOGI("FRAG", "FOCUSED_REGION start=%08x found=%d", (unsigned)s_target_start, s_target_start != 0);
     largest_neighbors();

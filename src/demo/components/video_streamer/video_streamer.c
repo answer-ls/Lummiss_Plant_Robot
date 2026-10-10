@@ -31,6 +31,7 @@
 #include "esp_crt_bundle.h"
 #include "network_manager.h"
 #include "webrtc_whip.h"
+#include "alert_clip.h"
 
 static const char *TAG = "VIDEO_STREAM";
 /* 独立 DMA2D 转换保持关闭；本轮只比较 JPEG 解码器内置 RX CSC。 */
@@ -369,6 +370,7 @@ static video_stream_stats_t s_stats;
 static int64_t s_next_submit_us;
 static uint32_t s_next_sequence;
 static bool s_initialized;
+static bool s_alert_capture_mode;
 /* 上传门控。默认关闭：开机后只跑 WebSocket 控制通道，
  * 必须等服务端下发 VIDEO_START 才开始编码上传。 */
 static bool s_stream_enabled = false;
@@ -1000,6 +1002,11 @@ unlock:
         xSemaphoreGive(s_ctrl_mutex);
     }
     return result;
+}
+
+void video_streamer_set_alert_capture_mode(bool enabled)
+{
+    s_alert_capture_mode = enabled;
 }
 
 void video_streamer_force_idr(void)
@@ -2624,6 +2631,11 @@ static void video_codec_task(void *arg)
         portEXIT_CRITICAL(&s_lock);
 
         if (encode_error == ESP_H264_ERR_OK && output_frame.length > 0) {
+            if (s_alert_capture_mode) {
+                alert_clip_push_h264(output_frame.raw_data.buffer,
+                                     output_frame.length,
+                                     output_frame.frame_type == ESP_H264_FRAME_TYPE_IDR);
+            }
             /* 先补齐帧头再入队：上传任务拿到槽时整条消息已经完整。 */
             video_ws_frame_header_fill(out_slot->data + VIDEO_WS_FRAME_HEADER_OFFSET,
                                        sequence, output_frame.frame_type);
@@ -2961,13 +2973,16 @@ static bool video_streamer_submit_jpeg_internal(
 
 #if !VIDEO_STREAM_CODEC_ONLY_TEST && !VIDEO_STREAM_JPEG_ONLY_TEST && !VIDEO_STREAM_YUV_ONLY_TEST
 #if defined(CONFIG_CLOUD_PROTOCOL_V3)
-    if (webrtc_whip_get_state() != WEBRTC_WHIP_STREAMING ||
-        !network_manager_is_connected()) {
+    /* 预警片段需要持续本地编码；RTC 未开始推流时仍接收摄像头帧。 */
+    if (!s_alert_capture_mode &&
+        (webrtc_whip_get_state() != WEBRTC_WHIP_STREAMING ||
+         !network_manager_is_connected())) {
         return false;
     }
 #else
-    if (!__atomic_load_n(&s_ws_connected, __ATOMIC_SEQ_CST) ||
-        !network_manager_is_connected()) {
+    if (!s_alert_capture_mode &&
+        (!__atomic_load_n(&s_ws_connected, __ATOMIC_SEQ_CST) ||
+         !network_manager_is_connected())) {
         return false;
     }
 #endif

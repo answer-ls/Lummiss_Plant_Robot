@@ -15,4 +15,4 @@ idf_component_register(
     # 注意：机械按键组件必须叫 mech_button，不能叫 button —— espressif__esp_lvgl_port
     # 会用 "button" 这个名字去探测 espressif/button(iot_button)，重名会把它的
     # esp_lvgl_port_button.c 拉进编译并链到我们这条库上，导致整片未定义符号。
-    REQUIRES board battery_monitor stepper_motor video_streamer webrtc_whip person_detect camera_photo network home_info sd_card anim_bin_player xiaozhi_audio usb esp_timer usb_host_uvc esp_lcd esp_driver_spi esp_lvgl_port lvgl__lvgl device_identity ota_client mech_button touch_key ambient_led cloud_mqtt cloud_udp esp_netif json mcp_registry esp_hosted)
+    REQUIRES board battery_monitor stepper_motor video_streamer webrtc_whip person_detect camera_photo network provisioning home_info sd_card alert_clip anim_bin_player xiaozhi_audio usb esp_timer usb_host_uvc esp_lcd esp_driver_spi esp_lvgl_port lvgl__lvgl device_identity ota_client mech_button touch_key ambient_led cloud_mqtt cloud_udp esp_netif json mcp_registry esp_hosted)

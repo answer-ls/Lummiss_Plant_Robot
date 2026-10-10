@@ -22,9 +22,9 @@ CONFIG_NETWORK_PROV_BLE_SEC_CONN=y
 # revalidated with matching Host/Slave versions.
 CONFIG_NETWORK_PROV_KEEP_BLE_ON_AFTER_PROV=y
 CONFIG_NETWORK_PROV_DISCONNECT_AFTER_PROV=y
-# 当前烧录目标为 ESP32-P4 v1.3；IDF 的 v1.x 与 v3.x 固件分支互斥。
-CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
-CONFIG_ESP32P4_REV_MIN_100=y
+# 当前烧录目标为 ESP32-P4 v3.2；IDF v5.5.5 最低版本选 v3.1，覆盖 v3.2。
+# CONFIG_ESP32P4_SELECTS_REV_LESS_V3 is not set
+CONFIG_ESP32P4_REV_MIN_301=y
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
@@ -39,7 +39,9 @@ CONFIG_SPIRAM_XIP_FROM_PSRAM=y
 CONFIG_CACHE_L2_CACHE_256KB=y
 CONFIG_CACHE_L2_CACHE_LINE_128B=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0
-CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=200000
+# 当前固件启用人体检测后，启动期已无法预留 200000 字节；
+# 保留 160000 字节内部 DMA 池，同时给 ESP-Hosted 等启动分配留出余量。
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=160000
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 
 # 完整系统运行时内部 RAM 最大连续块可能只有约 8 KB；TLS 握手与 16 KB
@@ -54,13 +56,11 @@ CONFIG_ESP_WS_CLIENT_TX_LOCK_TIMEOUT_MS=2000
 # 避免 USB HCD 在另一核等待缓存锁时长时间无法服务 ISOC。
 CONFIG_ESP_MM_CACHE_MSYNC_C2M_CHUNKED_OPS=y
 CONFIG_ESP_MM_CACHE_MSYNC_C2M_CHUNKED_OPS_MAX_LEN=0x4000
-# USB-DWC 内部 DMA 可访问 PSRAM：让 UVC 收流的 URB 数据缓冲落 PSRAM。
-# 必须落 PSRAM：8 x 18432 B = 144 KiB，而内部 DMA 池只有 146 KiB
-# （见启动日志 "Reserving pool of 146K of internal memory for DMA"）。codec-only
-# 档位能刚好塞下，完整档位的 WiFi(SDIO)/LVGL/LCD SPI 会先占用该池，分配必然失败；
-# 而分配失败又会被组件的 double-free 放大成开机重启循环（uvc_host.c:341 的
-# uvc_transfers_free 释放后不置空，被 uvc_host_stream_open 的错误路径二次调用）。
-# 代价是 6~10% UVC 丢帧；20 fps 门控下 30 fps 丢 10% 仍有约 27 fps，不影响帧率。
+# P4 的 USB-DWC DMA 可访问 PSRAM：让 UVC 的 8 个 URB 数据缓冲及 HCD 描述符
+# 落在 PSRAM。MPS=3072 时每个 URB 实际为 18432 B，合计 144 KiB；
+# 完整系统还需内部 DMA 内存供 WiFi(SDIO)、屏幕等模块使用。
+# 内部 RAM 零丢帧只在旧 codec-only 档位观察到，不能推广到完整系统；
+# 当前启用 PSRAM 是内存容量选择，不代表已确定稳态丢帧的机理或比例。
 CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM=y
 
 # 为测试任务和 USB Host 保留足够栈空间及控制传输缓冲区。
@@ -93,6 +93,7 @@ CONFIG_LWIP_TCP_WND_DEFAULT=65535
 # LVGL 动态对象使用系统 malloc；表情播放器的两个 RGB565 帧缓冲由
 # anim_bin_player 明确一次性分配到 PSRAM，不再启用 GIF/文件系统解码器。
 CONFIG_LV_MEM_CUSTOM=y
+CONFIG_LV_USE_QRCODE=y
 # CONFIG_LV_USE_GIF is not set
 # CONFIG_LV_USE_FS_POSIX is not set
 

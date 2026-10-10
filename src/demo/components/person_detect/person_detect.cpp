@@ -14,7 +14,11 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_partition.h"
+#include "esp_random.h"
 #include "esp_timer.h"
+#include "cloud_mqtt.h"
+#include "alert_clip.h"
+#include "video_streamer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/idf_additions.h"
@@ -24,22 +28,27 @@
 namespace {
 
 static constexpr const char *TAG = "PERSON_DETECT";
-static constexpr size_t JPEG_BUFFER_SIZE = 256U * 1024U;
+static constexpr size_t JPEG_BUFFER_SIZE = VIDEO_STREAM_JPEG_MAX_SIZE;
 static constexpr uint32_t SNAPSHOT_INTERVAL_MS = 1000U;
 static constexpr uint32_t STATS_INTERVAL_MS = 5000U;
-static constexpr uint16_t CAMERA_WIDTH = 640U;
-static constexpr uint16_t CAMERA_HEIGHT = 480U;
+static constexpr uint16_t CAMERA_WIDTH = VIDEO_STREAM_WIDTH;
+static constexpr uint16_t CAMERA_HEIGHT = VIDEO_STREAM_HEIGHT;
 static constexpr uint16_t MODEL_WIDTH = 320U;
 static constexpr uint16_t MODEL_HEIGHT = 320U;
+static constexpr uint16_t DOWNSAMPLE_FACTOR = CAMERA_WIDTH / MODEL_WIDTH;
+static constexpr uint16_t MODEL_CONTENT_HEIGHT = CAMERA_HEIGHT / DOWNSAMPLE_FACTOR;
+static constexpr uint16_t MODEL_BORDER_Y = (MODEL_HEIGHT - MODEL_CONTENT_HEIGHT) / 2U;
 static constexpr size_t RGB565_BUFFER_SIZE =
     static_cast<size_t>(CAMERA_WIDTH) * CAMERA_HEIGHT * 2U;
 static constexpr size_t MODEL_RGB565_BUFFER_SIZE =
     static_cast<size_t>(MODEL_WIDTH) * MODEL_HEIGHT * 2U;
-static_assert(CAMERA_WIDTH == MODEL_WIDTH * 2U &&
-              CAMERA_HEIGHT == (MODEL_HEIGHT - 80U) * 2U,
-              "当前 letterbox 仅适配 640x480 -> 320x240 + 上下各 40px");
+static_assert(CAMERA_WIDTH == MODEL_WIDTH * DOWNSAMPLE_FACTOR &&
+              CAMERA_HEIGHT == MODEL_CONTENT_HEIGHT * DOWNSAMPLE_FACTOR &&
+              MODEL_CONTENT_HEIGHT <= MODEL_HEIGHT &&
+              (MODEL_HEIGHT - MODEL_CONTENT_HEIGHT) % 2U == 0U,
+              "摄像头尺寸必须能等比例缩放并居中放入 320x320");
 static constexpr int PERSON_CATEGORY = 0;
-static constexpr float PERSON_SCORE_THRESHOLD = 0.45F;//置信度
+static constexpr float PERSON_SCORE_THRESHOLD = 0.25F;//置信度
 static constexpr uint32_t TASK_STACK_SIZE = 16384U;
 static constexpr UBaseType_t TASK_PRIORITY = 4U;
 static constexpr BaseType_t TASK_CORE = 1;
@@ -61,6 +70,8 @@ static size_t s_rgb565_allocated;
 static uint8_t *s_model_rgb565;
 static size_t s_model_rgb565_allocated;
 static std::atomic<bool> s_initialized{false};
+static std::atomic<bool> s_alert_report_enabled{false};
+static int64_t s_last_alert_us = 0;
 static std::atomic<bool> s_stop_requested{false};
 static std::atomic<bool> s_processing{false};
 static std::atomic<uint32_t> s_frame_seq{0};
@@ -209,16 +220,14 @@ static bool validate_input(const dl::image::img_t &image,
     return valid;
 }
 
-/* 2:1 最近邻缩小成 320x240，再放入 320x320 画布中央。
- * 上下各 40 行黑边在初始化时清零，正常播放只改写中间 240 行。 */
+/* 按输入分辨率最近邻缩小，再放入 320x320 画布中央。 */
 static void downsample_letterbox_320(const uint8_t *src, uint8_t *dst)
 {
-    constexpr uint32_t border_y = (MODEL_HEIGHT - CAMERA_HEIGHT / 2U) / 2U;
-    for (uint32_t y = 0; y < CAMERA_HEIGHT / 2U; ++y) {
-        const uint8_t *src_row = src + static_cast<size_t>(y * 2U) * CAMERA_WIDTH * 2U;
-        uint8_t *dst_row = dst + static_cast<size_t>(y + border_y) * MODEL_WIDTH * 2U;
+    for (uint32_t y = 0; y < MODEL_CONTENT_HEIGHT; ++y) {
+        const uint8_t *src_row = src + static_cast<size_t>(y * DOWNSAMPLE_FACTOR) * CAMERA_WIDTH * 2U;
+        uint8_t *dst_row = dst + static_cast<size_t>(y + MODEL_BORDER_Y) * MODEL_WIDTH * 2U;
         for (uint32_t x = 0; x < MODEL_WIDTH; ++x) {
-            const size_t from = static_cast<size_t>(x) * 4U;
+            const size_t from = static_cast<size_t>(x * DOWNSAMPLE_FACTOR) * 2U;
             const size_t to = static_cast<size_t>(x) * 2U;
             dst_row[to] = src_row[from];
             dst_row[to + 1U] = src_row[from + 1U];
@@ -226,16 +235,16 @@ static void downsample_letterbox_320(const uint8_t *src, uint8_t *dst)
     }
 }
 
-/* 模型坐标反变换到原始 640x480；黑边中的坐标裁剪到图像边缘。 */
+/* 模型坐标反变换到摄像头分辨率；黑边中的坐标裁剪到图像边缘。 */
 static int model_x_to_camera(int x)
 {
-    return std::min(std::clamp(x, 0, static_cast<int>(MODEL_WIDTH)) * 2,
+    return std::min(std::clamp(x, 0, static_cast<int>(MODEL_WIDTH)) * DOWNSAMPLE_FACTOR,
                     static_cast<int>(CAMERA_WIDTH) - 1);
 }
 
 static int model_y_to_camera(int y)
 {
-    return std::clamp((std::clamp(y, 0, static_cast<int>(MODEL_HEIGHT)) - 40) * 2,
+    return std::clamp((std::clamp(y, 0, static_cast<int>(MODEL_HEIGHT)) - MODEL_BORDER_Y) * DOWNSAMPLE_FACTOR,
                       0, static_cast<int>(CAMERA_HEIGHT) - 1);
 }
 
@@ -274,7 +283,10 @@ static void person_detect_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
-    ESP_LOGI(TAG, "model load OK (COCO YOLO11n 320x320 INT8)");
+    /* 必须同步修改模型后处理阈值，末端筛选阈值单独降低不会产生新候选框。 */
+    detector->set_score_thr(PERSON_SCORE_THRESHOLD);
+    ESP_LOGI(TAG, "model load OK (COCO YOLO11n 320x320 INT8), postprocess threshold=%.2f",
+             PERSON_SCORE_THRESHOLD);
     person_detect_log_memory("YOLO_LOAD_AFTER");
 
     const jpeg_decode_engine_cfg_t engine_cfg = {
@@ -294,7 +306,7 @@ static void person_detect_task(void *arg)
 
     const jpeg_decode_cfg_t decode_cfg = {
         .output_format = JPEG_DECODE_OUT_FORMAT_RGB565,
-        .rgb_order = JPEG_DEC_RGB_ELEMENT_ORDER_RGB,
+        .rgb_order = JPEG_DEC_RGB_ELEMENT_ORDER_BGR,
         .conv_std = JPEG_YUV_RGB_CONV_STD_BT601,
     };
     /* 模型的临时加载内存已经释放，允许天气 HTTPS 再启动。 */
@@ -330,7 +342,7 @@ static void person_detect_task(void *arg)
             continue;
         }
 
-        /* 即使 JPEG 驱动返回 ESP_OK，也必须确认完整输出 640x480，
+        /* 即使 JPEG 驱动返回 ESP_OK，也必须确认完整输出目标分辨率，
          * 避免下采样读取未写入区域。 */
         if (decoded_size != RGB565_BUFFER_SIZE) {
             s_invalid_output_frames.fetch_add(1);
@@ -356,8 +368,8 @@ static void person_detect_task(void *arg)
             continue;
         }
 
-        /* 在调用 ESP-DL 前完成 2:1 缩小与 letterbox，模型只看到
-         * 320x320 RGB565LE，因此不会调用其 640x480 resize SIMD。 */
+        /* 在调用 ESP-DL 前完成缩小与 letterbox，模型只看到
+         * 320x320 RGB565LE，因此不会调用其大图 resize SIMD。 */
         const int64_t letterbox_started_us = esp_timer_get_time();
         downsample_letterbox_320(s_rgb565, s_model_rgb565);
         const int64_t letterbox_elapsed_us =
@@ -383,6 +395,14 @@ static void person_detect_task(void *arg)
         s_inference_sum_us.fetch_add(inference_elapsed_us);
         update_max(s_inference_max_us, inference_elapsed_us);
         s_processed_frames.fetch_add(1);
+        if (frame_seq <= 3U || frame_seq % 10U == 0U) {
+            const auto best = std::max_element(results.begin(), results.end(),
+                [](const auto &a, const auto &b) { return a.score < b.score; });
+            ESP_LOGI(TAG, "RAW_RESULT frame=%u boxes=%u best_category=%d best_score=%.3f",
+                     (unsigned)frame_seq, (unsigned)results.size(),
+                     best != results.end() ? best->category : -1,
+                     best != results.end() ? best->score : 0.0F);
+        }
         if (!first_inference_logged) {
             first_inference_logged = true;
             person_detect_log_memory("YOLO_FIRST_INFER");
@@ -422,6 +442,31 @@ static void person_detect_task(void *arg)
                      "PERSON YES score=%.2f bbox=(%d,%d)-(%d,%d) person_count=%u",
                      best_score, best_box[0], best_box[1], best_box[2], best_box[3],
                      (unsigned)person_count);
+            if (s_alert_report_enabled.load(std::memory_order_relaxed) &&
+                cloud_mqtt_get_state() >= CLOUD_STATE_MQTT_SUBSCRIBED) {
+                const int64_t now_us = esp_timer_get_time();
+                if (s_last_alert_us == 0 || now_us - s_last_alert_us >= 600000000LL) {
+                    const int confidence = std::clamp(static_cast<int>(best_score * 100.0F + 0.5F), 0, 100);
+                    char event_id[33];
+                    snprintf(event_id, sizeof(event_id), "%08" PRIx32 "%08" PRIx32
+                             "%08" PRIx32 "%08" PRIx32,
+                             esp_random(), esp_random(), esp_random(), esp_random());
+                    if (alert_clip_trigger(event_id)) {
+                        char event[224];
+                        const int len = snprintf(event, sizeof(event),
+                                                 "{\"type\":\"device_alert\",\"event_id\":\"%s\",\"alert_type\":\"HUMAN_PRESENCE\","
+                                                 "\"confidence\":%d,\"pre_seconds\":10,\"post_seconds\":10}",
+                                                 event_id, confidence);
+                        if (len > 0 && static_cast<size_t>(len) < sizeof(event)) {
+                            const esp_err_t err = cloud_mqtt_publish_text(event);
+                            ESP_LOGI(TAG, "ALERT_TEST event_id=%s publish=%s confidence=%d pre=10 post=10",
+                                     event_id, esp_err_to_name(err), confidence);
+                            if (err == ESP_OK) s_last_alert_us = now_us;
+                            else alert_clip_cancel(event_id);
+                        } else alert_clip_cancel(event_id);
+                    }
+                }
+            }
         } else {
             ESP_LOGI(TAG, "PERSON NO");
         }
@@ -491,7 +536,7 @@ extern "C" esp_err_t person_detect_init(void)
         }
         return ESP_ERR_NO_MEM;
     }
-    /* 黑边只初始化一次；之后每帧只覆盖中间 240 行。 */
+    /* 黑边只初始化一次；之后每帧只覆盖画布中央的有效图像区域。 */
     memset(s_model_rgb565, 0, MODEL_RGB565_BUFFER_SIZE);
     ESP_LOGI(TAG,
              "AI buffers：MJPEG=%u bytes PSRAM，RGB565=%u bytes PSRAM，"
@@ -528,9 +573,11 @@ extern "C" esp_err_t person_detect_init(void)
     }
     s_stop_requested.store(false, std::memory_order_release);
     s_frame_seq.store(0, std::memory_order_release);
-    ESP_LOGI(TAG, "AI 输入：640x480 RGB565 -> 2:1 最近邻 320x240 -> "
-             "上下各 40px 黑边 -> 320x320 RGB565LE（PSRAM=%u bytes）",
-             (unsigned)MODEL_RGB565_BUFFER_SIZE);
+    ESP_LOGI(TAG, "AI 输入：%ux%u RGB565 -> %u:1 最近邻 320x%u -> "
+             "上下各 %upx 黑边 -> 320x320 RGB565LE（PSRAM=%u bytes）",
+             (unsigned)CAMERA_WIDTH, (unsigned)CAMERA_HEIGHT,
+             (unsigned)DOWNSAMPLE_FACTOR, (unsigned)MODEL_CONTENT_HEIGHT,
+             (unsigned)MODEL_BORDER_Y, (unsigned)MODEL_RGB565_BUFFER_SIZE);
     ESP_LOGI(TAG, "本地人体检测已启用：每 %u ms 抽帧，阈值=%.2f",
              SNAPSHOT_INTERVAL_MS, PERSON_SCORE_THRESHOLD);
     return ESP_OK;
@@ -548,6 +595,11 @@ extern "C" esp_err_t person_detect_wait_startup(uint32_t timeout_ms)
         return ESP_OK;
     }
     return (bits & MODEL_FAILED_BIT) != 0 ? ESP_FAIL : ESP_ERR_TIMEOUT;
+}
+
+extern "C" void person_detect_set_alert_report_enabled(bool enabled)
+{
+    s_alert_report_enabled.store(enabled, std::memory_order_relaxed);
 }
 
 extern "C" bool person_detect_submit_mjpeg(const uint8_t *data, size_t size)

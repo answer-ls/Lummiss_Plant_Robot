@@ -1,5 +1,6 @@
 #include "cloud_mcp.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
@@ -20,6 +21,7 @@
 #include "stepper_motor.h"
 #include "video_streamer.h"
 #include "webrtc_whip.h"
+#include "alert_clip.h"
 
 static const char *TAG = "CLOUD_MCP";
 
@@ -853,6 +855,58 @@ static void handle_tools_list(cJSON *id)
     publish_reply(id, result);
 }
 
+static bool alert_id_is_hex32(const cJSON *value)
+{
+    if (!cJSON_IsString(value) || value->valuestring == NULL ||
+        strlen(value->valuestring) != 32) {
+        return false;
+    }
+    for (const char *p = value->valuestring; *p != '\0'; ++p) {
+        if (!isxdigit((unsigned char)*p)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* MQTT 回调只交付授权；落卡和 HTTPS 上传由预警任务处理。 */
+static void handle_alert_upload_grant(cJSON *id, const cJSON *args)
+{
+    const cJSON *event_id = cJSON_GetObjectItem(args, "eventId");
+    const cJSON *alert_id = cJSON_GetObjectItem(args, "alertId");
+    const cJSON *ticket = cJSON_GetObjectItem(args, "uploadTicket");
+    const cJSON *path = cJSON_GetObjectItem(args, "uploadPath");
+    const cJSON *expires = cJSON_GetObjectItem(args, "expiresIn");
+    const cJSON *max_bytes = cJSON_GetObjectItem(args, "maxBytes");
+    const bool valid = alert_id_is_hex32(event_id) &&
+        alert_id_is_hex32(alert_id) && cJSON_IsString(ticket) &&
+        ticket->valuestring != NULL && ticket->valuestring[0] != '\0' &&
+        cJSON_IsString(path) && path->valuestring != NULL &&
+        strcmp(path->valuestring, "/device-api/v1/device-alerts") == 0 &&
+        cJSON_IsNumber(expires) && expires->valuedouble > 0 &&
+        cJSON_IsNumber(max_bytes) && max_bytes->valuedouble > 0;
+
+    mcp_tool_result_t result = {0};
+    if (valid) {
+        const bool accepted = alert_clip_set_grant(event_id->valuestring,
+            alert_id->valuestring, ticket->valuestring, path->valuestring,
+            (uint32_t)expires->valueint, (size_t)max_bytes->valuedouble);
+        ESP_LOGI(TAG,
+                 "ALERT_GRANT_RX event_id=%s alert_id=%s ticket_present=1 expires_in=%d max_bytes=%d accepted=%d",
+                 event_id->valuestring, alert_id->valuestring,
+                 expires->valueint, max_bytes->valueint, accepted);
+        snprintf(result.text, sizeof(result.text),
+                 "{\"received\":%s}", accepted ? "true" : "false");
+        result.is_error = !accepted;
+    } else {
+        result.is_error = true;
+        ESP_LOGW(TAG, "ALERT_GRANT_RX invalid_fields ticket_value_not_logged");
+        snprintf(result.text, sizeof(result.text),
+                 "{\"received\":false,\"error\":\"INVALID_GRANT\"}");
+    }
+    publish_tool_result(id, &result);
+}
+
 static void handle_tools_call(cJSON *id, const cJSON *params)
 {
     const cJSON *name = cJSON_GetObjectItem(params, "name");
@@ -863,6 +917,11 @@ static void handle_tools_call(cJSON *id, const cJSON *params)
     const cJSON *args = cJSON_GetObjectItem(params, "arguments");
     if (!cJSON_IsObject(args)) {
         args = NULL;
+    }
+
+    if (strcmp(name->valuestring, "alert.upload.grant") == 0) {
+        handle_alert_upload_grant(id, args);
+        return;
     }
 
     const mcp_tool_t *tool = NULL;

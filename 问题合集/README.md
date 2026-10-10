@@ -1,53 +1,24 @@
 # Lummiss 盆栽陪伴机器人
 
-基于 **ESP32-P4**（v1.3）的桌面植物陪伴机器人：表情屏幕交互 + USB 摄像头实时视频 + WiFi 云端联通。
+截至 2026-10-08，主固件位于 [`../src/demo/`](../src/demo/README.md)，使用 ESP-IDF 5.5.5，面向 ESP32-P4 v1.3 新 PCB；ESP32-C6 通过 ESP-Hosted/SDIO 提供 Wi-Fi 和 BLE。当前 `CAMERA_TEST_PROFILE=CAMERA_TEST_FULL`（档位 0），YOLO 关闭，摄像头随 RTC 预览按需启动。旧实验的完整过程和未决问题见 [`PROJECT_HANDOFF.md`](PROJECT_HANDOFF.md) 顶部“当前快照”。
 
-## 功能
-- **表情屏**：ST7789（240×320，横屏 320×240）表情动画，多种情绪切换。
-- **实时视频**：LRCPG720p USB UVC 摄像头（MJPEG）→ ESP32-P4 硬件 JPEG 解码 → CPU 分块 YUV422→YUV420 重排 → esp_h264 硬件编码 → WebSocket 二进制帧上传，800×600、4 Mbps、实测 15～20 fps。
-- **语音对话**：板载 ES8311 麦克风/扬声器 + Opus 编解码 + 小智协议，经 OTA 下发的 `wss://` 地址与云端双向传输（上行 16 kHz、下行 24 kHz，60 ms 包）。
-- **联网**：ESP32-C6 网络协处理器（ESP-Hosted，SDIO）连接 WiFi，支持 App 经 BLE 下发凭据。
+## 当前链路
 
-## 当前状态与已知问题
+| 功能 | 实现 | 当前状态 |
+| --- | --- | --- |
+| 云端 | MQTT 控制/MCP、UDP 加密 Opus、小智会话、WHIP/WebRTC H.264 | 基本链路已在实机跑通；RTC 帧率和长时间稳定性仍待优化 |
+| 音频 | ES7210 双麦 MIC1/MIC2 加播放参考输入 AFE，ES8311 播放，Opus 60 ms 帧 | 独立双麦工程连续对话效果好；主工程已对齐 AFE 输出缓冲及 Opus 编码任务，识别效果仍需同条件复测 |
+| 视频 | HBVCAM USB UVC 1280×720 MJPEG@30 → JPEG 硬解 → CPU YUV422→YUV420 → H.264 → WebRTC | 最近一次预览 UVC 完整帧约 19.6～23.6 fps、丢帧约 19.9%～33.8%；编码/发送约 10～11.5 fps，未达 20 fps 目标 |
+| TF 卡/表情 | 新 PCB SPI2 SDSPI，启动早期挂载 `/sdcard`；表情文件位于 `/sdcard/expressions/` | 120 MiB 卡可挂载并读扇区 0，但完整系统运行后读表情文件会报 `0x107`/`errno=5`；独立工程保持挂载约 90 秒后复读同一文件成功，差异尚待隔离 |
+| 配网 | C6 保存凭据；无凭据时 BLE Security 2 配网 | 既有凭据直接联网；强制配网开关当前关闭 |
 
-视频和语音**共用同一条云端 WebSocket**（地址与动态 Token 由 OTA 下发）。
+RTC 预览的 UVC 丢帧、编码端限速和浏览器实际播放帧率应分别统计。历史 800×600 同次运行 A/B 显示关闭编解码时 UVC 丢帧从 23.8% 降到 2.1%，说明负载相关；这**没有证明** PSRAM 仲裁的具体机理，也没有摄像头温度数据。此前把丢帧直接归因于 TLS/GIF 事件的解释已经撤回，详见 [`VIDEO_20FPS_VALIDATION.md`](../src/demo/markdown合集/VIDEO_20FPS_VALIDATION.md)。
 
-**2026-09-15 更正：摄像头推流时语音是通的。** 同一次运行里视频 13.9～15.6 fps 稳定上传
-（`send_fail=0`），同时上行 16.7 包/秒不断，服务端正常识别（`stt` 文本"好"）并回了完整回答。
-此前"摄像头开着时语音会失效（服务端只回兜底话术）"的结论**不再成立**——那次 A/B 时上传
-路径还在抢占/中断，不是摄像头本身。
+## 工程入口
 
-真正卡住系统的是**内部 DMA 堆耗尽**，不是协议冲突：
+- [`../src/demo/README.md`](../src/demo/README.md)：当前配置、主要模块和构建方法。
+- [`PROJECT_HANDOFF.md`](PROJECT_HANDOFF.md)：当前快照及按日期保留的诊断依据；旧章节中的“当前”按其记录日期理解。
+- [`../src/sdspi_official_test/`](../src/sdspi_official_test/main/main.c)：官方 SDSPI 流程的独立对照。
+- [`../src/xiaozhi_dual_mic_reference_test/`](../src/xiaozhi_dual_mic_reference_test/README.md)：双麦连续对话对照。
 
-- 全系统共用一块开机预留的内部 DMA 区（`Reserving pool of 146K of internal memory`，
-  大小由 `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL` 决定）。运行中它长期只剩
-  3～13 KB 空闲、**最大连续块 1 KB**。
-- ESP-Hosted 的 SDIO 收包路径要为**每个包**取一块 **1664 字节、64 字节对齐**的
-  内部 DMA 缓冲，取不到就 `assert` → panic 重启（`sdio_drv.c:862`
-  `assert(pkt_rxbuff)`，非 streaming 分支才有这条断言）。实测 64.8 秒时
-  `[VIDEO] MEM DMA=10/1 KB` 之后立刻崩在这一行。
-- 同一块池子被挤空时还会连带出：表情动画 `allocate_dma_buf: not enough mem`、
-  `transport: STA TX transport buffer unavailable`、TLS `PK verify failed 0x4290`。
-- 下行 TTS 播放队列已增加到 24 包，并用 `qovf/derr` 区分队列溢出与解码/写入错误。
-  最新对照恢复了 Git 基线的 CPU0/P6 音频任务配置，避免与 CPU1 的 JPEG/YUV/H.264
-  长时间争用。新日志进一步确认 H.264 单帧发送可阻塞 1.4～1.9 秒，并导致播放队列
-  `qovf=4`；现已开启 WebSocket 独立发送锁，使视频上行阻塞时仍可接收下行 Opus。
-
-详见 [`PROJECT_HANDOFF.md`](PROJECT_HANDOFF.md) 第 10 节与附录 A.7（语音实测口径与更正）、
-A.8（AES）、A.9（内部 DMA 池与本次三处改动）。
-
-## 目录
-| 路径 | 说明 |
-|---|---|
-| `src/demo/` | 主固件工程（ESP-IDF v5.5.5），含视频流水线、摄像头/屏幕驱动、表情资源；构建与烧录步骤见其 `README.md` |
-| `PROJECT_HANDOFF.md` | 开发交接/进展记录 |
-| `盆栽陪伴机器人_开发文档.md` | 产品开发文档（外包装、需求说明等） |
-
-## 硬件平台
-- 主控 ESP32-P4 rev v1.3 + 32MB PSRAM + 16MB Flash
-- 摄像头 LRCPG720p USB UVC（MJPEG）
-- 屏幕 ST7789 SPI
-- 无线 ESP32-C6（ESP-Hosted SDIO）
-
-## 快速开始（固件）
-详见 [`src/demo/README.md`](src/demo/README.md)。
+手动保存的构建、串口和诊断日志统一放在项目根目录 `logs/`。固件修改后使用 `src/demo/build_rtc_mem_b` 编译，同时保持 `src/demo/build` 可用；烧录需由测试者明确执行。

@@ -18,6 +18,10 @@
 
 #include "esp_err.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* MQTT 六字段，全部原样来自 OTA 响应（文档 §2.3）：
  * 不拼接 client_id、不解析 username 内部结构、不重新计算 password。 */
 #define CLOUD_MQTT_ENDPOINT_MAX_LEN   64
@@ -102,5 +106,9 @@ bool cloud_mqtt_get_session(cloud_mqtt_session_t *out);
 
 /* 发布到 OTA 的 publish_topic。JSON 文本，QoS 0，retain=false。 */
 esp_err_t cloud_mqtt_publish_text(const char *text);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

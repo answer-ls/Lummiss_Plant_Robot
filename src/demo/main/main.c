@@ -1,9 +1,12 @@
 #include "mem_contig.h"
 #include <assert.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "cJSON.h"
 #include "esp_heap_caps.h"
@@ -24,17 +27,20 @@
 #include "expression_manager.h"
 #include "home_info.h"
 #include "network_manager.h"
+#include "provisioning_manager.h"
 #include "ota_client.h"
 #include "peripheral_test.h"
 #include "test_profile.h"
 #include "time_service.h"
 #include "video_streamer.h"
+#include "alert_clip.h"
 #include "webrtc_whip.h"
 #include "cloud_mqtt.h"
 #include "xiaozhi_audio.h"
 #include "ambient_led.h"
 #include "person_detect.h"
 #include "sd_card.h"
+#include "screen_carousel.h"
 #include "board_init.h"
 #include "board_pins.h"
 #include "battery_monitor.h"
@@ -232,19 +238,29 @@ static void volume_set_tool_handler(const cJSON *arguments,
 #if TP_HAS(UI)
 static EventGroupHandle_t s_ui_ready_events;
 static const EventBits_t UI_READY_BIT = BIT0;
+static bool s_provisioning_display_started;
 
 static void ui_task(void *arg)
 {
     (void)arg;
     ESP_LOGI(TAG, "UI Task 启动（CPU%d）", xPortGetCoreID());
-    display_driver_start();
+    if (!s_provisioning_display_started) {
+        display_driver_start();
+    }
+#if CAMERA_TEST_PROFILE == CAMERA_TEST_SD_ONLY
+    if (sd_card_is_mounted()) {
+        screen_carousel_start();
+    } else {
+        ESP_LOGE(TAG, "TF 卡未挂载，无法轮播表情");
+    }
+#endif
 #if CAMERA_TEST_PROFILE == CAMERA_TEST_PERIPH_ONLY
     /* 新 PCB 外设档位显示固定测试图，验证 ST7789 颜色、字节序和方向。 */
     display_driver_show_test_pattern();
     /* 首板屏幕诊断：再次确认 GPIO47 为高电平，后续持续保持。 */
     display_driver_run_backlight_test();
 #endif
-#if TP_HAS(SD)
+#if TP_HAS(SD) && CAMERA_TEST_PROFILE != CAMERA_TEST_SD_ONLY
 #if CAMERA_TEST_PROFILE != CAMERA_TEST_FULL
     /* 隔离测试档位不加载 YOLO，保持原来的 UI 阶段挂载顺序。 */
     const esp_err_t sd_error = sd_card_mount();
@@ -261,7 +277,7 @@ static void ui_task(void *arg)
     /* 当前采用事件驱动表情，SD 卡仅由 Expression Manager 按事件读取；
      * 不启动旧的 screen_carousel 自动轮播任务或定时器。 */
     ESP_LOGI(TAG, "已禁用表情自动轮播，设备保持 HOME 页面");
-#else
+#elif CAMERA_TEST_PROFILE != CAMERA_TEST_SD_ONLY
     ESP_LOGI(TAG, "测试档位=%d（%s）：已暂停 GIF/SD 卡轮播",
              CAMERA_TEST_PROFILE, test_profile_name());
 #endif
@@ -271,7 +287,11 @@ static void ui_task(void *arg)
     if (s_ui_ready_events != NULL) {
         xEventGroupSetBits(s_ui_ready_events, UI_READY_BIT);
     }
+#if CAMERA_TEST_PROFILE == CAMERA_TEST_SD_ONLY
+    ESP_LOGI(TAG, "UI/LVGL 初始化完成，TF 卡表情轮播已启动");
+#else
     ESP_LOGI(TAG, "UI/LVGL 初始化完成，允许启动本地人体检测");
+#endif
 
     /* 当前没有 UI 事件队列，初始化任务完成后退出，减少常驻空任务。 */
     vTaskDelete(NULL);
@@ -280,6 +300,59 @@ static void ui_task(void *arg)
 
 #if RTC_CAMERA_ON_DEMAND
 static bool s_rtc_camera_started;
+#endif
+
+#if CAMERA_TEST_PROFILE == CAMERA_TEST_SD_ONLY && BOARD_USE_NEW_PCB
+static esp_err_t sd_test_read_expression(void)
+{
+    const char *path = "/sdcard/expressions/exp_08.bin";
+    struct stat info;
+    errno = 0;
+    if (stat(path, &info) != 0) {
+        ESP_LOGE(TAG, "SD_TEST stat 失败：%s errno=%d (%s)", path,
+                 errno, strerror(errno));
+        return ESP_FAIL;
+    }
+    if (info.st_size <= 0) return ESP_ERR_INVALID_SIZE;
+
+    errno = 0;
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) {
+        ESP_LOGE(TAG, "SD_TEST 打开文件失败：%s errno=%d (%s)", path,
+                 errno, strerror(errno));
+        return ESP_FAIL;
+    }
+    uint8_t *buffer = malloc(4096);
+    if (buffer == NULL) {
+        fclose(file);
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t total = 0;
+    uint32_t hash = 2166136261U;
+    int read_errno = 0;
+    while (total < (size_t)info.st_size) {
+        const size_t remaining = (size_t)info.st_size - total;
+        const size_t requested = remaining < 4096 ? remaining : 4096;
+        errno = 0;
+        const size_t received = fread(buffer, 1, requested, file);
+        for (size_t i = 0; i < received; ++i) hash = (hash ^ buffer[i]) * 16777619U;
+        total += received;
+        if (received != requested) {
+            read_errno = errno;
+            break;
+        }
+        vTaskDelay(1);
+    }
+    const bool read_failed = ferror(file) != 0;
+    free(buffer);
+    const int close_result = fclose(file);
+    const bool complete = total == (size_t)info.st_size && !read_failed && close_result == 0;
+    ESP_LOGI(TAG, "SD_TEST READ_EXPRESSION GPIO47=%d result=%s bytes=%u/%u hash=0x%08lx errno=%d",
+             gpio_get_level(BOARD_LCD_BL), complete ? "ESP_OK" : "ESP_FAIL",
+             (unsigned)total, (unsigned)info.st_size, (unsigned long)hash, read_errno);
+    return complete ? ESP_OK : ESP_FAIL;
+}
 #endif
 
 /* 摄像头驱动在独立任务内运行，USB 收帧不会阻塞 UI 初始化和刷新。 */
@@ -345,12 +418,18 @@ static bool rtc_camera_is_ready(void)
 void app_main(void)
 {
     mem_contig_log("APP_MAIN_ENTER");
+#if !CAMERA_PERSON_DETECT_ENABLED
     mem_fragment_begin();
+#else
+    /* 模型反序列化频繁分配内存，避免启动期堆追踪拖慢人体检测。 */
+    ESP_LOGI(TAG, "人体检测已启用，跳过启动期堆碎片追踪");
+#endif
     ESP_LOGW(TAG, "POWER_DIAG boot_reset_reason=%d (BROWNOUT=%d)",
              (int)esp_reset_reason(), (int)ESP_RST_BROWNOUT);
     /* 新板早期挂载 TF 时先只保持整板供电，挂载后再点亮背光。 */
 #if BOARD_USE_NEW_PCB && \
     (CAMERA_TEST_PROFILE == CAMERA_TEST_SD_ONLY || \
+     CAMERA_TEST_PROFILE == CAMERA_TEST_ALERT_ONLY || \
      (CAMERA_TEST_PROFILE == CAMERA_TEST_FULL && TP_HAS(SD) && !CAMERA_PERSON_DETECT_ENABLED))
     esp_err_t board_error = gpio_set_level(BOARD_PWR_IO, 1);
     if (board_error == ESP_OK) {
@@ -395,6 +474,24 @@ void app_main(void)
     const esp_err_t hosted_stop = esp_hosted_deinit();
     ESP_LOGI(TAG, "SD_TEST Hosted teardown=%s", esp_err_to_name(hosted_stop));
     if (hosted_stop != ESP_OK) return;
+
+    /* 先关闭背光进行读卡对照，结束后再打开背光显示表情。 */
+    esp_err_t bl_err = gpio_set_level(BOARD_LCD_BL, 0);
+    if (bl_err == ESP_OK) {
+        const gpio_config_t bl_config = {
+            .pin_bit_mask = 1ULL << BOARD_LCD_BL,
+            .mode = GPIO_MODE_INPUT_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        bl_err = gpio_config(&bl_config);
+    }
+    if (bl_err != ESP_OK) {
+        ESP_LOGE(TAG, "SD_TEST 配置 GPIO47 低电平失败：%s", esp_err_to_name(bl_err));
+        return;
+    }
+
 #endif
     // 仅测试期间延长 TWDT；不在 SD Busy 轮询中插入任务延时。
     const esp_task_wdt_config_t sd_wdt = {
@@ -402,12 +499,8 @@ void app_main(void)
     };
     esp_err_t sd_wdt_err = esp_task_wdt_reconfigure(&sd_wdt);
     ESP_LOGI(TAG, "SD_TEST TWDT 15s: %s", esp_err_to_name(sd_wdt_err));
-    // 新板复现独立工程的官方 SDSPI 挂载和只读扇区校验。
-#if BOARD_USE_NEW_PCB
-    const esp_err_t sd_test_result = sd_card_sdspi_reference_test();
-#else
-    const esp_err_t sd_test_result = sd_card_raw_diagnostic();
-#endif
+    // 保持 TF 卡挂载，供持续完整读取表情文件。
+    const esp_err_t sd_test_result = sd_card_mount();
     const esp_task_wdt_config_t normal_wdt = {
         .timeout_ms = 5000, .idle_core_mask = (1U << 0) | (1U << 1), .trigger_panic = false,
     };
@@ -415,11 +508,45 @@ void app_main(void)
         ESP_LOGI(TAG, "SD_TEST TWDT restore: %s",
                  esp_err_to_name(esp_task_wdt_reconfigure(&normal_wdt)));
     }
-    ESP_LOGI(TAG, "SD_TEST result=%s", esp_err_to_name(sd_test_result));
+    ESP_LOGI(TAG, "SD_TEST mount=%s mounted=%d", esp_err_to_name(sd_test_result),
+             sd_card_is_mounted());
     app_log_memory("SD_TEST_DONE");
+#if BOARD_USE_NEW_PCB
+    if (sd_test_result != ESP_OK) return;
+    ESP_LOGI(TAG, "SD_TEST 初始化 LCD/LVGL，GPIO47 保持低电平");
+    display_driver_start();
+    ESP_LOGI(TAG, "SD_TEST LCD 初始化完成，GPIO47=%d",
+             gpio_get_level(BOARD_LCD_BL));
+    if (gpio_get_level(BOARD_LCD_BL) != 0) {
+        ESP_LOGE(TAG, "GPIO47 未保持低电平，停止读卡测试");
+        return;
+    }
+    ESP_LOGI(TAG, "SD_TEST LOW_READ_BEGIN GPIO47=%d", gpio_get_level(BOARD_LCD_BL));
+    (void)sd_card_probe_sector0("GPIO47_LOW_FILE_READ");
+    const esp_err_t low_read = sd_test_read_expression();
+    ESP_LOGI(TAG, "SD_TEST LOW_READ_RESULT=%s，保持低电平 10 秒",
+             esp_err_to_name(low_read));
+    vTaskDelay(pdMS_TO_TICKS(10000));
+
+    ESP_ERROR_CHECK(gpio_set_level(BOARD_LCD_BL, BOARD_LCD_BL_ON_LEVEL));
+    ESP_LOGW(TAG, "SD_TEST HIGH_READ_BEGIN GPIO47=%d",
+             gpio_get_level(BOARD_LCD_BL));
+    (void)sd_card_probe_sector0("GPIO47_HIGH_FILE_READ");
+    const esp_err_t high_read = sd_test_read_expression();
+    ESP_LOGI(TAG, "SD_TEST HIGH_READ_RESULT=%s LOW_READ_RESULT=%s GPIO47=%d",
+             esp_err_to_name(high_read), esp_err_to_name(low_read),
+             gpio_get_level(BOARD_LCD_BL));
+    if (high_read == ESP_OK) {
+        ESP_LOGI(TAG, "SD_TEST 开始轮播 /sdcard/expressions 中的 BIN 表情");
+        screen_carousel_start();
+    } else {
+        ESP_LOGE(TAG, "SD_TEST 高电平读卡失败，跳过表情轮播");
+    }
 #endif
-#if CAMERA_TEST_PROFILE == CAMERA_TEST_WIFI_ONLY || SD_TEST_WIFI_ENABLED
-    // 档位11只启动C6/WiFi，不挂载SD卡；档位10可在SD卸载后继续测WiFi。
+    return;
+#endif
+#if CAMERA_TEST_PROFILE == CAMERA_TEST_WIFI_ONLY
+    // 档位11只启动C6/WiFi，不挂载SD卡。
     ESP_LOGI("WIFI_TEST", "BEGIN: ESP-Hosted/C6 + WiFi + DHCP");
 #if defined(CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE)
     ESP_LOGI("WIFI_TEST", "C6 SDIO: CLK=%d CMD=%d D0=%d D1=%d D2=%d D3=%d reset=%d max_clock=%d kHz",
@@ -444,21 +571,15 @@ void app_main(void)
     ESP_LOGI("WIFI_TEST", "result=%s state=%d connected=%d provisioning=%d",
              esp_err_to_name(wifi_test_result), network_manager_get_state(),
              network_manager_is_connected(), network_manager_is_provisioning());
-#if CAMERA_TEST_PROFILE == CAMERA_TEST_WIFI_ONLY
     ESP_LOGI(TAG, "TEST_SUMMARY SD=SKIPPED WiFi=%s (WiFi success means DHCP, not Internet)",
              esp_err_to_name(wifi_test_result));
-#else
-    ESP_LOGI(TAG, "TEST_SUMMARY SD=%s WiFi=%s (WiFi success means DHCP, not Internet)",
-             esp_err_to_name(sd_test_result), esp_err_to_name(wifi_test_result));
-#endif
     app_log_memory("WIFI_TEST_DONE");
-#else
-    ESP_LOGI(TAG, "TEST_SUMMARY SD=%s WiFi=SKIPPED", esp_err_to_name(sd_test_result));
 #endif
     return;
 #endif
 
-#if CAMERA_TEST_PROFILE == CAMERA_TEST_FULL && TP_HAS(SD) && !CAMERA_PERSON_DETECT_ENABLED
+#if (CAMERA_TEST_PROFILE == CAMERA_TEST_FULL && TP_HAS(SD) && !CAMERA_PERSON_DETECT_ENABLED) || \
+    CAMERA_TEST_PROFILE == CAMERA_TEST_ALERT_ONLY
     /* 诊断挂载时机：在网络、音频和 UI 启动前挂载，后期入口仍可复用已挂载卡。 */
     if (board_error == ESP_OK) {
         ESP_LOGI(TAG, "EARLY_SD_MOUNT begin");
@@ -466,7 +587,7 @@ void app_main(void)
         ESP_LOGI(TAG, "EARLY_SD_MOUNT result=%s mounted=%d",
                  esp_err_to_name(early_sd_error), sd_card_is_mounted());
     }
-#if BOARD_USE_NEW_PCB
+#if BOARD_USE_NEW_PCB && CAMERA_TEST_PROFILE != CAMERA_TEST_ALERT_ONLY
     /* 早期挂载结束后恢复正式系统的屏幕背光和板级 GPIO 初始化。 */
     const esp_err_t ui_board_error = board_init_early();
     if (ui_board_error != ESP_OK) {
@@ -539,6 +660,7 @@ void app_main(void)
     /* OTA 检查：设备身份必须在调用前初始化完毕。 */
 #if TP_HAS(WIFI)
 #if defined(CONFIG_CLOUD_PROTOCOL_V3)
+#if CAMERA_TEST_PROFILE != CAMERA_TEST_ALERT_ONLY
     /* 注册官方 MCP 通用工具（工具名与参数对照上游 mcp_server.cc 的
      * AddCommonTools，服务端的 LLM 提示词认识 self.* 这些名字）。
      * 必须在 cloud_mqtt_start() 之前注册 —— 服务端在 MCP 握手完成后立刻
@@ -590,6 +712,9 @@ void app_main(void)
     if (cloud_mcp_init() != ESP_OK) {
         ESP_LOGE(TAG, "MCP 初始化失败，工具与能力清单将不完整");
     }
+#else
+    ESP_LOGI(TAG, "预警测试：跳过 RTC 控制器和额外 MCP 工具注册");
+#endif
 #endif
     ota_client_init();
     if (identity_error == ESP_OK && network_error == ESP_OK) {
@@ -599,11 +724,25 @@ void app_main(void)
         const bool provisioning = network_manager_is_provisioning();
         if (provisioning) {
             ESP_LOGI(TAG, "等待 App 完成 BLE 配网...");
+#if CAMERA_TEST_PROFILE == CAMERA_TEST_FULL && TP_HAS(UI)
+            /* 配网等待可能持续很久，先启动屏幕显示实际的连接参数。 */
+            display_driver_start();
+            s_provisioning_display_started = true;
+            display_driver_show_provisioning(
+                provisioning_manager_service_name(),
+                provisioning_manager_username(),
+                provisioning_manager_pop());
+#endif
         } else {
             ESP_LOGI(TAG, "等待 WiFi 连接以发起 OTA 检查...");
         }
         bool wifi_ready = network_manager_wait_connected(
             provisioning ? UINT32_MAX : 20000);
+#if CAMERA_TEST_PROFILE == CAMERA_TEST_FULL && TP_HAS(UI)
+        if (s_provisioning_display_started) {
+            display_driver_hide_provisioning();
+        }
+#endif
         if (wifi_ready) {
             /* 文档 §2 的启动顺序：WiFi → NTP_TIME_READY → OTA_CONFIGURED。
              * SNTP 必须早于 OTA 与 RTC 信令（RTC 的 sent_at 允许与服务器
@@ -842,7 +981,7 @@ void app_main(void)
         }
     }
 #else
-#if CAMERA_PERSON_DETECT_ENABLED
+#if CAMERA_PERSON_DETECT_ENABLED && CAMERA_TEST_PROFILE != CAMERA_TEST_ALERT_ONLY
     if (person_detect_init() != ESP_OK) {
         ESP_LOGW(TAG, "本地人体检测初始化失败，继续运行其它模块");
     }
@@ -918,10 +1057,34 @@ void app_main(void)
 #endif
 
 #if CAMERA_TEST_PROFILE != CAMERA_TEST_FULL && TP_HAS(UVC)
+#if CAMERA_TEST_PROFILE == CAMERA_TEST_ALERT_ONLY
+    const esp_err_t clip_err = alert_clip_init();
+    ESP_LOGI(TAG, "预警片段初始化：%s，TF mounted=%d",
+             esp_err_to_name(clip_err), sd_card_is_mounted());
+    if (camera_driver_prepare_ready_event() != ESP_OK) {
+        ESP_LOGE(TAG, "预警测试：创建 CAMERA_READY 事件失败");
+    } else {
+#endif
     result = xTaskCreatePinnedToCoreWithCaps(camera_task, "camera_task", 8192, NULL, 7,
                                              NULL, APP_USB_CORE,
                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     assert(result == pdPASS);
+#if CAMERA_TEST_PROFILE == CAMERA_TEST_ALERT_ONLY
+        if (!camera_driver_wait_ready(60000)) {
+            ESP_LOGE(TAG, "预警测试：等待 UVC 首帧超时");
+        } else {
+            person_detect_set_alert_report_enabled(true);
+            const esp_err_t ai_err = person_detect_init();
+            if (ai_err != ESP_OK) {
+                ESP_LOGE(TAG, "预警测试：创建 YOLO 任务失败：%s", esp_err_to_name(ai_err));
+            } else {
+                ESP_LOGI(TAG, "预警测试：等待 YOLO 模型加载");
+                ESP_LOGI(TAG, "预警测试：模型加载结果=%s",
+                         esp_err_to_name(person_detect_wait_startup(60000)));
+            }
+        }
+    }
+#endif
 #elif CAMERA_TEST_PROFILE != CAMERA_TEST_FULL
     ESP_LOGI(TAG, "测试档位=%d（%s）：已停用 Camera Task 与 USB/UVC Host",
              CAMERA_TEST_PROFILE, test_profile_name());

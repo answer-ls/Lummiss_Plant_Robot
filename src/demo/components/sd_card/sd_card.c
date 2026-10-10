@@ -198,6 +198,14 @@ bool sd_card_is_mounted(void)
 {
     return s_mounted;
 }
+esp_err_t sd_card_probe_sector0(const char *stage)
+{
+    if (!s_mounted) return ESP_ERR_INVALID_STATE;
+    uint8_t sector[512];
+    const esp_err_t err = sdmmc_read_sectors(s_card, sector, 0, 1);
+    ESP_LOGI(TAG, "READ_PROBE stage=%s result=%s", stage, esp_err_to_name(err));
+    return err;
+}
 esp_err_t sd_card_get_write_error(void) { return ESP_OK; }
 esp_err_t sd_card_raw_diagnostic(void) { return sd_card_self_test(); }
 #endif

@@ -50,11 +50,10 @@ static const char *TAG = "CAMERA";
 #else
 #define CAMERA_REQUESTED_FPS        30.0f
 #endif
-/* UVC 丢帧根因已定位（2026-09-12）：URB 数据缓冲落 PSRAM 会与 H.264/JPEG 争
- * PSRAM 仲裁，ISOC 回调最长被推迟 8 ms，期间等时包被跳过整帧丢弃。
- * 8×16 KB 配内部 RAM（CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM=n）后丢帧清零；
- * 反向对照：URB 96→8 只把 PSRAM 下的丢帧从 ~35% 降到 ~10%，真正清零靠内部 RAM。
- * 16 KB 被 MPS=3072 对齐成 18432 B/URB，8 个共 144 KiB。 */
+/* 当前使用 8 个 16 KiB URB；MPS=3072 时每个实际分配 18432 B，合计 144 KiB。
+ * 2026-09-12 旧对照中，96→8 个 PSRAM URB 的丢帧约 35%→10%；
+ * 内部 RAM 的 0% 结果只适用于 codec-only 档位。具体丢帧机理尚未证实，
+ * 完整系统继续按 sdkconfig 将 USB DMA 数据缓冲放在 PSRAM。 */
 #define CAMERA_USB_URB_COUNT        8
 #define CAMERA_USB_URB_SIZE         (16U * 1024U)
 #define CAMERA_FRAME_BUFFER_COUNT   3
@@ -1076,7 +1075,18 @@ void camera_driver_run(void)
     camera_log_memory("USB_INSTALL_AFTER");
 
     /* UVC-only 隔离阶段不初始化视频流水线，避免 H.264/WebSocket 影响 USB。 */
-#if !TP_HAS(HANDOFF)
+#if CAMERA_TEST_PROFILE == CAMERA_TEST_ALERT_ONLY
+    /* 本地持续编码供预警环形缓冲使用；WHIP 未启动时不发送实时视频。 */
+    video_streamer_set_alert_capture_mode(true);
+    const esp_err_t alert_video_err = video_streamer_init(NULL);
+    if (alert_video_err == ESP_OK) {
+        const esp_err_t start_err = video_streamer_start();
+        ESP_LOGI(TAG, "预警本地 H.264 编码启动：%s", esp_err_to_name(start_err));
+    } else {
+        ESP_LOGE(TAG, "预警本地 H.264 编码初始化失败：%s",
+                 esp_err_to_name(alert_video_err));
+    }
+#elif !TP_HAS(HANDOFF)
     ESP_LOGI(TAG, "测试档位=%d（%s）：跳过 H.264/JPEG/WebSocket 视频流水线",
              CAMERA_TEST_PROFILE, test_profile_name());
 #else
@@ -1164,32 +1174,19 @@ void camera_driver_run(void)
                  * 注意 UVC_HOST_FRAME_BUFFER_OVERFLOW 不等于"这帧比缓冲大"：
                  * 它在 uvc_frame_add_data() 里由「已累积 + 本 URB > frame_size」
                  * 触发，驱动在两次 SoF 之间认不出 EoF 就会一路累积到爆。
-                 * 也就是说这条事件指向**帧重组失步**，把 frame_size 调大只会
-                 * 让失步时攒下更多垃圾数据。真正该动的是 URB 参数。
+                 * 也就是说这条事件可能指向帧重组失步；需结合帧边界与
+                 * URB 诊断判断，不能只靠增大 frame_size 修复。
                  * 3 个帧缓冲是连续取流的下限+1；其中最多 2 个会被编解码任务
                  * 暂时借用，剩下 1 个继续接收下一帧。 */
                 .frame_size = VIDEO_STREAM_JPEG_MAX_SIZE,
                 .number_of_frame_buffers = CAMERA_FRAME_BUFFER_COUNT,
-                /* URB 环深和内存位置两个变量都影响丢帧（2026-09-12 定论）。
-                 *
-                 * URB 落 PSRAM 时，USB HCD 的 DMA 与 H.264/JPEG 解码争 PSRAM
-                 * 仲裁，ISOC 回调最长被推迟（callback_gap_max 从 9 ms 涨到
-                 * 22 ms），期间等时包被主机标 SKIPPED，MJPEG 是熵编码，丢一个包
-                 * 这一帧从断点往后全错位，只能整帧丢弃（skipped 与 dropped 严格
-                 * 1:1）。UVC 等时传输没有重传，丢一个微帧就毁一整帧。
-                 *
-                 * 环深：96×32 KB → 8×16 KB，把 PSRAM 下的丢帧从 ~35% 压到
-                 * ~10%。不要再把环深当免维护窗口加大，那只会多烧 PSRAM。
-                 *
-                 * 内存位置：8×16 KB 落在内部 RAM 时 codec-only 档位能到 0%
-                 * 丢帧，但**不能推广到完整档位**——8 × 18432 B = 144 KiB，而内部
-                 * DMA 池只有 146 KiB，完整档位的 WiFi(SDIO)/LVGL/LCD SPI 会先
-                 * 占用同一个池，分配必然失败；失败还会被组件的 double-free
-                 * 放大成开机重启循环。所以 sdkconfig 里
-                 * CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM 必须为 y。
-                 * 完整档位的代价是丢帧 2.6%~32%（均值 ~16%），H.264 只有
-                 * 15~20 FPS，20 FPS 目标尚未达成。详见
-                 * VIDEO_20FPS_VALIDATION.md 与 PROJECT_HANDOFF.md 附录 A。 */
+                /* 旧 800×600 同次运行 A/B：编解码开启/关闭时 UVC 丢帧
+                 * 23.8%/2.1%，说明链路负载相关，未定位具体硬件/调度机理。
+                 * callback_gap_max 在两种状态均约 9 ms，不能据此认定
+                 * “PSRAM 仲裁延迟回调”；skipped 与丢帧也不是严格 1:1。
+                 * 内部 RAM 的零丢帧仅见于 codec-only，完整系统保留
+                 * CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM=y，避免 USB
+                 * 数据缓冲占用大块内部 DMA 内存。详见 VIDEO_20FPS_VALIDATION.md。 */
                 .number_of_urbs = CAMERA_USB_URB_COUNT,
                 .urb_size = CAMERA_USB_URB_SIZE,
                 .frame_heap_caps = MALLOC_CAP_SPIRAM,

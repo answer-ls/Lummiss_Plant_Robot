@@ -11,6 +11,7 @@ idf_component_register(
         esp_h264
         network
         webrtc_whip
+        alert_clip
         json)
 
 # YUV422 转 YUV420 是当前流水线中耗时最大的逐像素循环。仅对本组件启用

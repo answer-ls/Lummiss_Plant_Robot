@@ -3,12 +3,16 @@
 
 #include <stdbool.h>
 
-/* 初始化 ST7789、LVGL 和动态时间天气首页。
- * 该函数只能由 UI Task 调用。 */
+/* 初始化 ST7789、LVGL 和动态时间天气首页；配网时可在 app_main 中提前调用。 */
 void display_driver_start(void);
 
-/* 启动阶段、创建 UI 任务之前调用；NULL 表示不显示绑定页。 */
+/* 设置 OTA 绑定码；屏幕已启动时立即显示，NULL 表示不显示绑定页。 */
 void display_driver_set_binding_code(const char *code);
+
+/* BLE 配网期间显示连接参数；联网完成后关闭页面。 */
+void display_driver_show_provisioning(const char *name, const char *username,
+                                      const char *pop);
+void display_driver_hide_provisioning(void);
 
 /* 显示固定 RGB/黑白色条和四角标记，用于档位 9 验证颜色、方向和刷新链路。
  * 该函数只能在 display_driver_start() 成功后由 UI Task 调用。 */
